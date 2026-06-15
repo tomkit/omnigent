@@ -5,12 +5,7 @@
 
 import { PinIcon, XIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 export interface PinnedMessageBannerProps {
   /** Snippet of the pinned message (rendered as one CSS-truncated line). */
@@ -23,7 +18,12 @@ export interface PinnedMessageBannerProps {
   className?: string;
 }
 
-export function PinnedMessageBanner({ text, onJump, onUnpin, className }: PinnedMessageBannerProps) {
+export function PinnedMessageBanner({
+  text,
+  onJump,
+  onUnpin,
+  className,
+}: PinnedMessageBannerProps) {
   return (
     // top-16 clears the h-14 ChatHeader overlay with a small gap; z-20 sits
     // above the scroll content but below the header's z-30.

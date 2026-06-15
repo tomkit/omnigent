@@ -140,14 +140,11 @@ export function jumpToUserMessageAfterLayoutSettles(
   };
 }
 
-export function useUserMessageNav(
-  userMessageIds: readonly string[],
-): UserMessageNav {
+export function useUserMessageNav(userMessageIds: readonly string[]): UserMessageNav {
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const [anchorId, setAnchorId] = useState<string | null>(null);
 
-  const currentIndex =
-    anchorId === null ? -1 : userMessageIds.indexOf(anchorId);
+  const currentIndex = anchorId === null ? -1 : userMessageIds.indexOf(anchorId);
   // outside = never navigated, or anchor was removed from the list.
   const outside = anchorId === null || currentIndex === -1;
 
@@ -174,8 +171,5 @@ export function useUserMessageNav(
 
   // Stable identity so consumers can put the return value in an
   // effect dep array without re-registering on every render.
-  return useMemo(
-    () => ({ goPrev, goNext, canPrev, canNext }),
-    [goPrev, goNext, canPrev, canNext],
-  );
+  return useMemo(() => ({ goPrev, goNext, canPrev, canNext }), [goPrev, goNext, canPrev, canNext]);
 }

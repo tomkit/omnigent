@@ -137,9 +137,7 @@ describe("UserBubble pin action", () => {
 describe("usePinnedMessageJump", () => {
   it("keeps one banner click pending until older history renders the pinned message", async () => {
     vi.useFakeTimers();
-    const scrollSpy = vi
-      .spyOn(Element.prototype, "scrollIntoView")
-      .mockImplementation(() => {});
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
     const loadMoreHistory = vi.fn(async () => {});
     const flashUserMessage = vi.fn();
     const onMissing = vi.fn();
@@ -205,9 +203,7 @@ describe("usePinnedMessageJump", () => {
   });
 
   it("reports a pin as missing once all history is loaded without it", async () => {
-    const scrollSpy = vi
-      .spyOn(Element.prototype, "scrollIntoView")
-      .mockImplementation(() => {});
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
     const loadMoreHistory = vi.fn(async () => {});
     const flashUserMessage = vi.fn();
     const onMissing = vi.fn();
