@@ -234,3 +234,103 @@ async def test_subagent_background_turn_resolves_child_native_harness() -> None:
         "spawn is the bug: it respawns the harness and tears down the live "
         "claude-native terminal ('Bridge closed: terminal resource not found')."
     )
+
+
+class _CatchUpServer(_SubAgentSnapshotServer):
+    """Like the snapshot server, but ``/items`` returns one fresh user message.
+
+    The catch-up scan only starts a turn when new user items arrived after the
+    last seen cursor — this provides exactly one so the scan dispatches.
+    """
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        del kwargs
+        u = url.rstrip("/")
+        if u.endswith(f"{CHILD_SESSION_ID}/items"):
+            return self._Resp(
+                {
+                    "data": [
+                        {
+                            "id": "item_new1",
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "continue"}],
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        if u.endswith(CHILD_SESSION_ID):
+            return self._Resp(
+                {
+                    "agent_id": PARENT_AGENT_ID,
+                    "sub_agent_name": SUB_AGENT_NAME,
+                    "parent_session_id": "conv_parent_polly",
+                    "created_at": 0,
+                    "workspace": None,
+                }
+            )
+        if u.endswith("/items"):
+            return self._Resp({"data": [], "has_more": False})
+        return super(_SubAgentSnapshotServer, self)._Response()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_catch_up_scan_keeps_child_native_harness() -> None:
+    """The reconnect catch-up scan must not flip a sub-agent off claude-native.
+
+    This drives the REAL ``app.state.catch_up_scan`` (the runner's
+    ``on_reconnect`` callback) — the exact path that fired in production after
+    a Databricks Apps ingress WebSocket recycle. With the sub-agent session
+    known to the runner (it has history) but its spec cache holding the PARENT
+    spec, ``_is_native_harness`` returns False on the buggy code, so the scan
+    does NOT skip it, runs a catch-up turn, and resolves the parent
+    ``claude-sdk`` harness — asking ``get_client`` for ``claude-sdk`` while the
+    live subprocess is ``claude-native`` (the respawn that kills the terminal).
+
+    The fix recovers ``sub_agent_name`` from the server snapshot so the turn
+    resolves ``claude-native`` instead.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    pm = _FakeProcessManager(
+        _ScriptedHarnessClient(
+            [
+                _sse({"type": "response.created", "response": {"id": "r1"}}),
+                _sse({"type": "response.completed", "response": {"id": "r1"}}),
+            ]
+        )
+    )
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_parent_spec_resolver,
+        server_client=_CatchUpServer(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app):
+        # Field state after a reconnect: the runner knows the session (it has
+        # in-memory history) but never repopulated the sub-agent-name map for
+        # it. Seed history so the scan iterates this session.
+        _session_histories_ref[CHILD_SESSION_ID] = [
+            {"role": "user", "content": [{"type": "input_text", "text": "prev"}]}
+        ]
+        try:
+            await app.state.catch_up_scan()
+            for _ in range(300):
+                if pm.get_client_calls:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            _session_histories_ref.pop(CHILD_SESSION_ID, None)
+
+    sub_calls = [h for (conv, h, _env) in pm.get_client_calls if conv == CHILD_SESSION_ID]
+    assert sub_calls, "catch-up scan did not dispatch a turn for the sub-agent session"
+    assert all(h == "claude-native" for h in sub_calls), (
+        f"reconnect catch-up scan asked the process manager to spawn {sub_calls!r} "
+        "for the sub-agent session; expected only 'claude-native'. A 'claude-sdk' "
+        "spawn is the production bug: the ingress WebSocket recycle triggers this "
+        "scan, which respawns the harness and tears down the live claude-native "
+        "terminal ('Bridge closed: terminal resource not found')."
+    )
