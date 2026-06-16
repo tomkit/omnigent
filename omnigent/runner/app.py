@@ -6703,6 +6703,76 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
+    async def _handle_codex_native_compact(conv_id: str) -> Response:
+        """
+        Type ``/compact`` into Codex's tmux pane.
+
+        Mirrors :func:`_handle_claude_native_compact` for codex-native
+        sessions.  Codex owns its own context window in the terminal,
+        so explicit compaction must be injected as the ``/compact``
+        slash command — the same rationale as the claude-native path.
+
+        The tmux pane coordinates come from the **resource registry**
+        (not a ``tmux.json`` sidecar) because codex-native terminals
+        are launched through the registry.  This is the same resolution
+        path :func:`_handle_codex_native_cost_popup` uses.
+
+        Returns 200 on successful injection so the Omnigent server
+        knows the control was handled in the terminal and skips its
+        own AP-side compaction.  204 when no live terminal is
+        registered (the server falls back to in-process compaction).
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: 200 once ``/compact`` has been typed into the pane.
+            204 if no live codex terminal is registered for the session.
+            503 if the tmux send-keys invocation fails.
+        """
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            # No live codex terminal — let the server run AP-side compaction.
+            return Response(status_code=204)
+
+        socket_path = str(instance.socket_path)
+        target = instance.tmux_target
+
+        try:
+            await asyncio.to_thread(_inject_codex_compact, socket_path, target)
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
+    def _inject_codex_compact(socket_path: str, target: str) -> None:
+        """
+        Blocking helper: type ``/compact`` into a codex tmux pane.
+
+        Uses the same ``C-u`` → literal ``/compact`` → ``Enter``
+        sequence that :func:`~omnigent.claude_native_bridge.inject_slash_command`
+        uses for claude-native.  Factored into its own function so
+        :func:`_handle_codex_native_compact` can run it via
+        ``asyncio.to_thread`` without importing at call time.
+
+        :param socket_path: Absolute path to the tmux socket, e.g.
+            ``"/tmp/.../codex-main.sock"``.
+        :param target: Tmux target pane, e.g. ``"main"``.
+        :raises RuntimeError: If any ``tmux send-keys`` invocation fails.
+        """
+        from omnigent.claude_native_bridge import _run_tmux
+
+        # Clear any draft the user is mid-typing.
+        _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
+        # Paste ``/compact`` literally.
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        # Submit.
+        _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -6871,10 +6941,11 @@ def create_runner_app(
         Covers the case where the ASK fired while no terminal client was
         attached (the user was in the web Chat), then the user opens the
         Terminal: on attach this re-checks the session snapshot and, if a
-        native approval is still outstanding — the server-side
-        tool-policy gate (``TOOL_CALL`` / ``LLM_REQUEST``, e.g. a
-        cost-budget checkpoint) — pops it on the now-attached
-        client. Self-correcting — it only pops while the elicitation is still
+        native approval is still outstanding — the server-side policy gate
+        (``TOOL_CALL`` / ``LLM_REQUEST``, e.g. a cost-budget checkpoint, or
+        the ``REQUEST`` gate a native session enforces via the
+        ``UserPromptSubmit`` hook) — pops it on the now-attached client.
+        Self-correcting — it only pops while the elicitation is still
         pending, so an already-answered approval is not re-shown. Complements
         the ASK-time forward (which covers clients attached *before* the
         ASK). Best-effort: any miss leaves the web card.
@@ -6903,17 +6974,21 @@ def create_runner_app(
         if resp.status_code != 200:
             return
         pending = resp.json().get("pending_elicitations") or []
-        # The native popup surfaces the server-side tool-policy gate
-        # (tool_call / llm_request — including cost-budget checkpoints),
-        # which parks and resolves via the same endpoint. Re-pop whichever
-        # is pending.
+        # The native popup surfaces the server-side policy gate, which parks
+        # and resolves via the same endpoint. Re-pop whichever is pending:
+        # the tool-policy gate (tool_call / llm_request — including
+        # cost-budget checkpoints) and the request-phase gate (request),
+        # which native sessions enforce via the UserPromptSubmit hook. A
+        # request-phase ASK typically fires while the user is in the web
+        # Chat (no client attached), so the on-attach re-pop is its main
+        # path onto the terminal.
         approval = next(
             (
                 e
                 for e in pending
                 if isinstance(e, dict)
                 and isinstance(e.get("params"), dict)
-                and e["params"].get("phase") in ("tool_call", "llm_request")
+                and e["params"].get("phase") in ("request", "tool_call", "llm_request")
             ),
             None,
         )
@@ -9373,14 +9448,16 @@ def create_runner_app(
 
         if body_type == "compact":
             # Omnigent server forwards explicit /compact here. claude-native
-            # injects the slash command into the tmux pane so Claude
-            # Code compacts its own context, and returns 200 to signal
-            # the control was handled in the terminal. Other harnesses
-            # 204 no-op — their explicit compaction is an AP-side
-            # operation the server runs when the runner does not handle
-            # the control (see ``_run_compact_locked``).
+            # and codex-native inject the slash command into the tmux
+            # pane so the CLI compacts its own context, and return 200
+            # to signal the control was handled in the terminal. Other
+            # harnesses 204 no-op — their explicit compaction is an
+            # AP-side operation the server runs when the runner does
+            # not handle the control (see ``_run_compact_locked``).
             if _session_harness_name(conversation_id) == "claude-native":
                 return await _handle_claude_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "codex-native":
+                return await _handle_codex_native_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":
@@ -12047,6 +12124,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
+    "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
 }
 
 
@@ -12074,6 +12152,7 @@ def _build_spawn_env_from_spec(
     """
     try:
         from omnigent.runtime.workflow import (
+            _build_antigravity_spawn_env,
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
             _build_cursor_spawn_env,
@@ -12091,6 +12170,8 @@ def _build_spawn_env_from_spec(
             env = _build_openai_agents_sdk_spawn_env(spec)
         elif harness == "cursor":
             env = _build_cursor_spawn_env(spec, workdir=workdir)
+        elif harness == "antigravity":
+            env = _build_antigravity_spawn_env(spec)
         else:
             # Native terminal harnesses and unknown harnesses build env elsewhere.
             return None

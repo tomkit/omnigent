@@ -8027,6 +8027,109 @@ def _set_cursor_api_key() -> str | None:
     return "✓ Cursor API key stored"
 
 
+def _manage_antigravity_harness() -> None:
+    """Run the level-2 loop for Antigravity: set / replace / remove its Gemini key.
+
+    Antigravity is Gemini-native (no provider family), so this manages just its
+    API key — stored in the secret store, referenced from the ``antigravity:``
+    config block — mirroring how the other harnesses persist api keys.
+
+    :returns: None. Side effects: may write the ``antigravity:`` config block
+        and the secret store.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_CONFIG_KEY,
+        ANTIGRAVITY_SECRET_NAME,
+        antigravity_api_key_configured,
+        antigravity_api_key_ref,
+    )
+    from omnigent.onboarding.interactive import select
+
+    status: str | None = None
+    while True:
+        config = _load_global_config()
+        key_set = antigravity_api_key_configured(config)
+
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow(
+                "Replace Gemini API key" if key_set else "Set Gemini API key",
+                action="set_key",
+            )
+        ]
+        if key_set:
+            rows.append(_HarnessMenuRow("Remove API key", action="remove_key"))
+        rows.append(_HarnessMenuRow("← Back", action="back"))
+
+        header = (
+            "Antigravity — Gemini API key configured"
+            if key_set
+            else "Antigravity — no Gemini API key yet"
+        )
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "set_key":
+            status = _set_antigravity_api_key()
+        elif action == "remove_key":
+            ref = antigravity_api_key_ref(config)
+            # Only the secret we own (``keychain:antigravity``) is ours to
+            # delete: a hand-edited block may point at a shared ``keychain:<other>``
+            # secret, and an ``env:`` ref names the user's own environment. In
+            # both of those cases just drop the config block and leave the secret.
+            if ref == f"keychain:{ANTIGRAVITY_SECRET_NAME}":
+                secret_store.delete_secret(ANTIGRAVITY_SECRET_NAME)
+            _save_global_config({}, unset_keys=(ANTIGRAVITY_CONFIG_KEY,))
+            status = "✓ Removed Gemini API key"
+
+
+def _set_antigravity_api_key() -> str | None:
+    """Prompt for and store a Gemini API key; return a status line.
+
+    Offers an existing ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY`` first
+    (recorded as an ``env:`` ref, so the secret stays in the environment), else
+    reads it with a hidden prompt and stores it under ``keychain:antigravity``.
+    The ``AIza`` prefix is checked softly (a wrong paste is caught but can be
+    forced). The key is never echoed.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_ENV_VARS,
+        ANTIGRAVITY_SECRET_NAME,
+        antigravity_api_key_settings,
+        looks_like_gemini_api_key,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    detected_var = next((v for v in ANTIGRAVITY_ENV_VARS if os.environ.get(v)), None)
+    if detected_var is not None and click.confirm(
+        f"Detected {detected_var} in the environment — use it?", default=True
+    ):
+        detected = os.environ[detected_var]
+        if not looks_like_gemini_api_key(detected) and not click.confirm(
+            f"${detected_var} doesn't start with 'AIza'. Use it anyway?", default=False
+        ):
+            return None
+        _save_global_config(antigravity_api_key_settings(f"env:{detected_var}"))
+        return f"✓ Gemini API key set (from ${detected_var})"
+
+    pasted = prompt_text("Gemini API key (GEMINI_API_KEY)", hide_input=True).strip()
+    if not pasted:
+        return None
+    if not looks_like_gemini_api_key(pasted) and not click.confirm(
+        "That doesn't start with 'AIza'. Store it anyway?", default=False
+    ):
+        return None
+    secret_store.store_secret(ANTIGRAVITY_SECRET_NAME, pasted)
+    _save_global_config(antigravity_api_key_settings(f"keychain:{ANTIGRAVITY_SECRET_NAME}"))
+    return "✓ Gemini API key stored"
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -8305,6 +8408,10 @@ def _run_configure_harnesses_interactive() -> None:
         the backfill/adopt steps and any add/set-default/remove the user
         performs while navigating.
     """
+    from omnigent.onboarding.antigravity_auth import (
+        ANTIGRAVITY_ENV_VARS,
+        antigravity_api_key_configured,
+    )
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.cursor_auth import cursor_api_key_configured
     from omnigent.onboarding.harness_install import CURSOR_KEY, harness_cli_installed
@@ -8342,6 +8449,10 @@ def _run_configure_harnesses_interactive() -> None:
     # overview. The menu clears in place on each choice so the session stays on
     # one screen. Quit / Esc / q exits.
     _QUIT = "\x00quit"  # sentinel marking the Quit row (not a family)
+    # Sentinel marking the Antigravity row — it is not a provider family (Gemini
+    # is outside the anthropic/openai machinery), so it dispatches to its own
+    # credential manager rather than ``_manage_harness_providers``.
+    _ANTIGRAVITY = "\x00antigravity"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
     while True:
         config = _load_global_config()
@@ -8403,6 +8514,24 @@ def _run_configure_harnesses_interactive() -> None:
         options.append(f"  {cursor_sub}")
         selectable.append(False)
         row_target.append(None)
+        # Antigravity (Gemini-native, no provider family): like Cursor, readiness
+        # is just whether a Gemini key is configured (``antigravity:`` block or
+        # ambient env); its drill-in manages that key. Vertex specs need no key,
+        # so a ✗ isn't a hard blocker for that path.
+        ag_key_set = antigravity_api_key_configured(config) or any(
+            os.environ.get(v) for v in ANTIGRAVITY_ENV_VARS
+        )
+        options.append(f"{'  ' if ag_key_set else '[red]✗[/] '}Antigravity")
+        selectable.append(True)
+        row_target.append(_ANTIGRAVITY)
+        ag_sub = (
+            "[green]✓[/] Gemini API key configured"
+            if ag_key_set
+            else "[dim]no Gemini API key yet — open to add one[/]"
+        )
+        options.append(f"  {ag_sub}")
+        selectable.append(False)
+        row_target.append(None)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
@@ -8419,6 +8548,8 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_cursor_harness()
         elif target in families:
             _manage_harness_providers(target)
+        elif target == _ANTIGRAVITY:
+            _manage_antigravity_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
 

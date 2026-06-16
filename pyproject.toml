@@ -124,6 +124,10 @@ agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
 ]
+# Google Antigravity SDK harness (`harness: antigravity`). Optional: the
+# harness module imports the SDK lazily on first turn, so only users of the
+# harness need this extra. Early SDK (v0.1.x) — pin minor.
+antigravity = ["google-antigravity>=0.1,<1"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
