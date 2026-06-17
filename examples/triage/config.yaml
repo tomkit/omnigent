@@ -32,7 +32,7 @@ prompt: |
   ```
   {
     "type": "bug" | "enhancement" | "documentation" | null,
-    "component": "comp:server" | "comp:runner" | "comp:repr" | "comp:web-ui" | "comp:policies" | "comp:harnesses" | null,
+    "components": ["comp:server" | "comp:runner" | "comp:repr" | "comp:web-ui" | "comp:policies" | "comp:harnesses"],
     "priority": "P0-critical" | "P1-high" | "P2-medium" | "P3-low" | null,
     "needs_info": true | false,
     "good_first_issue": true | false,
@@ -54,14 +54,14 @@ prompt: |
   matching type. Otherwise determine from content. Use `documentation`
   for docs-only issues.
 
-  **component** — which subsystem is affected:
+  **components** — list of affected subsystems (one or more):
   - `comp:server` — the Omnigent server, API, session management
   - `comp:runner` — the agent runner, execution engine
   - `comp:repr` — serialization, representation layer
   - `comp:web-ui` — the web frontend (ap-web)
   - `comp:policies` — safety policies, guardrails
   - `comp:harnesses` — SDK harnesses (Claude, Cursor, Antigravity, etc.)
-  Set to `null` if you cannot determine the component.
+  Use an empty array `[]` if you cannot determine the component.
 
   **priority**:
   - `P0-critical` — service down, data loss, security vulnerability

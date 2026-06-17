@@ -334,10 +334,12 @@ jobs:
               if t and t in ALLOWED_TYPES:
                   labels_add.append(t)
 
-              # Component
-              c = result.get("component")
-              if c and c in ALLOWED_COMPONENTS:
-                  labels_add.append(c)
+              # Components (array)
+              components = result.get("components", [])
+              if isinstance(components, list):
+                  for c in components:
+                      if c in ALLOWED_COMPONENTS:
+                          labels_add.append(c)
 
               # Priority
               p = result.get("priority")
@@ -358,9 +360,14 @@ jobs:
               labels_remove.append("needs-triage")
               labels_add.append("triaged")
 
+          # Collect validated components for domain-aware assignment.
+          valid_components = [c for c in result.get("components", [])
+                              if isinstance(c, str) and c in ALLOWED_COMPONENTS]
+
           output = {
               "labels_add": labels_add,
               "labels_remove": labels_remove,
+              "components": valid_components,
               "duplicate_of": result.get("duplicate_of") if isinstance(result.get("duplicate_of"), int) else None,
               "priority": result.get("priority") if result.get("priority") in ALLOWED_PRIORITIES else None,
               "reasoning": result.get("reasoning", ""),
@@ -404,20 +411,20 @@ jobs:
           # Round-robin assign engineer for P0/P1 issues, with domain routing.
           priority=$(echo "$result" | jq -r '.priority // empty')
           if [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; then
-            component=$(echo "$result" | jq -r '.component // empty')
-            python3 <<PYEOF
+            python3 <<'PYEOF'
           import json, pathlib, os
 
           assignees = json.loads(pathlib.Path("/tmp/assignees.json").read_text())
+          triage = json.loads(pathlib.Path("/tmp/triage_result.json").read_text())
           issue_number = int(os.environ["ISSUE_NUMBER"])
-          component = "${component}"
 
-          # Extract domain from comp:* label (e.g. "comp:server" → "server").
-          domain = component.removeprefix("comp:") if component else ""
+          # Extract domains from comp:* labels (e.g. "comp:server" → "server").
+          domains = [c.removeprefix("comp:") for c in triage.get("components", [])]
 
-          # Filter to engineers matching the domain; fall back to full list.
-          if domain:
-              candidates = [u for u, ds in assignees.items() if domain in ds]
+          # Filter to engineers matching ANY of the domains; fall back to full list.
+          if domains:
+              candidates = [u for u, ds in assignees.items()
+                            if any(d in ds for d in domains)]
           else:
               candidates = []
 
@@ -428,7 +435,7 @@ jobs:
               candidates.sort()  # deterministic order
               index = issue_number % len(candidates)
               assignee = candidates[index]
-              print(f"Assigning to {assignee} (domain={domain or 'any'}, "
+              print(f"Assigning to {assignee} (domains={domains or ['any']}, "
                     f"index {index} of {len(candidates)} candidates)")
               pathlib.Path("/tmp/assignee.txt").write_text(assignee)
           else:
