@@ -1,0 +1,59 @@
+# Code owners -- reviewer routing for pull requests.
+#
+# GitHub auto-requests a review from the owner(s) of any path a PR touches.
+# This is ROUTING ONLY: it does not gate merge. The merge gate stays
+# `Maintainer Approval` + `Merge Ready` (branch protection). Do NOT enable
+# "Require review from Code Owners" in branch protection unless you intend
+# these to become blocking.
+#
+# Owners must be maintainers with write access -- entries are drawn from
+# .github/MAINTAINER. Last matching pattern wins, so the `*` default is first
+# and more specific paths override it below.
+#
+# ---------------------------------------------------------------------------
+# DRAFT mapping: seeded from `git log` authorship per area, which is thin for
+# this repo (much of it landed via an internal import). Treat the per-area
+# owners as a starting point and correct them to reflect real ownership.
+# ---------------------------------------------------------------------------
+#
+# ROUND-ROBIN / even distribution: the `*` default below points at a team
+# (@omnigent-ai/maintainers). Create that team and set its "Code review
+# assignment" to round-robin (load-balance) so unowned PRs are distributed
+# across maintainers instead of pinging everyone. Until the team exists,
+# GitHub ignores the `*` line (no default auto-request) -- the per-area
+# owners below still work. Replace with individuals if you prefer not to use
+# a team.
+
+# Default owner for anything not matched below (round-robin team -- see note).
+*                          @omnigent-ai/maintainers
+
+# Repo automation / CI
+/.github/                  @PattaraS @serena-ruan
+
+# Web UI
+/ap-web/                   @serena-ruan @SabhyaC26
+
+# Core agent runtime & harnesses
+/omnigent/inner/           @SabhyaC26 @TomeHirata
+/omnigent/runner/          @SabhyaC26 @PattaraS
+/omnigent/runtime/         @SabhyaC26
+/omnigent/server/          @ckcuslife-source
+/omnigent/onboarding/      @SabhyaC26
+/omnigent/policies/        @TomeHirata
+/omnigent/spec/            @SabhyaC26
+/omnigent/llms/            @dhruv0811
+/omnigent/host/            @PattaraS @dhruv0811
+/omnigent/sandbox/         @dhruv0811
+/omnigent/environments/    @dhruv0811
+/omnigent/db/              @dhruv0811
+/omnigent/stores/          @dhruv0811
+/omnigent/repl/            @dhruv0811
+
+# Deploy targets
+/deploy/                   @dbczumar
+
+# Tests
+/tests/                    @TomeHirata @PattaraS
+
+# Design docs
+/designs/                  @TomeHirata @serena-ruan
