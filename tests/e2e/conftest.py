@@ -199,25 +199,20 @@ def using_mock_llm(request: pytest.FixtureRequest) -> bool:
 
 @pytest.fixture(scope="session")
 def mock_llm_server_url(
-    using_mock_llm: bool,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[str | None]:
+) -> Iterator[str]:
     """
-    Start a mock LLM server when running without a real API key.
+    Start a mock LLM server for the test session.
 
+    Always started regardless of ``--llm-api-key`` so mock-only
+    tests can run alongside real-LLM tests in the same session.
     The mock server implements ``POST /v1/responses`` with pre-canned
     SSE responses. Tests configure it via ``POST /mock/configure``
-    before each turn. When a real ``--llm-api-key`` is provided,
-    yields ``None`` (real LLM path).
+    before each turn.
 
-    :param using_mock_llm: Whether mock mode is active.
     :param tmp_path_factory: Pytest temp path factory for logs.
-    :returns: The mock server base URL, or ``None``.
+    :returns: The mock server base URL.
     """
-    if not using_mock_llm:
-        yield None
-        return
-
     mock_port = find_free_port()
     mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
     log_handle = open(mock_log, "w")  # noqa: SIM115

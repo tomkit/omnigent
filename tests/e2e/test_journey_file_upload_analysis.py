@@ -14,7 +14,6 @@ from __future__ import annotations
 import uuid
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -30,7 +29,6 @@ from tests.e2e.helpers import final_assistant_text
 def test_file_upload_and_analysis_journey(
     http_client: httpx.Client,
     live_runner_id: str,
-    using_mock_llm: bool,
     mock_llm_server_url: str | None,
 ) -> None:
     """
@@ -43,8 +41,6 @@ def test_file_upload_and_analysis_journey(
     3. Upload a second file with "The population of Freedonia is 42,000."
     4. Ask the agent about both; assert both facts appear.
     """
-    if not using_mock_llm:
-        pytest.skip("mock-only test")
 
     model = f"mock-file-{uuid.uuid4().hex[:6]}"
 

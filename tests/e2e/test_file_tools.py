@@ -44,7 +44,6 @@ def _extract_all_text(body: dict[str, Any]) -> str:
 def test_markdown_file_attachment(
     http_client: httpx.Client,
     live_runner_id: str,
-    using_mock_llm: bool,
     mock_llm_server_url: str | None,
 ) -> None:
     """
@@ -54,8 +53,6 @@ def test_markdown_file_attachment(
     block → content resolution (MIME type from filename) → LLM
     receives and responds.
     """
-    if not using_mock_llm:
-        pytest.skip("mock-only test")
     model = f"mock-md-{uuid.uuid4().hex[:6]}"
 
     reset_mock_llm(mock_llm_server_url)

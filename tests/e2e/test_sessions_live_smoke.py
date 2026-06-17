@@ -34,12 +34,9 @@ from tests.e2e.helpers import final_assistant_text
 def test_live_sessions_path_round_trips_through_openai_agents_harness(
     http_client: httpx.Client,
     live_runner_id: str,
-    using_mock_llm: bool,
     mock_llm_server_url: str | None,
 ) -> None:
     """A harness-backed session turn reaches the LLM and returns text."""
-    if not using_mock_llm:
-        pytest.skip("mock-only test")
     marker = "SESSIONS_LIVE_SMOKE_OK"
     model = f"mock-smoke-{uuid.uuid4().hex[:6]}"
 

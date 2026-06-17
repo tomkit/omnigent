@@ -77,15 +77,12 @@ def _mock_agent(
 def test_steering_acknowledged(
     http_client: httpx.Client,
     live_runner_id: str,
-    using_mock_llm: bool,
     mock_llm_server_url: str | None,
 ) -> None:
     """
     A message sent while the agent is running is steered into
     the active task and reflected in the final output.
     """
-    if not using_mock_llm:
-        pytest.skip("mock-only test")
 
     reset_mock_llm(mock_llm_server_url)
     agent_name, model = _mock_agent(http_client, mock_llm_server_url)
@@ -183,15 +180,12 @@ def test_steering_with_web_search(
 def test_steering_after_completed_starts_new_turn(
     http_client: httpx.Client,
     live_runner_id: str,
-    using_mock_llm: bool,
     mock_llm_server_url: str | None,
 ) -> None:
     """
     A message sent after the task completes creates a new turn,
     not a steer.
     """
-    if not using_mock_llm:
-        pytest.skip("mock-only test")
 
     reset_mock_llm(mock_llm_server_url)
     agent_name, model = _mock_agent(http_client, mock_llm_server_url)
@@ -233,15 +227,12 @@ def test_steering_after_completed_starts_new_turn(
 def test_steering_during_multi_tool_iterations(
     http_client: httpx.Client,
     live_runner_id: str,
-    using_mock_llm: bool,
     mock_llm_server_url: str | None,
 ) -> None:
     """
     Steering is picked up between tool call iterations when the
     agent makes multiple sequential sys_read_inbox calls.
     """
-    if not using_mock_llm:
-        pytest.skip("mock-only test")
 
     reset_mock_llm(mock_llm_server_url)
     agent_name, model = _mock_agent(http_client, mock_llm_server_url)
