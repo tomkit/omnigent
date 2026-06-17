@@ -274,7 +274,7 @@ jobs:
 
           prompt=$(cat /tmp/triage_prompt.txt)
 
-          uv run omnigent run examples/triage/ \
+          uv run omnigent run .github/triage/ \
             -p "$prompt" \
             --no-session \
             2>triage-stderr.log \
