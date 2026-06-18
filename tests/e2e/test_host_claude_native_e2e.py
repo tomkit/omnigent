@@ -41,6 +41,8 @@ Environment requirements (why this is opt-in, not pure-CI):
   alone would let this run unauthenticated and hang the TUI until the
   shard times out. The env-var gate keeps it out of CI entirely; a
   developer with a logged-in Claude opts in explicitly.
+  The tmux-level readiness test at the bottom needs no Claude login and
+  DOES run in CI, gated only on ``tmux`` (installed on the e2e runners).
 * It runs the daemon under the real HOME with the real Claude login —
   like ``claude_coder`` relies on the CLI's own session.
 * The workspace folder must be trusted in ``~/.claude.json`` or Claude
@@ -66,6 +68,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import stat
@@ -83,17 +86,17 @@ import pytest
 from omnigent import claude_native_bridge
 from tests.e2e.helpers import POLL_INTERVAL_S
 
-# Opt-in only. claude-native needs a real *interactive* Claude login
-# (OAuth/Enterprise), which can't be relocated into CI: the `claude`
-# binary IS present in CI (the claude-sdk e2e tests install it), but it
-# is not logged in, so this test would launch a Claude TUI that can
-# never reach its input box and hang until the shard times out. Binary
-# presence is therefore NOT a sufficient gate — require an explicit
-# opt-in env var that only a developer with a logged-in Claude sets.
-pytestmark = pytest.mark.skipif(
+# The full-stack claude-native tests need a real *interactive* Claude
+# login (OAuth/Enterprise): the `claude` binary IS present in CI but is
+# not logged in, so the TUI never reaches its input box and would hang
+# until the shard times out. Gate each of those tests with this marker so
+# they skip in CI. NOTE: this is a per-test decorator, deliberately NOT a
+# module-level ``pytestmark`` — the tmux readiness test at the bottom
+# needs no Claude login and MUST run in CI, so it is left undecorated.
+_needs_logged_in_claude = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_CLAUDE_NATIVE") != "1" or shutil.which("claude") is None,
     reason=(
-        "claude-native e2e needs an interactive Claude login; set "
+        "claude-native full-stack e2e needs an interactive Claude login; set "
         "OMNIGENT_E2E_CLAUDE_NATIVE=1 (and have `claude` installed + logged in) to run"
     ),
 )
@@ -332,6 +335,7 @@ def _poll_for_assistant_marker(
     )
 
 
+@_needs_logged_in_claude
 def test_claude_native_first_message_survives_terminal_boot(
     live_server: str,
     http_client: httpx.Client,
@@ -439,6 +443,7 @@ def _plant_poisoned_omnigent_package(workspace: Path) -> None:
     )
 
 
+@_needs_logged_in_claude
 def test_claude_native_hooks_ignore_workspace_omnigent_package(
     live_server: str,
     http_client: httpx.Client,
@@ -520,6 +525,7 @@ def test_claude_native_hooks_ignore_workspace_omnigent_package(
                 daemon.wait()
 
 
+@_needs_logged_in_claude
 def test_claude_native_message_not_duplicated_on_cold_start(
     live_server: str,
     http_client: httpx.Client,
@@ -741,6 +747,7 @@ def _post_user_message(client: httpx.Client, *, session_id: str, text: str) -> N
     resp.raise_for_status()
 
 
+@_needs_logged_in_claude
 def test_claude_native_second_message_survives_tall_status_footer(
     live_server: str,
     http_client: httpx.Client,
@@ -842,3 +849,69 @@ def test_claude_native_second_message_survives_tall_status_footer(
             except subprocess.TimeoutExpired:
                 daemon.kill()
                 daemon.wait()
+
+
+def test_prompt_ready_detects_glyph_above_tall_footer_in_real_tmux(tmp_path: Path) -> None:
+    """
+    The readiness gate finds ``❯`` above a tall footer in a *real* tmux pane.
+
+    The CI-runnable slice of issue #701: this needs no Claude login — only
+    ``tmux`` (installed on the e2e runners) — so, unlike the full-stack
+    tests above, it is deliberately NOT gated on a logged-in Claude and
+    runs in CI. It paints a Claude-like idle frame whose footer is far
+    taller than the old five-line prompt-scan window into a real tmux
+    pane, then drives the production readiness gate against it through the
+    same helpers injection uses (``_capture_pane`` →
+    ``_claude_prompt_rendered`` → ``_wait_for_claude_prompt_ready``).
+
+    Before the structural-detection fix the live ``❯`` sat outside the
+    scanned tail and the gate raised "did not become ready"; after it the
+    box is recognized by the border rule directly beneath ``❯``,
+    independent of footer height. Verified red→green by toggling the fix.
+    """
+    if shutil.which("tmux") is None:
+        pytest.skip("needs tmux")
+
+    # A Claude-like idle frame: input-box top rule, the live prompt, the
+    # box's closing rule, then a footer with far more than four rows below
+    # ``❯`` — so the old tail-5 scan cannot reach the prompt row.
+    pane_lines = [
+        "────────────────────────────────────────",
+        "❯ ",
+        "────────────────────────────────────────",
+        *[f"  status row {n}" for n in range(1, 9)],
+    ]
+    pane_file = tmp_path / "pane.txt"
+    pane_file.write_text("\n".join(pane_lines) + "\n", encoding="utf-8")
+
+    # Unix-domain socket paths are length-limited (~104 chars on macOS) and
+    # pytest's tmp_path is far longer, so put the tmux socket under /tmp with
+    # a short unique name. tmux removes it on kill-server (no manual cleanup).
+    socket = f"/tmp/cnrp-{uuid.uuid4().hex[:12]}.sock"
+    session = "cn_ready_probe"
+    # Paint the frame (cat) and hold the pane open (sleep) so the gate can
+    # poll a stable capture. tmux runs the command through the shell.
+    subprocess.run(
+        [
+            "tmux",
+            "-S",
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            f"cat {shlex.quote(str(pane_file))}; sleep 30",
+        ],
+        check=True,
+    )
+    try:
+        # Returns once the frame renders (post-fix); raises RuntimeError
+        # "did not become ready" while the prompt stays outside the scan
+        # window (pre-fix). Reaching past this call means it was detected.
+        claude_native_bridge._wait_for_claude_prompt_ready(socket, session, timeout_s=10.0)
+    finally:
+        subprocess.run(["tmux", "-S", socket, "kill-server"], check=False)
