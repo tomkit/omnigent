@@ -92,10 +92,18 @@ def test_coding_supervisor_with_forks_one_shot(
         ],
         key=model,
     )
+    # claude-sdk routes through ANTHROPIC_BASE_URL; add it alongside the
+    # OPENAI_BASE_URL already in mock_credentials_env so both harnesses
+    # reach the mock server.
+    env = dict(mock_credentials_env)
+    if harness == "claude-sdk":
+        env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
+        env["ANTHROPIC_API_KEY"] = "mock-key"
+        env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = "printf %s mock-key"
     result = run_one_shot(
         omnigent_python=omnigent_python,
         omnigent_repo_root=omnigent_repo_root,
-        omnigent_credentials_env=mock_credentials_env,
+        omnigent_credentials_env=env,
         example_name="coding_supervisor_with_forks",
         harness=harness,
         model=model,
