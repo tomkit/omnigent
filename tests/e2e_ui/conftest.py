@@ -91,7 +91,7 @@ _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 # YAML must carry an explicit ``executor`` block — otherwise the
 # server rejects with ``executor.config.harness: required when
 # executor.type is 'omnigent'``. The mock LLM server handles
-# ``model: mock-model`` via the OpenAI-compatible endpoint, so the
+# The model name (databricks-gpt-5-4) is used for harness routing only;
 # harness auto-picks ``openai-agents`` and routes requests to the
 # in-process mock rather than a real provider.
 _TEST_AGENT_YAML = """\
@@ -99,7 +99,7 @@ name: hello_world
 prompt: You are a friendly assistant. Say hello and answer questions.
 
 executor:
-  model: mock-model
+  model: databricks-gpt-5-4
   config:
     harness: openai-agents
 
@@ -166,7 +166,7 @@ name: {_FILES_PROBE_NO_ENV_AGENT_NAME}
 prompt: You are a terse assistant with no filesystem.
 
 executor:
-  model: mock-model
+  model: databricks-gpt-5-4
   config:
     harness: openai-agents
 """
@@ -175,7 +175,7 @@ name: {_FILES_PROBE_ENV_AGENT_NAME}
 prompt: You are a terse assistant with a filesystem.
 
 executor:
-  model: mock-model
+  model: databricks-gpt-5-4
   config:
     harness: openai-agents
 
@@ -1176,7 +1176,7 @@ prompt: |
   other tools.
 
 executor:
-  model: mock-model
+  model: databricks-gpt-5-4
   config:
     harness: openai-agents
 
@@ -1358,7 +1358,7 @@ prompt: |
   sub-agent session via `sys_session_send` — NEVER spawn a second one.
 
 executor:
-  model: mock-model
+  model: databricks-gpt-5-4
   harness: openai-agents
 
 tools:
@@ -1368,7 +1368,7 @@ tools:
       Deep Thought, the supercomputer built to compute the Answer to the
       Ultimate Question of Life, the Universe, and Everything.
     executor:
-      model: mock-model
+      model: databricks-gpt-5-4
       harness: openai-agents
     prompt: |
       You are Deep Thought from The Hitchhiker's Guide to the Galaxy.
@@ -1494,7 +1494,7 @@ prompt: |
   other command or call any other tool.
 
 executor:
-  model: mock-model
+  model: databricks-gpt-5-4
   config:
     harness: openai-agents
 
@@ -1664,7 +1664,7 @@ prompt: |
   and nothing else — no preamble, no quotes, no trailing punctuation.
 
 executor:
-  model: mock-model
+  model: databricks-gpt-5-4
   config:
     harness: openai-agents
 """
