@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import claude_native_hook
+from omnigent import claude_native_hook, native_policy_hook
 from omnigent.claude_native_bridge import (
     build_hook_settings,
     prepare_bridge_dir,
@@ -1729,6 +1729,8 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client(mode))
+    # connect_error / non_2xx (5xx) are retried; skip the backoff sleeps.
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1776,6 +1778,8 @@ def test_evaluate_policy_non_tool_call_phases_fail_open_on_error(
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    # connect_error is retried; skip the backoff sleeps to keep the test fast.
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")

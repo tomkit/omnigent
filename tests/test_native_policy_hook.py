@@ -2,13 +2,221 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from omnigent import native_policy_hook
 from omnigent.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    post_policy_evaluation,
 )
+
+
+def _scripted_client(outcomes: list[object], calls: list[str]) -> type:
+    """
+    Build an ``httpx.Client`` stub that replays a scripted POST sequence.
+
+    :param outcomes: One entry per expected POST. An :class:`Exception`
+        is raised; an ``(status, text)`` tuple is returned as an
+        :class:`httpx.Response`.
+    :param calls: List the stub appends each POST URL to, so a test can
+        assert how many attempts were made.
+    :returns: A class usable as a drop-in for :class:`httpx.Client`.
+    """
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            outcome = outcomes[len(calls)]
+            calls.append(url)
+            if isinstance(outcome, Exception):
+                raise outcome
+            status, text = outcome  # type: ignore[misc]
+            return httpx.Response(status, text=text, request=httpx.Request("POST", url))
+
+    return _Client
+
+
+_ALLOW_BODY = '{"result":"POLICY_ACTION_ALLOW"}'
+
+
+def test_post_policy_evaluation_retries_5xx_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transient 5xx is retried and the eventual verdict is returned.
+
+    This is the reported failure: a shared server returning intermittent
+    5xx under load used to fail closed on the FIRST error, hard-denying the
+    tool call. Two blips followed by a healthy response must now yield the
+    real verdict instead of a denial.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _scripted_client([(503, "down"), (502, "down"), (200, _ALLOW_BODY)], calls),
+    )
+
+    result = post_policy_evaluation(
+        "http://x/evaluate",
+        {},
+        {"event": {}},
+        read_timeout_s=1.0,
+        log_prefix="test",
+    )
+
+    assert result == {"result": "POLICY_ACTION_ALLOW"}
+    assert len(calls) == 3
+
+
+def test_post_policy_evaluation_retries_connect_error_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A connect-phase failure is retried (the request never reached the server).
+
+    A ``ConnectError`` means nothing was evaluated or parked server-side, so
+    re-POSTing is safe and absorbs a brief unreachable-server blip.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _scripted_client(
+            [
+                httpx.ConnectError("unreachable", request=httpx.Request("POST", "http://x")),
+                (200, _ALLOW_BODY),
+            ],
+            calls,
+        ),
+    )
+
+    result = post_policy_evaluation(
+        "http://x/evaluate", {}, {"event": {}}, read_timeout_s=1.0, log_prefix="test"
+    )
+
+    assert result == {"result": "POLICY_ACTION_ALLOW"}
+    assert len(calls) == 2
+
+
+def test_post_policy_evaluation_exhausts_retries_on_persistent_5xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A server that is genuinely down still fails closed after the retry budget.
+
+    The retry must not paper over a real outage: once attempts are exhausted
+    the helper returns ``None`` so the caller fails closed (deny).
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _scripted_client([(503, "down")] * 10, calls),
+    )
+
+    result = post_policy_evaluation(
+        "http://x/evaluate", {}, {"event": {}}, read_timeout_s=1.0, log_prefix="test"
+    )
+
+    assert result is None
+    assert len(calls) == native_policy_hook._EVALUATE_RETRY_MAX_ATTEMPTS
+
+
+def test_post_policy_evaluation_does_not_retry_4xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 4xx is a deterministic rejection — return immediately, no retry.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _scripted_client([(403, "forbidden"), (200, _ALLOW_BODY)], calls),
+    )
+
+    result = post_policy_evaluation(
+        "http://x/evaluate", {}, {"event": {}}, read_timeout_s=1.0, log_prefix="test"
+    )
+
+    assert result is None
+    assert len(calls) == 1
+
+
+def test_post_policy_evaluation_does_not_retry_read_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A read-phase transport error is NOT retried.
+
+    A severed read can mean a long-poll ASK gate was parked server-side and
+    then cut; re-POSTing (this path carries no stable elicitation id) would
+    re-park a duplicate approval card. Fail closed instead.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _scripted_client(
+            [
+                httpx.ReadError("connection reset", request=httpx.Request("POST", "http://x")),
+                (200, _ALLOW_BODY),
+            ],
+            calls,
+        ),
+    )
+
+    result = post_policy_evaluation(
+        "http://x/evaluate", {}, {"event": {}}, read_timeout_s=1.0, log_prefix="test"
+    )
+
+    assert result is None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("body", ["", "not json at all"])
+def test_post_policy_evaluation_fails_on_unusable_body(
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+) -> None:
+    """
+    A 2xx with an empty or malformed body fails closed without retrying.
+
+    The server answered, so the verdict is simply unusable — retrying would
+    not change a deterministic bad body.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _scripted_client([(200, body), (200, _ALLOW_BODY)], calls),
+    )
+
+    result = post_policy_evaluation(
+        "http://x/evaluate", {}, {"event": {}}, read_timeout_s=1.0, log_prefix="test"
+    )
+
+    assert result is None
+    assert len(calls) == 1
 
 
 def test_pre_tool_use_maps_to_phase_tool_call() -> None:
