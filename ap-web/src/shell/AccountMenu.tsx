@@ -21,8 +21,16 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "@/lib/routing";
-import { KeyRoundIcon, LogOutIcon, ShieldCheckIcon, UserCogIcon, UsersIcon } from "lucide-react";
+import {
+  KeyboardIcon,
+  KeyRoundIcon,
+  LogOutIcon,
+  ShieldCheckIcon,
+  UserCogIcon,
+  UsersIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { MOD_KEY, openKeyboardShortcuts } from "@/components/KeyboardShortcutsDialog";
 import {
   Dialog,
   DialogContent,
@@ -37,6 +45,7 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -148,9 +157,7 @@ export function AccountMenu() {
           <DropdownMenuLabel>
             {me.id}
             {me.is_admin && (
-              <span className="ml-1 text-xs font-normal text-muted-foreground">
-                (admin)
-              </span>
+              <span className="ml-1 text-xs font-normal text-muted-foreground">(admin)</span>
             )}
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
@@ -169,6 +176,13 @@ export function AccountMenu() {
             </>
           )}
           <DropdownMenuItem
+            onClick={() => openKeyboardShortcuts()}
+            className="flex items-center gap-2"
+          >
+            <KeyboardIcon /> Keyboard shortcuts
+            <DropdownMenuShortcut>{MOD_KEY} /</DropdownMenuShortcut>
+          </DropdownMenuItem>
+          <DropdownMenuItem
             onClick={() => {
               resetPwForm();
               setPwOpen(true);
@@ -177,10 +191,7 @@ export function AccountMenu() {
           >
             <KeyRoundIcon /> Change password
           </DropdownMenuItem>
-          <DropdownMenuItem
-            onClick={() => void onSignOut()}
-            className="flex items-center gap-2"
-          >
+          <DropdownMenuItem onClick={() => void onSignOut()} className="flex items-center gap-2">
             <LogOutIcon /> Sign out
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -250,10 +261,7 @@ export function AccountMenu() {
                 <Button
                   type="submit"
                   disabled={
-                    pwBusy ||
-                    oldPw.length === 0 ||
-                    newPw.length === 0 ||
-                    confirmPw.length === 0
+                    pwBusy || oldPw.length === 0 || newPw.length === 0 || confirmPw.length === 0
                   }
                 >
                   {pwBusy ? "Changing…" : "Change password"}

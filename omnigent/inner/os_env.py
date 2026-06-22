@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import atexit
+import base64
+import codecs
 import contextlib
 import json
 import os
@@ -21,7 +23,12 @@ from urllib.parse import urlparse, urlunparse
 from omnigent.runner.identity import strip_runner_auth_secrets
 
 from .async_utils import run_sync_on_thread
-from .datamodel import OSEnvSpec
+from .credential_proxy import (
+    CredentialProxyRuntime,
+    CredentialRewriteRule,
+    prepare_credential_proxy_runtime,
+)
+from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
     SandboxPolicy,
     activate_sandbox,
@@ -207,6 +214,38 @@ def build_helper_env(
     return strip_runner_auth_secrets(env)
 
 
+def _build_credential_proxy_parent_env(
+    *,
+    helper_env: Mapping[str, str],
+    parent_env: Mapping[str, str],
+    spec: CredentialProxySpec,
+) -> dict[str, str]:
+    """
+    Build the parent-side env used to resolve credential-proxy sources.
+
+    ``file:`` / ``command:`` sources run against the same filtered
+    baseline the sandbox helper gets (so a ``command`` source can't
+    enumerate the parent's full secret-bearing environment), with the
+    one narrow addition that ``env:`` sources need: their referenced
+    variable, lifted from the real parent environment.
+
+    :param helper_env: The filtered helper environment from
+        :func:`build_helper_env`.
+    :param parent_env: The real parent process environment (typically
+        ``os.environ``).
+    :param spec: The credential-proxy policy whose ``env:`` source names
+        are lifted from *parent_env*.
+    :returns: An env map suitable for source resolution.
+    """
+    resolved = dict(helper_env)
+    for entry in spec.entries:
+        if entry.source.kind == "env" and entry.source.env:
+            value = parent_env.get(entry.source.env)
+            if value is not None:
+                resolved[entry.source.env] = value
+    return resolved
+
+
 @dataclass
 class OSEnvironment(ABC):
     """Base OS environment interface."""
@@ -360,6 +399,7 @@ class _HelperProcessClient:
         )
 
         helper_cwd = self.cwd
+        credential_runtime: CredentialProxyRuntime | None = None
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
@@ -367,13 +407,36 @@ class _HelperProcessClient:
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
+            if sandbox.credential_proxy is not None:
+                # Resolve real secrets in the parent. Real secrets stay
+                # here and are attached to outbound requests by the egress
+                # proxy (swap-on-access). Only entries that opted into
+                # ``inject_env`` contribute a synthetic placeholder, merged
+                # into the helper env below; nothing else crosses into the
+                # sandbox.
+                credential_parent_env = _build_credential_proxy_parent_env(
+                    helper_env=env,
+                    parent_env=os.environ,
+                    spec=sandbox.credential_proxy,
+                )
+                credential_runtime = prepare_credential_proxy_runtime(
+                    sandbox.credential_proxy,
+                    parent_env=credential_parent_env,
+                )
+                env.update(credential_runtime.helper_env_updates)
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
         # starts a relay inside the network namespace that bridges
         # loopback TCP to this socket.
         if self._egress_rules and self._tmpdir is not None:
-            sandbox = self._start_egress_proxy_locked(sandbox, env)
+            sandbox = self._start_egress_proxy_locked(
+                sandbox,
+                env,
+                credential_rewrites=(
+                    credential_runtime.rewrites if credential_runtime is not None else None
+                ),
+            )
 
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),
@@ -519,7 +582,11 @@ class _HelperProcessClient:
     # ------------------------------------------------------------------
 
     def _start_egress_proxy_locked(
-        self, sandbox: SandboxPolicy, env: dict[str, str]
+        self,
+        sandbox: SandboxPolicy,
+        env: dict[str, str],
+        *,
+        credential_rewrites: list[CredentialRewriteRule] | None = None,
     ) -> SandboxPolicy:
         """Start the egress MITM proxy and inject env vars.
 
@@ -570,6 +637,8 @@ class _HelperProcessClient:
             replacement for egress fields).
         :param env: The helper environment dict — proxy/CA env vars
             are added in-place.
+        :param credential_rewrites: Optional synthetic-to-real credential
+            rewrites the proxy applies (secretless ``credential_proxy``).
         :returns: Updated :class:`SandboxPolicy` with egress relay
             port and socket path set. The egress auth token is NOT
             stored on the policy (which serialises to JSON and
@@ -592,6 +661,7 @@ class _HelperProcessClient:
             tmpdir=self._tmpdir,
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,
+            credential_rewrites=credential_rewrites,
         )
 
         # S4 (security): hold the controller refs on the client so
@@ -675,6 +745,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -687,6 +758,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "path": path,
                 "offset": offset,
                 "limit": limit,
+                "max_binary_bytes": max_binary_bytes,
             },
         )
         return cast(OpResult, result)
@@ -823,10 +895,13 @@ def _handle_helper_request(
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
+        max_binary_raw = request.get("max_binary_bytes")
+        max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
+            max_binary_bytes=max_binary_bytes,
         )
 
     if op == "write":
@@ -946,26 +1021,137 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
     raise PermissionError(f"Write access to '{path}' is blocked by sandbox.")
 
 
-def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
+# Bytes sampled to classify a file as text vs binary. A NUL byte or an invalid
+# UTF-8 sequence in this prefix marks the file binary (the same prefix-sniff
+# heuristic git uses), so a multi-MB binary is never read in full just to find
+# out it is not text.
+_BINARY_SNIFF_BYTES = 8192
+
+
+def _is_binary_file(path: Path) -> bool:
+    """Classify *path* as binary by inspecting only its first chunk.
+
+    Reads at most :data:`_BINARY_SNIFF_BYTES` and reports binary when those
+    bytes contain a NUL or are not valid UTF-8. The NUL check matters because
+    ``\x00`` *is* valid UTF-8, so a UTF-16/NUL-laden file would otherwise be
+    misread as text; checking for it explicitly matches git's heuristic. An
+    incremental decoder is used with ``final=False`` so a multi-byte character
+    straddling the chunk boundary is treated as *incomplete* (text), not
+    invalid (binary).
+
+    :param path: Absolute path of the file to classify.
+    :returns: ``True`` if the prefix contains a NUL or is not decodable UTF-8.
     """
-    Read lines from a text file.
+    with path.open("rb") as fh:
+        prefix = fh.read(_BINARY_SNIFF_BYTES)
+    if b"\x00" in prefix:
+        return True
+    try:
+        codecs.getincrementaldecoder("utf-8")("strict").decode(prefix, final=False)
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
+    """Read a binary file as base64, bounded by *max_binary_bytes*.
+
+    Only ``stat`` (for the total size) and at most *max_binary_bytes* are read
+    from disk, so a large file neither saturates memory nor inflates IPC.
+
+    :param path: Absolute path of the binary file.
+    :param max_binary_bytes: Byte cap. ``None`` returns a descriptor only (the
+        agent ``sys_os_read`` path); a positive int inlines up to that many
+        base64-encoded bytes (the filesystem-service path).
+    :returns: An :class:`OpResult` with ``encoding="base64"`` (see
+        :func:`_read_impl`).
+    """
+    total = path.stat().st_size
+    if max_binary_bytes is None:
+        # Agent tool path: return a descriptor only — inlining base64 the
+        # model cannot use would waste (and risk saturating) the context.
+        return {
+            "path": str(path),
+            "encoding": "base64",
+            "content": "",
+            "total_bytes": total,
+            # Not truncated — the content was deliberately not inlined.
+            "truncated": False,
+            "note": (
+                f"Binary file not inlined ({total} bytes). "
+                "View or download it via the file viewer."
+            ),
+        }
+    with path.open("rb") as fh:
+        payload = fh.read(max_binary_bytes)
+    return {
+        "path": str(path),
+        "content": base64.b64encode(payload).decode("ascii"),
+        "encoding": "base64",
+        "total_bytes": total,
+        "returned_bytes": len(payload),
+        "truncated": len(payload) < total,
+    }
+
+
+def _read_impl(
+    path: Path,
+    offset: int,
+    limit: JsonValue,
+    max_binary_bytes: int | None = None,
+) -> OpResult:
+    """
+    Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
+
+    The file's first chunk is sniffed for UTF-8 validity (see
+    :func:`_is_binary_file`). Files that look like text are read and returned
+    with the usual line-oriented ``offset``/``limit`` windowing. Files that do
+    *not* (images, archives, fonts, …) cannot be line-windowed, so they are
+    capped by *bytes* instead, reading at most ``max_binary_bytes`` from disk.
+
+    For binary files the behaviour depends on ``max_binary_bytes``:
+
+    * ``None`` (the default, used by the agent ``sys_os_read`` tool) — the
+      base64 payload is **not** inlined. A model cannot decode base64, and a
+      multi-MB blob would saturate the context window, so only a descriptor
+      (``total_bytes`` + a ``note``) is returned.
+    * a positive int (used by the filesystem service that feeds the web
+      viewer / downloads) — up to that many raw bytes are base64-encoded and
+      returned, with ``truncated`` set when the file was larger.
 
     :param path: Absolute path of the file to read.
-    :param offset: 1-based line number to start reading from.
+    :param offset: 1-based line number to start reading from (text only).
     :param limit: Maximum number of lines to return, or ``None`` for no
         limit (return all lines from *offset* to end of file).  Callers
         that want the default agent-tool cap should pass
-        :data:`_DEFAULT_READ_LIMIT` explicitly.
-    :returns: An :class:`OpResult` dict with ``path``, ``content``,
-        ``offset``, ``limit``, ``returned_lines``, and ``total_lines``.
+        :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
+    :param max_binary_bytes: Byte cap for binary files (see above). ``None``
+        returns a descriptor only.
+    :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
+        ``content``, ``offset``, ``limit``, ``returned_lines``, and
+        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``truncated`` and either ``content`` (the base64 string, byte-capped
+        callers) or a ``note`` (descriptor-only callers).
     """
     if offset < 1:
         return {"error": "offset must be >= 1"}
     if limit is not None:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
+    if max_binary_bytes is not None and max_binary_bytes < 1:
+        return {"error": "max_binary_bytes must be >= 1"}
 
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if _is_binary_file(path):
+        return _read_binary_impl(path, max_binary_bytes)
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        # The sniffed prefix decoded cleanly but bytes further in did not (a
+        # file that is text up front and binary later). Fall back to the binary
+        # path so we never return garbled text.
+        return _read_binary_impl(path, max_binary_bytes)
+
     lines = text.splitlines(keepends=True)
     start = offset - 1
     effective_limit = len(lines) if limit is None else limit
@@ -974,6 +1160,7 @@ def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
     return {
         "path": str(path),
         "content": content,
+        "encoding": "utf-8",
         "offset": offset,
         "limit": effective_limit,
         "returned_lines": max(0, resolved_limit - start),
@@ -1248,6 +1435,7 @@ def _run_helper(config_fd: int) -> int:
 
     cwd = Path(cwd_value)
     os.chdir(cwd)
+
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
 

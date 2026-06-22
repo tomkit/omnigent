@@ -84,6 +84,4 @@ TLS / DB wiring. Put that under `deploy/<platform>/` next to
 ## Related skills + docs
 
 - [`deploy/README.md`](../README.md) — the deploy-options menu.
-- [`deploy/databricks/SKILL.md`](../databricks/SKILL.md) — the Databricks Apps deploy path.
-- [`deploy/aws/SKILL.md`](../aws/SKILL.md) — wrapping this image in a one-command EC2 deploy.
 - `designs/OIDC_AUTH.md` — full native OIDC design.
