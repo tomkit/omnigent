@@ -823,6 +823,11 @@ def live_server(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Route the openai-agents harness to the mock LLM server so no
+        # real provider credentials are needed for agent turns. Without
+        # these the openai SDK falls back to real OpenAI, which fails.
+        "OPENAI_BASE_URL": f"{mock_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
     }
     runner_proc = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
@@ -897,6 +902,10 @@ def live_server(
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
     set_fallback_mock_llm(mock_url, "_policy_llm_", '{"action": "allow", "reason": ""}')
+    # Fallback for the openai-agents harness: any agent turn that doesn't
+    # match a content-based queue gets a generic reply (sufficient for tests
+    # that only assert an assistant bubble appears, not its exact content).
+    set_fallback_mock_llm(mock_url, "databricks-gpt-5-4", "Mock LLM response.")
 
     try:
         yield base_url
@@ -1542,6 +1551,7 @@ guardrails:
 @pytest.fixture
 def approval_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
     """Create a runner-bound session whose agent triggers an approval prompt.
@@ -1552,16 +1562,49 @@ def approval_session(
     ``guardrails`` blocks that path supports — see ``examples/polly``).
 
     :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL; used to
+        pre-configure the ``sys_os_shell`` tool call the approval agent emits.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``. Send a "run the command" turn to
         raise the gated-push approval.
     """
     import json as _json
+    import uuid as _uuid
+
+    # Each approval_session gets a unique model name so the mock queue is
+    # isolated between test runs. Using content-based routing (match=) on a
+    # shared model name caused a race: the previous test's runner (making its
+    # post-approval second LLM call) would steal the freshly-configured queue
+    # from the next test. A unique model per fixture call eliminates that race
+    # entirely — no other request will ever use this model key.
+    approval_model = f"approval-probe-{_uuid.uuid4().hex[:8]}"
+    # Substitute the unique model into the agent spec.
+    agent_yaml_text = _APPROVAL_AGENT_YAML.replace("databricks-gpt-5-4", approval_model)
+
+    # First LLM call: return the gated sys_os_shell tool call.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_git_push",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "git push origin main"}),
+                    }
+                ]
+            }
+        ],
+        key=approval_model,
+    )
+    # Fallback for the second LLM call (after the tool result arrives): the
+    # agent prompt asks for one short sentence, so any text suffices.
+    set_fallback_mock_llm(mock_llm_server_url, approval_model, "Command executed.")
 
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
-    yaml_bytes = _APPROVAL_AGENT_YAML.encode()
+    yaml_bytes = agent_yaml_text.encode()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         # Strict path: arcname config.yaml keeps it on the spec_version:1
