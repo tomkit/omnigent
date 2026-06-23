@@ -8,6 +8,7 @@ import {
   getConversationIconKind,
   getConversationAgentType,
   normalizePinnedConversationIds,
+  orderByPinnedSequence,
   togglePinnedConversationId,
 } from "./sidebarNav";
 
@@ -113,6 +114,45 @@ describe("pin helpers", () => {
     expect(
       normalizePinnedConversationIds(["conv_a", "missing", "conv_a", "conv_b"], conversations),
     ).toEqual(["conv_a", "conv_b"]);
+  });
+});
+
+describe("orderByPinnedSequence", () => {
+  it("orders by pin sequence, ignoring updated_at", () => {
+    // conv_b is the most recently updated, but conv_a was pinned more
+    // recently (it leads the ids list), so it must sort first.
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9), {
+      updatedAt: new Date(2026, 4, 14, 9),
+    });
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8), {
+      updatedAt: new Date(2026, 4, 14, 23),
+    });
+
+    // Passed in updated_at-desc order to prove the sort re-orders them.
+    expect(orderByPinnedSequence([convB, convA], ["conv_a", "conv_b"]).map((c) => c.id)).toEqual([
+      "conv_a",
+      "conv_b",
+    ]);
+  });
+
+  it("holds a pinned row's slot when its updated_at is bumped", () => {
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
+    const ids = ["conv_a", "conv_b"];
+
+    const before = orderByPinnedSequence([convA, convB], ids).map((c) => c.id);
+    // conv_b gets a new message (latest updated_at) — its slot must not move.
+    const bumped = { ...convB, updated_at: Math.floor(new Date(2026, 4, 14, 23).getTime() / 1000) };
+    const after = orderByPinnedSequence([convA, bumped], ids).map((c) => c.id);
+    expect(after).toEqual(before);
+  });
+
+  it("does not mutate the input array", () => {
+    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
+    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
+    const input = [convB, convA];
+    orderByPinnedSequence(input, ["conv_a", "conv_b"]);
+    expect(input.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
   });
 });
 

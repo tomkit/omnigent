@@ -117,6 +117,21 @@ export function togglePinnedConversationId(
   return [conversationId, ...pinnedIds];
 }
 
+// Order pinned conversations by when they were pinned, not by `updated_at`.
+// `pinnedIds` is kept most-recently-pinned-first (see
+// `togglePinnedConversationId`), so we preserve that order: a pinned session
+// holds its slot even when a new message bumps its `updated_at`. Anything
+// not in `pinnedIds` (shouldn't happen for this list) sinks to the bottom in
+// a stable order.
+export function orderByPinnedSequence(
+  conversations: Conversation[],
+  pinnedIds: readonly string[],
+): Conversation[] {
+  const rankById = new Map(pinnedIds.map((id, index) => [id, index]));
+  const rank = (c: Conversation): number => rankById.get(c.id) ?? Number.MAX_SAFE_INTEGER;
+  return [...conversations].sort((a, b) => rank(a) - rank(b));
+}
+
 export function normalizePinnedConversationIds(
   pinnedIds: readonly string[],
   conversations: readonly Conversation[],

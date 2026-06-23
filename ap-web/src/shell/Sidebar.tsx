@@ -80,6 +80,7 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   normalizePinnedConversationIds,
+  orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
   sortByUpdatedAtDesc,
   togglePinnedConversationId,
@@ -506,9 +507,12 @@ function ConversationList({
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
-    const pinned = sortByUpdatedAtDesc(
+    // Pinned rows are ordered strictly by when they were pinned (newest pin
+    // on top), not by `updated_at` — a pinned session shouldn't jump when it
+    // gets a new message.
+    const pinned = orderByPinnedSequence(
       allWithBackfill.filter((c) => pinnedSet.has(c.id) && c.archived !== true),
-      activeOverride,
+      pinnedConversationIds,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
     const active = allConversations.filter((c) => !pinnedIdSet.has(c.id) && c.archived !== true);
@@ -522,7 +526,7 @@ function ConversationList({
       activeOverride,
     );
     return { pinned, sessions, shared, archived };
-  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride]);
+  }, [allConversations, pinnedBackfill, pinnedSet, pinnedConversationIds, activeOverride]);
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
