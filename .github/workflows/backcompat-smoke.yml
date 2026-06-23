@@ -1,0 +1,113 @@
+name: Backcompat Smoke
+
+# Pre-merge backwards-compat SMOKE: run main's e2e + integration suites against
+# the PREVIOUS release only (not the full version matrix the scheduled
+# Backwards-Compat sweep covers). The version set is {main, <latest non-rc tag>}
+# crossed pairwise, so the cells are: old server + main runner (Config 1), main
+# server + old runner (Config 2), and old server + old runner. Each cell pins
+# the server and/or runner subprocess to the old build; client + tests stay on
+# the PR. Reuses the SAME composite actions and matrix script as the gates and
+# the scheduled sweep (.github/actions/{e2e,integration}-run,
+# .github/scripts/ci/backcompat-pairwise-matrix.sh), so there's no drift.
+#
+# Lighter than the scheduled sweep: previous release only, 2 e2e shards/cell.
+# Runs on every PR so a change that breaks the last release's server or runner
+# is caught pre-merge.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: backcompat-smoke-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      e2e_matrix: ${{ steps.matrix.outputs.e2e_matrix }}
+      integration_matrix: ${{ steps.matrix.outputs.integration_matrix }}
+    steps:
+      - name: Check out CI scripts + tags
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          sparse-checkout: .github/scripts/ci
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve previous release tag
+        id: prev
+        run: |
+          prev="$(git tag --sort=-v:refname | grep -viE '(^|[^a-z])rc[0-9]' | head -1)"
+          if [ -z "$prev" ]; then
+            echo "No release tag found; nothing to smoke against." >&2
+            echo "prev=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Previous release: $prev"
+            echo "prev=$prev" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compute smoke matrices (main + previous release, pairwise)
+        id: matrix
+        env:
+          # {main, <prev>} crossed pairwise -> 3 cells (main/main excluded):
+          # old-server+main-runner, main-server+old-runner, old-server+old-runner.
+          VERSIONS: ${{ steps.prev.outputs.prev != '' && format('main,{0}', steps.prev.outputs.prev) || 'main' }}
+          NUM_SHARDS: "2"
+        run: bash .github/scripts/ci/backcompat-pairwise-matrix.sh
+
+  smoke-e2e:
+    name: Backcompat smoke e2e (server ${{ matrix.server }} / runner ${{ matrix.runner }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.setup.outputs.e2e_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # Test the merge result on PRs; fetch-depth 0 so the action can
+          # `git worktree add` the old release tag.
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run e2e suite for this cell
+        uses: ./.github/actions/e2e-run
+        with:
+          server_version: ${{ matrix.server != 'main' && matrix.server || '' }}
+          runner_version: ${{ matrix.runner != 'main' && matrix.runner || '' }}
+          shard_id: ${{ matrix.shard_id }}
+          num_shards: ${{ matrix.num_shards }}
+          parallelism: "2"
+          artifact_suffix: "-s${{ matrix.server }}-r${{ matrix.runner }}"
+
+  smoke-integration:
+    name: Backcompat smoke integration (server ${{ matrix.server }} / runner ${{ matrix.runner }}, ${{ matrix.harness }})
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.setup.outputs.integration_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run integration suite for this cell
+        uses: ./.github/actions/integration-run
+        with:
+          server_version: ${{ matrix.server != 'main' && matrix.server || '' }}
+          runner_version: ${{ matrix.runner != 'main' && matrix.runner || '' }}
+          harness: ${{ matrix.harness }}
+          model: ${{ matrix.model }}
+          workers: ${{ matrix.workers }}
+          artifact_suffix: "-s${{ matrix.server }}-r${{ matrix.runner }}"
