@@ -1424,6 +1424,38 @@ class ClaudeSDKExecutor(Executor):
             state.model = model
         return state.client
 
+    async def compact(self, session_key: str):  # type: ignore[override]
+        """Trigger explicit compaction by sending ``/compact`` to the CLI.
+
+        The CLI compacts its own context internally. We drain the
+        response stream so the compaction completes, then yield a
+        ``CompactionComplete`` event so the runner can update its
+        history mirror and publish SSE events.
+        """
+        state = self._clients.get(session_key)
+        if state is None:
+            return
+        client = state.client
+        try:
+            await client.query("/compact", session_id=session_key)
+            # Drain the response to let the CLI finish compacting.
+            async for _message in client.receive_response():
+                pass
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Explicit compaction failed for claude-sdk session %s",
+                session_key,
+                exc_info=True,
+            )
+            return
+        from omnigent.inner.executor import CompactionComplete
+
+        yield CompactionComplete(
+            summary="[Claude Code compaction — explicit /compact]",
+            token_count=0,
+            model=state.model,
+        )
+
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
         await self._close_live_client(session_key)
