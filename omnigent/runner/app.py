@@ -7139,34 +7139,43 @@ def create_runner_app(
         result: list[dict[str, Any]] = []
         if compaction_idx is not None:
             c = items[compaction_idx]
-            result.append(
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "[Automatically generated summary of prior "
-                                "conversation context.]\n\n"
-                                "Please provide a summary of our conversation so far."
-                            ),
-                        }
-                    ],
-                }
-            )
-            result.append(
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": c.get("summary", ""),
-                        }
-                    ],
-                }
-            )
+            # Prefer compacted_messages when available — they carry the
+            # full compacted state (e.g. OpenAI's opaque compaction
+            # tokens) that the harness can replay directly. Fall back
+            # to a synthetic summary pair for older compaction items or
+            # harnesses that don't provide compacted messages.
+            _compacted = c.get("compacted_messages")
+            if _compacted:
+                result.extend(_compacted)
+            else:
+                result.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "[Automatically generated summary of prior "
+                                    "conversation context.]\n\n"
+                                    "Please provide a summary of our conversation so far."
+                                ),
+                            }
+                        ],
+                    }
+                )
+                result.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": c.get("summary", ""),
+                            }
+                        ],
+                    }
+                )
             remaining = items[compaction_idx + 1 :]
         else:
             remaining = items
