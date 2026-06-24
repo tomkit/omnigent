@@ -1605,18 +1605,11 @@ async def _auto_create_goose_terminal(
     # re-creating, so old and new tasks can't both mirror (double-posting), and
     # drop the prior terminal's stale forward cursor.
     await _cancel_auto_forwarder_task(session_id)
-    from omnigent.goose_native_bridge import (
-        bridge_dir_for_session_id,
-        setup_goose_native_plugin_root,
-        write_tmux_target,
-    )
+    from omnigent.goose_native_bridge import bridge_dir_for_session_id, write_tmux_target
     from omnigent.goose_native_forwarder import clear_goose_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_goose_bridge_state(bridge_dir)
-    # Server URL is needed before launch (the policy plugin's hook posts to it via
-    # the terminal env) and reused by the forwarder below.
-    server_url = _required_runner_env("RUNNER_SERVER_URL")
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -1626,22 +1619,15 @@ async def _auto_create_goose_terminal(
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     goose_command = resolve_goose_executable()
-    # Per-session GOOSE_PATH_ROOT holding an Omnigent policy plugin so native TUI
-    # tool calls gate via the web approval card. ``None`` when Goose's real dirs
-    # can't be resolved — then we launch without gating rather than break auth.
-    goose_path_root = setup_goose_native_plugin_root(bridge_dir, goose_command=goose_command)
-    goose_env: dict[str, str] = {"GOOSE_CLI_THEME": "ansi", "GOOSE_TELEMETRY_OFF": "1"}
-    if goose_path_root is not None:
-        goose_env.update(
-            {
-                "GOOSE_PATH_ROOT": str(goose_path_root),
-                # auto = no in-TUI tool prompt; the PreToolUse hook (Omnigent) is
-                # the gate, raising the web approval card on an ASK policy.
-                "GOOSE_MODE": "auto",
-                "_OMNIGENT_SERVER_URL": server_url,
-                "_OMNIGENT_SESSION_ID": session_id,
-            }
-        )
+    # GOOSE_MODE=smart_approve so Goose prompts in its TUI before sensitive tools
+    # (its native approval, which shows in the terminal and the web's embedded
+    # terminal). Goose's default mode is Auto (no prompt), so we set this for the
+    # approval flow to appear at all. Provider/model come from `goose configure`.
+    goose_env: dict[str, str] = {
+        "GOOSE_CLI_THEME": "ansi",
+        "GOOSE_TELEMETRY_OFF": "1",
+        "GOOSE_MODE": "smart_approve",
+    }
     # Launch-unique Goose session name. `goose session --name X` (without
     # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
     # so a per-launch-unique name lets the forwarder bind to EXACTLY this
@@ -1667,10 +1653,9 @@ async def _auto_create_goose_terminal(
             args=goose_args,
             # ANSI theme keeps the pane cheap to scrape; GOOSE_TELEMETRY_OFF
             # suppresses Goose's first-run "share usage data?" prompt, which
-            # would otherwise block the headless pane on a fresh install. Goose's
+            # would otherwise block the headless pane on a fresh install;
+            # GOOSE_MODE=smart_approve turns on Goose's own in-TUI approval. Goose's
             # provider/model come from the user's own `goose configure` (KTD4).
-            # ``goose_env`` also carries the GOOSE_PATH_ROOT + policy-hook env when
-            # tool-policy gating is active (see setup_goose_native_plugin_root).
             env=goose_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
@@ -1702,6 +1687,7 @@ async def _auto_create_goose_terminal(
     # server URL + refresh-capable auth.
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.goose_native_forwarder import supervise_goose_forwarder
@@ -1766,18 +1752,11 @@ async def _auto_create_hermes_terminal(
     # re-creating, so old and new tasks can't both mirror (double-posting), and
     # drop the prior terminal's stale forward cursor.
     await _cancel_auto_forwarder_task(session_id)
-    from omnigent.hermes_native_bridge import (
-        bridge_dir_for_session_id,
-        setup_hermes_native_home,
-        write_tmux_target,
-    )
+    from omnigent.hermes_native_bridge import bridge_dir_for_session_id, write_tmux_target
     from omnigent.hermes_native_forwarder import clear_hermes_bridge_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_hermes_bridge_state(bridge_dir)
-    # Resolve the server URL before launch: the per-session policy hook posts tool
-    # calls to it, and the forwarder reuses it below.
-    server_url = _required_runner_env("RUNNER_SERVER_URL")
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -1787,13 +1766,6 @@ async def _auto_create_hermes_terminal(
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     hermes_command = resolve_hermes_executable()
-    # Per-session HERMES_HOME = the user's full ~/.hermes config (minus state.db)
-    # plus Omnigent's pre_tool_call policy hook, so native TUI tool calls gate via
-    # the web approval card. Paired with HERMES_YOLO_MODE=1 below so Hermes' own
-    # in-TUI prompt is suppressed and the web card is the sole gate.
-    hermes_home_dir = setup_hermes_native_home(
-        bridge_dir, session_id=session_id, server_url=server_url
-    )
     # Stamp the discovery floor BEFORE launch: the forwarder binds the newest
     # ``sessions`` row whose ``cwd`` matches this workspace and whose
     # ``started_at`` is at/after this instant (minus a small skew). A wiped bridge
@@ -1809,15 +1781,13 @@ async def _auto_create_hermes_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=hermes_command,
             args=hermes_args,
-            # HERMES_HOME points at the per-session config (full user config +
-            # Omnigent policy hook). HERMES_YOLO_MODE=1 suppresses Hermes' own
-            # in-TUI tool prompt so the web approval card (raised by the hook on an
-            # ASK policy) is the sole gate. No color-disabling env: Hermes' themed
-            # TUI (its gold prompt) is the point of the native view, and the bridge
-            # captures the pane with ``tmux capture-pane -p`` (ANSI stripped) for
-            # readiness detection while the forwarder reads the SQLite transcript —
-            # so colour never interferes. (An earlier NO_COLOR=1 rendered it white.)
-            env={"HERMES_HOME": str(hermes_home_dir), "HERMES_YOLO_MODE": "1"},
+            # No env overrides: Hermes uses the user's own ~/.hermes (model,
+            # provider, tools, and its native tool-approval prompt — which appears
+            # in the TUI and the web's embedded terminal). No NO_COLOR (an earlier
+            # NO_COLOR=1 rendered the gold TUI white); no HERMES_YOLO_MODE (that
+            # suppressed Hermes' own approval). The bridge captures the pane with
+            # ``tmux capture-pane -p`` (ANSI stripped), so colour never interferes.
+            env={},
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
@@ -1848,6 +1818,7 @@ async def _auto_create_hermes_terminal(
     # server URL + refresh-capable auth.
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.hermes_native_forwarder import supervise_hermes_forwarder
@@ -1868,9 +1839,8 @@ async def _auto_create_hermes_terminal(
             agent_name="hermes-native-ui",
             workspace=workspace,
             launch_epoch_s=launch_epoch_s,
-            # The native TUI writes its transcript into the per-session HERMES_HOME,
-            # so tail that store (not the user's ~/.hermes/state.db).
-            db_path=hermes_home_dir / "state.db",
+            # The native TUI uses the user's ~/.hermes, so the forwarder tails the
+            # default store there (default_state_db()).
             auth=_runner_auth,
         ),
         name=f"hermes-forwarder-{session_id}",
