@@ -2949,5 +2949,3 @@ def test_no_compaction_item_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
-
-

@@ -1077,19 +1077,24 @@ class OpenAIAgentsSDKExecutor(Executor):
 
         underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
         sdk_session: Any = underlying  # type: ignore[explicit-any]
-        try:
-            from agents.memory import OpenAIResponsesCompactionSession
+        # Wrap with compaction session when the client targets a real
+        # HTTP endpoint. Skip for Databricks (responses.compact not
+        # proxied) and bare object() clients in unit tests.
+        _base = str(getattr(self._client, "base_url", ""))
+        if not self._databricks and _base.startswith("http"):
+            try:
+                from agents.memory import OpenAIResponsesCompactionSession
 
-            sdk_session = OpenAIResponsesCompactionSession(
-                session_id=session_key,
-                underlying_session=underlying,  # type: ignore[arg-type]
-                client=self._client,
-            )
-        except (ImportError, AttributeError, ValueError) as exc:
-            logger.debug(
-                "Compaction session setup failed, falling back to plain session: %s",
-                exc,
-            )
+                sdk_session = OpenAIResponsesCompactionSession(
+                    session_id=session_key,
+                    underlying_session=underlying,  # type: ignore[arg-type]
+                    client=self._client,
+                )
+            except (ImportError, AttributeError, ValueError) as exc:
+                logger.debug(
+                    "Compaction session setup failed, falling back to plain session: %s",
+                    exc,
+                )
         state = _AgentsSessionState(sdk_session=sdk_session)
         self._session_states[session_key] = state
         return state
