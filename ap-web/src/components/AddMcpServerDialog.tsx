@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { isValidMcpServerName } from "@/lib/bundleManipulation";
 import {
   Dialog,
   DialogContent,
@@ -102,8 +103,9 @@ export function AddMcpServerDialog({
     onAdd(result);
   }
 
+  const nameValid = isValidMcpServerName(name.trim());
   const canSubmit =
-    name.trim().length > 0 &&
+    nameValid &&
     !submitting &&
     (transport === "stdio" ? command.trim().length > 0 : url.trim().length > 0);
 
@@ -130,6 +132,11 @@ export function AddMcpServerDialog({
                 placeholder="server-name"
                 autoFocus
               />
+              {name.trim().length > 0 && !nameValid && (
+                <p className="text-[10px] text-destructive">
+                  Letters, digits, hyphens, underscores only
+                </p>
+              )}
             </div>
             <div className="flex flex-col gap-1.5">
               <label className="text-xs font-medium text-muted-foreground">Transport</label>

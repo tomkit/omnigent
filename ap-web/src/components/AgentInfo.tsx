@@ -522,15 +522,17 @@ function SessionMcpSection({
   const [addOpen, setAddOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   async function handleAdd(server: McpServerFormResult) {
     setSubmitting(true);
+    setError(null);
     try {
       await addMcpServerToSession(sessionId, server);
       await queryClient.invalidateQueries({ queryKey: ["session-agent", sessionId] });
       setAddOpen(false);
     } catch (e) {
-      console.error("Failed to add MCP server:", e);
+      setError(e instanceof Error ? e.message : "Failed to add MCP server");
     } finally {
       setSubmitting(false);
     }
@@ -538,11 +540,12 @@ function SessionMcpSection({
 
   async function handleRemove(serverName: string) {
     setRemoving(serverName);
+    setError(null);
     try {
       await removeMcpServerFromSession(sessionId, serverName);
       await queryClient.invalidateQueries({ queryKey: ["session-agent", sessionId] });
     } catch (e) {
-      console.error("Failed to remove MCP server:", e);
+      setError(e instanceof Error ? e.message : "Failed to remove MCP server");
     } finally {
       setRemoving(null);
     }
@@ -620,6 +623,11 @@ function SessionMcpSection({
         </div>
       ) : (
         <p className="text-xs text-muted-foreground">No MCP servers</p>
+      )}
+      {error && (
+        <p className="text-xs text-destructive" data-testid="mcp-error">
+          {error}
+        </p>
       )}
       <AddMcpServerDialog
         open={addOpen}
