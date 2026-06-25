@@ -222,6 +222,13 @@ class _FakeSandbox:
         # Exception ``set_autostop_interval`` raises (models a
         # provider rejection), or ``None`` for normal configuration.
         self.autostop_raises: Exception | None = None
+        # Stopped-box lifecycle setters (keep_alive's idle-suspend disk
+        # retention): the intervals recorded per post-creation call.
+        self.auto_archive_intervals: list[int] = []
+        self.auto_delete_intervals: list[int] = []
+        # Exception ``set_auto_archive_interval`` raises (models a
+        # provider rejection), or ``None`` for normal configuration.
+        self.auto_archive_raises: Exception | None = None
         # Exception ``stop`` raises (models a provider rejection), or
         # ``None`` for a normal stop.
         self.stop_raises: Exception | None = None
@@ -249,6 +256,16 @@ class _FakeSandbox:
         if self.autostop_raises is not None:
             raise self.autostop_raises
         self.autostop_intervals.append(interval)
+
+    def set_auto_archive_interval(self, interval: int) -> None:
+        """Record the configured stopped-box auto-archive interval."""
+        if self.auto_archive_raises is not None:
+            raise self.auto_archive_raises
+        self.auto_archive_intervals.append(interval)
+
+    def set_auto_delete_interval(self, interval: int) -> None:
+        """Record the configured stopped-box auto-delete interval."""
+        self.auto_delete_intervals.append(interval)
 
 
 @dataclass
@@ -832,6 +849,11 @@ def test_keep_alive_disables_autostop(fake_daytona: _FakeDaytonaState) -> None:
 
     # 0 = disabled; any other value re-enables the idle reaper.
     assert fake_daytona.sandboxes[sandbox_id].autostop_intervals == [0]
+    # Always-on path must NOT touch the stopped-box lifecycle: an
+    # always-on host never stops, so leave auto-archive / auto-delete at
+    # the provider defaults (preserving prior behavior).
+    assert fake_daytona.sandboxes[sandbox_id].auto_archive_intervals == []
+    assert fake_daytona.sandboxes[sandbox_id].auto_delete_intervals == []
 
 
 def test_keep_alive_soft_fails_on_provider_rejection(
@@ -966,13 +988,63 @@ def test_keep_alive_sets_configured_idle_interval(fake_daytona: _FakeDaytonaStat
     interval rather than forcing always-on (0) — so an attached sandbox
     created outside this flow idle-suspends consistently with provisioned
     ones instead of being pinned on forever.
+
+    It ALSO pins the stopped-box lifecycle exactly as provision does, so
+    an externally-created box (provider-default ~7-day auto-archive,
+    recoverable:false) gets the same reclaim protection: auto-delete
+    disabled (negative sentinel) and auto-archive at the maximal-retention
+    sentinel (0). Without this, the idle-stop armed here could put the box
+    to sleep and let the provider reclaim its disk before a resume.
     """
     launcher = DaytonaSandboxLauncher(idle_minutes=30)
     sandbox_id = launcher.provision("a")
 
     launcher.keep_alive(sandbox_id)
 
-    assert fake_daytona.sandboxes[sandbox_id].autostop_intervals == [30]
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    assert sandbox.autostop_intervals == [30]
+    # Auto-delete disabled (negative) — a stopped box is never deleted.
+    assert sandbox.auto_delete_intervals == [-1]
+    # Auto-archive at the maximum-interval sentinel (0) — longest
+    # retention, so the idle-suspended box isn't archived before resume.
+    assert sandbox.auto_archive_intervals == [0]
+
+
+def test_keep_alive_respects_archive_minutes_override(fake_daytona: _FakeDaytonaState) -> None:
+    """
+    On the attach path, ``archive_minutes`` sets a finite auto-archive
+    ceiling for the idle-suspended box (vs maximal retention), mirroring
+    provision; auto-delete stays disabled and auto-stop tracks
+    ``idle_minutes``.
+    """
+    launcher = DaytonaSandboxLauncher(idle_minutes=30, archive_minutes=4320)
+    sandbox_id = launcher.provision("a")
+
+    launcher.keep_alive(sandbox_id)
+
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    assert sandbox.autostop_intervals == [30]
+    assert sandbox.auto_archive_intervals == [4320]
+    assert sandbox.auto_delete_intervals == [-1]
+
+
+def test_keep_alive_soft_fails_on_retention_rejection(
+    fake_daytona: _FakeDaytonaState, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    A rejected stopped-box retention setting (idle-suspend mode) warns
+    instead of aborting — same soft-fail contract as the auto-stop
+    rejection, naming the reclaim risk so the operator knows.
+    """
+    launcher = DaytonaSandboxLauncher(idle_minutes=30)
+    sandbox_id = launcher.provision("a")
+    fake_daytona.sandboxes[sandbox_id].auto_archive_raises = _FakeDaytonaError("nope")
+
+    launcher.keep_alive(sandbox_id)  # must not raise
+
+    out = capsys.readouterr().out
+    assert "could not arm idle-suspend" in out
+    assert "reclaimed while stopped" in out
 
 
 # ── put / wheel_install_command ─────────────────────────────

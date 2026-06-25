@@ -596,9 +596,20 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         with ``idle_minutes`` it instead sets that interval, so attached
         sandboxes created outside this flow idle-suspend consistently
         with provisioned ones (rather than being forced always-on).
-        ``provision`` already applies the same interval at create time;
-        this re-asserts it. Soft-fail per the launcher contract: a
-        rejected setting warns rather than aborting the bootstrap.
+
+        In idle-suspend mode this ALSO pins the stopped-box lifecycle —
+        auto-delete disabled, auto-archive at a safe (by default maximal)
+        interval — exactly as :meth:`provision` does at create time. An
+        externally-created sandbox carries the provider-default
+        stopped-box lifecycle (observed: auto-archive at 7 days,
+        ``recoverable: false``), so without this it could be reclaimed out
+        from under a pending :meth:`resume` once the idle-stop armed here
+        puts it to sleep. Pinning closes that gap, giving boxes created
+        outside Omnigent the same reclaim protection as provisioned ones.
+        When always-on (interval 0) the host never stops, so the
+        stopped-box lifecycle is left untouched — preserving prior
+        behavior. Soft-fail per the launcher contract: a rejected setting
+        warns rather than aborting the bootstrap.
 
         :param sandbox_id: The sandbox to configure.
         """
@@ -610,19 +621,31 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         interval = self._autostop_interval()
         try:
             handle.set_autostop_interval(interval)
+            # With idle-suspend on, this attached box WILL sit stopped
+            # between turns. Mirror provision and pin the stopped-box
+            # lifecycle so an externally-created box (provider-default
+            # ~7-day auto-archive / recoverable:false) isn't reclaimed
+            # before its resume: disable auto-delete, pin auto-archive to
+            # a safe (by default maximal) interval. When always-on
+            # (interval 0) the host never stops, so leave both untouched.
+            if self._idle_minutes is not None:
+                handle.set_auto_delete_interval(_AUTO_DELETE_DISABLED)
+                handle.set_auto_archive_interval(self._archive_interval())
         except daytona.DaytonaError as exc:
             # Interval 0 is always-on: a rejection risks an UNWANTED
             # idle-stop; a non-zero interval is idle-suspend: a rejection
-            # risks the wrong (likely Daytona-default) idle timeout. Name
-            # the failure either way so the operator knows.
+            # risks the wrong idle timeout OR an unprotected stopped box
+            # that gets reclaimed before resume. Name the failure either
+            # way so the operator knows.
             detail = (
                 "could not disable idle auto-stop"
                 if interval == _AUTO_STOP_DISABLED
-                else f"could not set idle auto-stop to {interval} minutes"
+                else f"could not arm idle-suspend (auto-stop {interval}m + disk retention)"
             )
             ui.console.print(
                 f"  → warning: {detail} on '{sandbox_id}' ({exc}); the "
-                "sandbox may stop after Daytona's idle timeout.",
+                "sandbox may stop after Daytona's idle timeout or be "
+                "reclaimed while stopped.",
                 style="omni.warning",
                 markup=False,
             )
@@ -630,7 +653,10 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             message = (
                 "idle auto-stop disabled (sandbox lives until deleted)"
                 if interval == _AUTO_STOP_DISABLED
-                else f"idle auto-stop set to {interval} minutes (host resumes on next message)"
+                else (
+                    f"idle auto-stop set to {interval} minutes; stopped-box "
+                    "disk retention pinned (host resumes on next message)"
+                )
             )
             click.echo(f"  → {message}")
 
