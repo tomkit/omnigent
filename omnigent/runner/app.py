@@ -14965,7 +14965,6 @@ def create_runner_app(
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
-        _compaction_contexts.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         if agent_id:
             _spec_cache.pop(agent_id, None)
