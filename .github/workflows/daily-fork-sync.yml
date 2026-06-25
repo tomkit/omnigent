@@ -40,6 +40,11 @@ concurrency:
   group: daily-fork-sync
   cancel-in-progress: false
 
+# Minimal permissions. We resolve conflicts with the headless `claude` CLI
+# authenticated by a direct API key / OAuth token (NOT the Claude GitHub App),
+# so OIDC is not used and `id-token: write` is deliberately NOT granted. (The
+# `anthropics/claude-code-action` GitHub-App path WOULD need `id-token: write`;
+# we avoid that path entirely — see the resolver step below.)
 permissions:
   contents: write
   pull-requests: write
@@ -83,61 +88,37 @@ jobs:
         id: rebase
         run: bash .github/scripts/rebase-fork.sh
 
-      # ---- Claude Code in the loop: only runs when the rebase paused on conflicts ----
-      - name: Resolve rebase conflicts with Claude Code
+      # ---- Claude in the loop: only when the rebase paused on conflicts ----
+      # IMPORTANT: the `anthropics/claude-code-action` REFUSES destructive git
+      # ops (rebase / merge / rebase --continue / force-push) — the refusal is
+      # baked into its system prompt and fires even with Bash allowed. So we do
+      # NOT use that action. Instead we install the headless Claude Code CLI and
+      # let our own script (resolve-rebase.sh) OWN the git rebase loop, calling
+      # `claude -p` with file-editing tools ONLY (no Bash) to fix the conflicted
+      # file contents. The shell runs every `git add` / `rebase --continue`.
+      - name: Install Claude Code CLI
         if: steps.rebase.outputs.outcome == 'conflict'
-        uses: anthropics/claude-code-action@v1
-        with:
-          # Either secret works; pass both, the empty one is ignored.
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Give Claude the shell + edit tools it needs to drive the rebase.
-          claude_args: >-
-            --allowedTools Bash,Read,Edit,Write,Glob,Grep
-            --max-turns 60
-          prompt: |
-            You are running inside a GitHub Actions runner, in the checked-out
-            git repository of the fork `tomkit/omnigent`. A `git rebase` of this
-            fork's custom commits onto the upstream branch
-            `${{ env.UPSTREAM_REMOTE }}/${{ env.UPSTREAM_BRANCH }}`
-            (omnigent-ai/omnigent) is PAUSED on a merge conflict.
+        run: |
+          # Pin the CLI for a reproducible daily production run; bump deliberately.
+          npm install -g @anthropic-ai/claude-code@2.1.191
+          claude --version
 
-            Your job: resolve every conflict and drive the rebase to completion.
+      - name: Resolve rebase conflicts (shell-driven loop, Claude edits files)
+        if: steps.rebase.outputs.outcome == 'conflict'
+        env:
+          # Use ONE credential (prefer the OAuth token for Claude subscribers;
+          # swap to ANTHROPIC_API_KEY if you use a pay-as-you-go API key). The
+          # CLI reads whichever of these env vars is set.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAX_ITERS: "20"
+        run: bash .github/scripts/resolve-rebase.sh
 
-            Rules:
-            - Inspect state with `git status` and `git diff`. The conflicted
-              files have conflict markers (<<<<<<<, =======, >>>>>>>).
-            - Resolve each conflict so that the fork's custom commits keep their
-              INTENT (the feature/behavior each commit added), while taking
-              upstream's changes wherever they do not actually conflict with that
-              intent. When upstream refactored code the fork also touched,
-              re-apply the fork's change on top of upstream's new shape rather
-              than reverting upstream.
-            - The fork's notable custom work includes: daytona managed-sandbox
-              idle-suspend/resume + bidirectional context sync, the Fly server
-              image / deploy config, and a polly worker-routing policy. Preserve
-              these.
-            - After fixing the files for the current step:
-              `git add -A` then `git rebase --continue`. Do NOT use a commit
-              editor — set `GIT_EDITOR=true` (or pass `--no-edit` semantics) so
-              the rebase continues non-interactively. Repeat for every paused
-              step until `git status` shows the rebase is complete (no
-              "rebase in progress").
-            - If a commit becomes empty because upstream already contains its
-              change, run `git rebase --skip`.
-            - Do NOT run `git rebase --abort`. Do NOT `git push`. Do NOT change
-              project files beyond what conflict resolution requires. Leave the
-              final rebased commits in the working branch for the workflow to
-              push.
-            - When finished, print the output of `git log --oneline -15` and a
-              one-paragraph summary of how you resolved the conflicts.
-
-      - name: Verify rebase completed
+      - name: Verify rebase completed and landed on upstream
         if: steps.rebase.outputs.outcome == 'conflict'
         run: |
           if [ -d "$(git rev-parse --git-path rebase-merge)" ] || \
              [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
-            echo "::error::Rebase is still in progress after Claude Code ran — conflicts were not fully resolved."
+            echo "::error::Rebase is still in progress after resolution — conflicts were not fully resolved."
             git status
             exit 1
           fi
@@ -146,7 +127,18 @@ jobs:
             git status
             exit 1
           fi
-          echo "Rebase completed and tree is clean."
+          # Prove the rebase actually landed on upstream: upstream must be an
+          # ancestor of HEAD AND HEAD must have moved from where we started. This
+          # stops an aborted/empty resolution from masquerading as success.
+          if ! git merge-base --is-ancestor "${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}" HEAD; then
+            echo "::error::HEAD is not a descendant of ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH} — rebase did not land on upstream."
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" = "${{ steps.rebase.outputs.head_before }}" ]; then
+            echo "::error::HEAD did not move during conflict resolution — suspect an aborted rebase."
+            exit 1
+          fi
+          echo "Rebase completed, tree clean, HEAD descends from upstream."
 
       - name: Decide outcome
         id: decide
@@ -204,13 +196,31 @@ jobs:
           echo "Conflicts were resolved by Claude — pushing ${branch} and opening a PR."
           git push origin "HEAD:${branch}"
 
-          pr_url="$(gh pr create \
-            --base "${FORK_BRANCH}" \
-            --head "${branch}" \
-            --title "Daily fork sync (conflict-resolved) ${ts}" \
-            --body "Automated daily rebase of \`${FORK_BRANCH}\` onto \`${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}\`. Conflicts were resolved by Claude Code in CI. **Review the resolution before merging** — auto-deploy was withheld pending this human gate." \
-            2>&1)" || { echo "::warning::gh pr create failed (a PR for this branch may already exist): $pr_url"; }
-          echo "PR: $pr_url"
+          # The review PR is REQUIRED. If it cannot be created we fail the job —
+          # a conflict-resolved tree must never exist without a review gate, and
+          # the force_deploy path must never run an unreviewed deploy. The ONLY
+          # tolerated failure is "a PR already exists for this branch" (e.g. a
+          # re-run): we detect that specifically and reuse the existing PR URL.
+          body="Automated daily rebase of \`${FORK_BRANCH}\` onto \`${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}\`. Conflicts were resolved by Claude Code in CI. **Review the resolution before merging** — auto-deploy is withheld pending this human gate (unless re-run with force_deploy)."
+          if pr_url="$(gh pr create \
+                --base "${FORK_BRANCH}" \
+                --head "${branch}" \
+                --title "Daily fork sync (conflict-resolved) ${ts}" \
+                --body "${body}" 2>err.txt)"; then
+            echo "Opened review PR: ${pr_url}"
+          else
+            if grep -qiE 'already exists' err.txt; then
+              pr_url="$(gh pr list --head "${branch}" --state open --json url --jq '.[0].url' 2>/dev/null || true)"
+              if [ -z "${pr_url}" ]; then
+                echo "::error::gh reported an existing PR for ${branch} but none could be found."
+                cat err.txt; exit 1
+              fi
+              echo "Reusing existing review PR: ${pr_url}"
+            else
+              echo "::error::gh pr create failed — refusing to leave a conflict-resolved tree without a review PR."
+              cat err.txt; exit 1
+            fi
+          fi
 
           if [ "${FORCE_DEPLOY}" = "true" ]; then
             echo "force_deploy is set — deploying the conflict-resolved tree anyway."
@@ -226,7 +236,8 @@ jobs:
           } >>"$GITHUB_OUTPUT"
           {
             echo "### Daily fork sync: conflicts resolved by Claude :warning:"
-            echo "Opened review PR for branch \`${branch}\`. Deploy gated: \`force_deploy=${FORCE_DEPLOY}\`."
+            echo "Review PR for branch \`${branch}\`: ${pr_url}"
+            echo "Deploy gated: \`force_deploy=${FORCE_DEPLOY}\` (deploy=${deploy})."
           } >>"$GITHUB_STEP_SUMMARY"
 
   deploy:
