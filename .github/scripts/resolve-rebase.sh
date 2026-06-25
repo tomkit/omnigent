@@ -30,9 +30,14 @@ in_rebase() {
 
 # A signature that strictly advances as the rebase makes progress: last applied
 # commit + the current step number. Used to detect a stall (no progress).
+# Merge-style rebases track the step in rebase-merge/msgnum; apply-style rebases
+# (e.g. `git rebase --apply`) use rebase-apply/next — read whichever exists so
+# an apply-style rebase doesn't look stalled at a constant 0.
 progress_sig() {
   local msgnum
-  msgnum="$(cat "$(git rev-parse --git-path rebase-merge/msgnum)" 2>/dev/null || echo 0)"
+  msgnum="$(cat "$(git rev-parse --git-path rebase-merge/msgnum)" 2>/dev/null \
+    || cat "$(git rev-parse --git-path rebase-apply/next)" 2>/dev/null \
+    || echo 0)"
   echo "$(git rev-parse HEAD 2>/dev/null || echo none)-${msgnum}"
 }
 
@@ -41,7 +46,11 @@ continue_rebase() {
   if GIT_EDITOR=true git rebase --continue >"$CONT_LOG" 2>&1; then
     return 0
   fi
-  if grep -qiE 'no changes|empty|nothing to commit' "$CONT_LOG"; then
+  # Match git's specific "this commit became empty" phrasings only, so an
+  # unrelated error that merely contains the word "empty" doesn't get silently
+  # skipped. Git emits one of: "No changes - did you forget ...", "nothing to
+  # commit", or "... is now empty" / "would make it empty" / "becomes empty".
+  if grep -qiE 'no changes|nothing to commit|(is now|becomes|make it) empty' "$CONT_LOG"; then
     echo "resolve-rebase: step became empty; skipping."
     git rebase --skip >"$CONT_LOG" 2>&1 || {
       echo "::error::git rebase --skip failed"; cat "$CONT_LOG"; return 1; }
