@@ -266,6 +266,12 @@ class _CreateParams:
     :param labels: Sandbox labels.
     :param auto_stop_interval: Idle auto-stop minutes (0 = disabled).
     :param resources: The ``Resources`` instance passed.
+    :param auto_archive_interval: Auto-archive minutes for a stopped
+        sandbox (0 = provider max), or ``None`` when the launcher leaves
+        it to the provider default (the always-on path).
+    :param auto_delete_interval: Auto-delete minutes for a stopped
+        sandbox (negative = disabled), or ``None`` when left to the
+        provider default (the always-on path).
     """
 
     image: str
@@ -273,6 +279,8 @@ class _CreateParams:
     labels: dict[str, str]
     auto_stop_interval: int
     resources: _FakeResources
+    auto_archive_interval: int | None = None
+    auto_delete_interval: int | None = None
 
 
 @dataclass
@@ -453,6 +461,11 @@ def test_provision_defaults_official_image_and_disables_autostop(
     # 0 = disabled; any other value re-enables the idle reaper that
     # would stop the session host mid-conversation.
     assert create.params.auto_stop_interval == 0
+    # Always-on path must not touch the stopped-sandbox lifecycle: an
+    # always-on host never stops, so provision leaves auto-archive /
+    # auto-delete at the provider defaults (preserving prior behavior).
+    assert create.params.auto_archive_interval is None
+    assert create.params.auto_delete_interval is None
     assert create.params.env_vars is None
     assert create.params.labels == {"omnigent-name": "managed-abc"}
     assert create.params.resources == _FakeResources(cpu=2, memory=4)
@@ -462,7 +475,7 @@ def test_provision_defaults_official_image_and_disables_autostop(
     assert create.has_log_callback is True
 
 
-def test_provision_idle_minutes_enables_autostop(
+def test_provision_idle_minutes_enables_autostop_and_protects_disk(
     fake_daytona: _FakeDaytonaState,
 ) -> None:
     """
@@ -470,13 +483,60 @@ def test_provision_idle_minutes_enables_autostop(
     with that non-zero auto-stop interval — Daytona then idle-suspends
     the host and the server's wake path resumes it in place (vs the
     always-on default that disables auto-stop).
+
+    Crucially, it ALSO pins the stopped-sandbox lifecycle so an
+    idle-suspended box can't be reclaimed before its resume: auto-delete
+    is disabled (negative sentinel) and auto-archive defaults to the
+    provider's "maximum interval" sentinel (0). A fake stop() can't
+    simulate real provider archival, so this asserts the protective
+    config is what gets SENT at provision.
     """
     sandbox_id = DaytonaSandboxLauncher(idle_minutes=30).provision("managed-abc")
 
     [create] = fake_daytona.create_calls
     # Non-zero = idle-suspend armed at the configured interval.
     assert create.params.auto_stop_interval == 30
+    # Auto-delete disabled (negative) — a stopped box is never deleted.
+    assert create.params.auto_delete_interval is not None
+    assert create.params.auto_delete_interval < 0
+    # Auto-archive at the SDK's "maximum interval" sentinel (0) — the
+    # longest retention, so an idle-suspended host isn't archived out
+    # from under its pending resume.
+    assert create.params.auto_archive_interval == 0
     assert sandbox_id == "dt-new-1"
+
+
+def test_provision_archive_minutes_overrides_archive_ceiling(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """
+    ``archive_minutes`` sets a finite auto-archive ceiling for an
+    idle-suspended host (vs the maximal-retention default), while
+    auto-delete stays disabled and auto-stop tracks ``idle_minutes``.
+    """
+    DaytonaSandboxLauncher(idle_minutes=30, archive_minutes=4320).provision("managed-abc")
+
+    [create] = fake_daytona.create_calls
+    assert create.params.auto_stop_interval == 30
+    assert create.params.auto_archive_interval == 4320
+    assert create.params.auto_delete_interval is not None
+    assert create.params.auto_delete_interval < 0
+
+
+def test_provision_archive_minutes_ignored_without_idle_suspend(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """
+    ``archive_minutes`` without ``idle_minutes`` is inert: an always-on
+    host never stops, so it never archives — provision leaves the
+    stopped-sandbox lifecycle at provider defaults.
+    """
+    DaytonaSandboxLauncher(archive_minutes=4320).provision("managed-abc")
+
+    [create] = fake_daytona.create_calls
+    assert create.params.auto_stop_interval == 0
+    assert create.params.auto_archive_interval is None
+    assert create.params.auto_delete_interval is None
 
 
 def test_provision_image_resolution_order(
