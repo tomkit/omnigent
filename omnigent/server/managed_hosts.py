@@ -49,6 +49,11 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
+           idle_minutes: 30        # optional: stop the host after this many
+                                   # idle minutes and resume it in place on
+                                   # the next message (the stop keeps the
+                                   # workspace disk). Omit to keep the host
+                                   # always-on (auto-stop disabled).
          islo:                    # optional block (provider: islo)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -163,8 +168,10 @@ _ONLINE_POLL_INTERVAL_S = 1.0
 MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 
 # Launch-token lifetime for the YAML daytona path. Daytona sandboxes
-# have no platform lifetime cap (idle auto-stop is disabled at
-# provision), so the bound is policy, not platform: 7 days keeps a
+# have no platform lifetime cap (idle auto-stop is disabled at provision
+# unless sandbox.daytona.idle_minutes opts into idle-suspend, whose wake
+# path mints a fresh token anyway), so the bound is policy, not
+# platform: 7 days keeps a
 # long-lived sandbox re-authenticating across tunnel reconnects while
 # still expiring tokens of sandboxes nobody deleted. A relaunch (or a
 # session past 7 days going through the dead-host relaunch path) mints
@@ -639,7 +646,9 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s = MODAL_MANAGED_TOKEN_TTL_S
     elif provider == "daytona":
         launcher_factory = _daytona_launcher_factory(
-            _parse_daytona_image(raw), _parse_daytona_env(raw)
+            _parse_daytona_image(raw),
+            _parse_daytona_env(raw),
+            _parse_provider_positive_int(raw, "daytona", "idle_minutes"),
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "boxlite":
@@ -797,6 +806,7 @@ def _parse_modal_secrets(raw: dict[str, object]) -> list[str] | None:
 def _daytona_launcher_factory(
     image: str | None,
     env: list[str] | None,
+    idle_minutes: int | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: daytona`` path.
@@ -810,6 +820,10 @@ def _daytona_launcher_factory(
         every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
         ``None`` to resolve from the launcher's env-var fallback /
         inject nothing.
+    :param idle_minutes: Idle auto-stop interval in minutes — the host
+        idle-suspends after this long and the server's wake path resumes
+        it in place — or ``None`` to keep the always-on default
+        (auto-stop disabled), so existing deployments do not regress.
     :returns: A factory producing parameterized Daytona launchers.
     """
 
@@ -817,7 +831,7 @@ def _daytona_launcher_factory(
         """Construct the Daytona launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
-        return DaytonaSandboxLauncher(image=image, env=env)
+        return DaytonaSandboxLauncher(image=image, env=env, idle_minutes=idle_minutes)
 
     return _build
 
