@@ -63,6 +63,7 @@ from omnigent.host.identity import (
 )
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
+    ContextRepo,
     RemoteCommandResult,
     SandboxLauncher,
 )
@@ -1018,6 +1019,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        git_user_name: str | None = None,
+        git_user_email: str | None = None,
+        context_repos: Sequence[ContextRepo] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -1042,12 +1046,22 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
         :param repo_branch: Branch to clone, or ``None`` for the default branch.
         :param repo_name: Directory the clone lands in, or ``None``.
+        :param git_user_name: Bidirectional-git-sync identity. Accepted for
+            launcher-API parity with the exec-model default but NOT yet wired
+            into the init-container clone script — git sync / context repos are
+            an exec-model-provider (Daytona, Modal) feature today.
+        :param git_user_email: See *git_user_name*; accepted, not yet applied.
+        :param context_repos: See *git_user_name*; accepted, not yet applied.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
         :raises click.ClickException: When creation fails or the host does not
             start in time.
         """
+        # Git-sync params are accepted for API parity but not consumed here (the
+        # clone happens in a rendered init-container script); explicitly discard
+        # so they don't read as an oversight.
+        del git_user_name, git_user_email, context_repos
         _ensure_sdk()
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
