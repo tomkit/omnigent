@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import ClassVar
 
@@ -11,12 +12,14 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.base import ContextRepo, RemoteCommandResult
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
+    DEFAULT_MANAGED_GIT_USER_NAME,
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
@@ -56,6 +59,9 @@ def _injected_config(
     *,
     server_url: str = "https://srv.example.com",
     token_ttl_s: int = 3600,
+    git_user_name: str | None = None,
+    git_user_email: str | None = None,
+    context_repos: tuple[ContextRepo, ...] = (),
 ) -> ManagedSandboxConfig:
     """
     Build a config that injects *fake* through the launcher-factory seam
@@ -64,12 +70,18 @@ def _injected_config(
     :param fake: The launcher every launch should use.
     :param server_url: Server URL the sandbox host dials back to.
     :param token_ttl_s: Launch-token lifetime in seconds.
+    :param git_user_name: Bidirectional-git-sync commit identity name.
+    :param git_user_email: Bidirectional-git-sync commit identity email.
+    :param context_repos: Extra repos (skills / memory git bus) to clone.
     :returns: A ready :class:`ManagedSandboxConfig`.
     """
     return ManagedSandboxConfig(
         server_url=server_url,
         launcher_factory=lambda: fake,
         token_ttl_s=token_ttl_s,
+        git_user_name=git_user_name,
+        git_user_email=git_user_email,
+        context_repos=context_repos,
     )
 
 
@@ -218,6 +230,106 @@ def test_parse_daytona_without_section_defaults(
     # No archive_minutes → launcher uses the provider's maximal retention
     # for any stopped box (moot while always-on, but threaded through).
     assert fake.archive_minutes is None
+    # No git_sync / context_repos → bidirectional sync stays off.
+    assert cfg.git_user_name is None
+    assert cfg.git_user_email is None
+    assert cfg.context_repos == ()
+
+
+def test_parse_daytona_git_sync_and_context_repos() -> None:
+    """
+    The documented bidirectional-sync shape parses into the config's git
+    identity + context-repo fields: identity verbatim, and each context
+    repo's URL/branch (split from the ``#branch`` fragment) and dest path.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "daytona",
+            "server_url": "https://s.example.com",
+            "daytona": {
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "git_sync": {
+                    "user_name": "Omni Agent",
+                    "user_email": "agent@example.com",
+                    "token_env": "GIT_TOKEN",
+                },
+                "context_repos": [
+                    {"url": "https://github.com/me/skills#main", "path": ".claude/skills"},
+                    {"url": "https://github.com/me/memory.git", "path": "/root/.omnigent/memory"},
+                ],
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.git_user_name == "Omni Agent"
+    assert cfg.git_user_email == "agent@example.com"
+    assert cfg.context_repos == (
+        ContextRepo(url="https://github.com/me/skills", branch="main", dest=".claude/skills"),
+        ContextRepo(
+            url="https://github.com/me/memory.git", branch=None, dest="/root/.omnigent/memory"
+        ),
+    )
+
+
+def test_parse_daytona_git_sync_defaults_user_name() -> None:
+    """
+    A bare ``git_sync: {}`` block opts in: the commit ``user.name`` falls
+    back to the managed default (git needs SOME identity), and the email is
+    left ``None`` to default to the session owner at launch.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "daytona",
+            "server_url": "https://s.example.com",
+            "daytona": {"git_sync": {}},
+        }
+    )
+    assert cfg is not None
+    assert cfg.git_user_name == DEFAULT_MANAGED_GIT_USER_NAME
+    assert cfg.git_user_email is None
+
+
+def test_parse_daytona_git_sync_token_env_must_be_forwarded() -> None:
+    """
+    ``token_env`` ties item 1 to the env allowlist (item 3): it names the
+    by-reference credential the image's helper reads, so a token_env not in
+    ``sandbox.daytona.env`` is an operator error caught at startup, not an
+    opaque mid-clone auth failure.
+    """
+    with pytest.raises(ValueError, match=r"token_env.*not in 'sandbox\.daytona\.env'"):
+        parse_sandbox_config(
+            {
+                "provider": "daytona",
+                "server_url": "https://s.example.com",
+                "daytona": {
+                    "env": ["OPENAI_API_KEY"],
+                    "git_sync": {"token_env": "GIT_TOKEN"},
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("context_repos", "match"),
+    [
+        ("notalist", "must be a non-empty list"),
+        ([], "must be a non-empty list"),
+        ([{"url": "https://github.com/me/skills"}], r"\.path"),
+        ([{"path": ".claude/skills"}], r"\.url"),
+        ([{"url": "https://github.com/me/skills", "path": ".claude/skills", "x": 1}], "unknown"),
+        ([{"url": "https://github.com/me/skills", "path": "../escape"}], "'\\.\\.' segments"),
+    ],
+)
+def test_parse_daytona_context_repos_fails_loud(context_repos: object, match: str) -> None:
+    """Malformed context-repo config fails at parse, not at clone time."""
+    with pytest.raises(ValueError, match=match):
+        parse_sandbox_config(
+            {
+                "provider": "daytona",
+                "server_url": "https://s.example.com",
+                "daytona": {"context_repos": context_repos},
+            }
+        )
 
 
 def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
@@ -1236,6 +1348,146 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
     assert fake.terminated == []
 
 
+async def test_launch_git_sync_configures_identity_and_widens_refspec(db_uri: str) -> None:
+    """
+    With bidirectional git sync configured, a managed launch sets a global
+    git identity in the sandbox (so an agent can ``git commit``) BEFORE the
+    clone, and widens the cloned repo's fetch refspec to all branches AFTER
+    it (so the agent can ``git pull`` a branch the other host pushed) — the
+    two halves of the round-trip. Push/fetch auth is the image's GIT_TOKEN
+    credential helper, so nothing writes a token here.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    await launch_managed_host(
+        config=_injected_config(
+            fake, git_user_name="Omni Agent", git_user_email="agent@example.com"
+        ),
+        owner=_OWNER,
+        host_store=host_store,
+        repo=parse_repo_workspace("https://github.com/org/myrepo.git#release-1.2"),
+    )
+
+    name_cmd = "git config --global user.name 'Omni Agent'"
+    email_cmd = "git config --global user.email agent@example.com"
+    clone_cmd = (
+        "git clone --branch release-1.2 --single-branch "
+        "-- https://github.com/org/myrepo.git /root/workspace/myrepo"
+    )
+    refspec_cmd = (
+        "git -C /root/workspace/myrepo config remote.origin.fetch "
+        "'+refs/heads/*:refs/remotes/origin/*'"
+    )
+    for cmd in (name_cmd, email_cmd, clone_cmd, refspec_cmd):
+        assert cmd in fake.commands, f"missing: {cmd}\ngot: {fake.commands}"
+    # Identity is global, so it must be set BEFORE the clone (it governs the
+    # clone's repo too); the all-branches refspec is reset AFTER the clone
+    # (which pinned it to the single cloned branch).
+    assert fake.commands.index(name_cmd) < fake.commands.index(clone_cmd)
+    assert fake.commands.index(email_cmd) < fake.commands.index(clone_cmd)
+    assert fake.commands.index(clone_cmd) < fake.commands.index(refspec_cmd)
+    # No token is ever written to disk — auth is the image credential helper.
+    assert not any("x-access-token" in c or "GIT_TOKEN" in c for c in fake.commands)
+
+
+async def test_launch_git_sync_defaults_commit_email_to_owner(db_uri: str) -> None:
+    """
+    When git sync is enabled with a name but no explicit email, the commit
+    email defaults to the session owner — the meaningful per-session value,
+    so pushed-back commits are attributed to the user the host acts for.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    await launch_managed_host(
+        config=_injected_config(fake, git_user_name="Omni Agent"),
+        owner=_OWNER,
+        host_store=host_store,
+        repo=parse_repo_workspace("https://github.com/org/myrepo.git"),
+    )
+    assert f"git config --global user.email {_OWNER}" in fake.commands
+
+
+async def test_launch_without_git_sync_leaves_git_unconfigured(db_uri: str) -> None:
+    """
+    The opt-out path: with no git identity and no context repos configured,
+    a launch sets NO git identity and clones exactly as before (single-branch,
+    no refspec rewrite) — existing deployments don't regress.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    await launch_managed_host(
+        config=_injected_config(fake),
+        owner=_OWNER,
+        host_store=host_store,
+        repo=parse_repo_workspace("https://github.com/org/myrepo.git#main"),
+    )
+    assert not any(c.startswith("git config") for c in fake.commands)
+    assert not any("remote.origin.fetch" in c for c in fake.commands)
+
+
+async def test_launch_clones_context_repos_beside_workspace(db_uri: str) -> None:
+    """
+    The skills / memory-files git bus: a configured context repo is cloned
+    into its harness-read path beside the workspace, with the same
+    identity + all-branches refspec machinery as the primary repo — and
+    context repos alone (no explicit git identity) still enable a commit
+    identity, since the bus is useless without push-back.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    await launch_managed_host(
+        config=_injected_config(
+            fake,
+            context_repos=(
+                ContextRepo(
+                    url="https://github.com/me/skills.git", branch="main", dest=".claude/skills"
+                ),
+            ),
+        ),
+        owner=_OWNER,
+        host_store=host_store,
+        repo=parse_repo_workspace("https://github.com/org/myrepo.git"),
+    )
+    # The context repo clones into its workspace-relative path.
+    context_clone = (
+        "git clone --branch main --single-branch "
+        "-- https://github.com/me/skills.git /root/workspace/.claude/skills"
+    )
+    context_refspec = (
+        "git -C /root/workspace/.claude/skills config remote.origin.fetch "
+        "'+refs/heads/*:refs/remotes/origin/*'"
+    )
+    assert context_clone in fake.commands
+    assert context_refspec in fake.commands
+    # Context repos alone enable a commit identity (default name + owner email).
+    assert f"git config --global user.name '{DEFAULT_MANAGED_GIT_USER_NAME}'" in fake.commands
+    assert f"git config --global user.email {_OWNER}" in fake.commands
+
+
 async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> None:
     """
     A failed clone (bad URL, missing branch, private repo) cleans up
@@ -1286,7 +1538,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         self.provisioned_names.append(name)
         return f"omnigent-pod-{len(self.provisioned_names)}"
 
-    def run(self, sandbox_id: str, command: str, *, check: bool = True):
+    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """The entrypoint model never execs in — the base default is overridden."""
         raise AssertionError("entrypoint launcher must not exec via run()")
 
@@ -1301,7 +1553,10 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
-        on_stage=None,
+        git_user_name: str | None = None,
+        git_user_email: str | None = None,
+        context_repos: Sequence[ContextRepo] | None = None,
+        on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """Record the call, prove the token already resolves, and connect."""
         self.start_calls.append(

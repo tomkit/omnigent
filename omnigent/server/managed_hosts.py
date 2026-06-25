@@ -60,6 +60,23 @@ stores into ``create_app``):
                                    # provider's maximal retention so an
                                    # idle-suspended host is not archived
                                    # before its resume.
+           git_sync:               # optional: bidirectional repo push-back.
+                                   # Presence sets a sandbox git identity (so
+                                   # an agent can commit) and widens every
+                                   # clone's fetch refspec (so it can pull a
+                                   # branch the other host pushed). Push/fetch
+                                   # AUTH rides the host image's GIT_TOKEN
+                                   # credential helper — by-reference env, no
+                                   # token written to disk.
+             user_name: Omni Agent #   optional; default "Omnigent Managed Host"
+             user_email: a@ex.com  #   optional; default = session owner
+             token_env: GIT_TOKEN  #   optional; if set, must be in env above
+           context_repos:          # optional: the skills / memory-files git
+                                   # bus — extra repos cloned beside the
+                                   # workspace at a path the harness reads,
+                                   # pushed back the same way.
+             - url: https://github.com/me/skills#main
+               path: .claude/skills   # workspace-relative or absolute
          islo:                    # optional block (provider: islo)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -127,6 +144,7 @@ import click
 from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.base import ContextRepo
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -379,6 +397,15 @@ class ManagedSandboxConfig:
         falls back to the generic "New Sandbox" label. Exposed (when
         managed launch is supported) on the unauthenticated
         ``GET /v1/info`` as ``sandbox_provider``.
+    :param git_user_name: ``git config user.name`` for in-sandbox commits
+        when bidirectional git sync is enabled (the ``sandbox.daytona.git_sync``
+        block), or ``None`` to leave git identity unset. Without it an agent
+        cannot ``git commit`` to push work back.
+    :param git_user_email: ``git config user.email`` for in-sandbox commits,
+        or ``None`` to default to the session owner's address at launch.
+    :param context_repos: Extra repositories cloned into the sandbox beside
+        the primary workspace — the skills / memory-files git bus
+        (``sandbox.daytona.context_repos``). Empty when not configured.
     """
 
     server_url: str
@@ -386,6 +413,9 @@ class ManagedSandboxConfig:
     token_ttl_s: int
     managed_launch_supported: bool = True
     provider: str | None = None
+    git_user_name: str | None = None
+    git_user_email: str | None = None
+    context_repos: tuple[ContextRepo, ...] = ()
 
 
 @dataclass
@@ -645,19 +675,28 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             "server config 'sandbox.server_url' is required — the public URL "
             "of this server that sandboxed hosts connect back to"
         )
+    # Bidirectional git-sync surface (Daytona only today). Defaults keep every
+    # other provider's config — and a Daytona config without the git_sync /
+    # context_repos blocks — behaving exactly as before.
+    git_user_name: str | None = None
+    git_user_email: str | None = None
+    context_repos: tuple[ContextRepo, ...] = ()
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
         )
         token_ttl_s = MODAL_MANAGED_TOKEN_TTL_S
     elif provider == "daytona":
+        daytona_env = _parse_daytona_env(raw)
         launcher_factory = _daytona_launcher_factory(
             _parse_daytona_image(raw),
-            _parse_daytona_env(raw),
+            daytona_env,
             _parse_provider_positive_int(raw, "daytona", "idle_minutes"),
             _parse_provider_positive_int(raw, "daytona", "archive_minutes"),
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+        git_user_name, git_user_email = _parse_daytona_git_sync(raw, daytona_env)
+        context_repos = _parse_daytona_context_repos(raw)
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_boxlite_keys(
@@ -735,6 +774,9 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s=token_ttl_s,
         managed_launch_supported=provider in PROVIDERS_WITH_MANAGED_LAUNCH,
         provider=provider,
+        git_user_name=git_user_name,
+        git_user_email=git_user_email,
+        context_repos=context_repos,
     )
 
 
@@ -929,6 +971,185 @@ def _parse_daytona_env(raw: dict[str, object]) -> list[str] | None:
             "'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+# Default in-sandbox commit identity name when bidirectional git sync is
+# enabled but the operator didn't set ``git_sync.user_name`` — git needs SOME
+# ``user.name`` or every agent ``git commit`` aborts with "Author identity
+# unknown". The email defaults to the session owner at launch (see
+# :func:`_arm_and_start_host`), which is the more meaningful per-session value.
+DEFAULT_MANAGED_GIT_USER_NAME = "Omnigent Managed Host"
+
+
+def _optional_str_field(mapping: dict[str, object], key: str, path: str) -> str | None:
+    """
+    Read an OPTIONAL non-empty string field from a config mapping.
+
+    :param mapping: The enclosing config mapping.
+    :param key: The field name within *mapping*.
+    :param path: Dotted config path for the error message, e.g.
+        ``"sandbox.daytona.git_sync.user_name"``.
+    :returns: The stripped value, or ``None`` when the key is absent.
+    :raises ValueError: When present but not a non-empty string.
+    """
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"server config '{path}' must be a non-empty string")
+    return value.strip()
+
+
+def _parse_daytona_git_sync(
+    raw: dict[str, object], env: list[str] | None
+) -> tuple[str | None, str | None]:
+    """
+    Parse the OPTIONAL ``sandbox.daytona.git_sync`` block.
+
+    Presence of the block opts a managed Daytona host into bidirectional
+    git sync: the launch sets a git identity in the sandbox so an agent can
+    commit, and widens every clone's fetch refspec so it can pull branches
+    the other host pushed. Auth for clone / push / fetch rides the host
+    image's GIT_TOKEN credential helper (by-reference env, never a token on
+    disk), so the optional ``token_env`` here only NAMES the env var that
+    must be forwarded — validated against ``sandbox.daytona.env`` so a
+    misconfiguration fails at startup, not as an opaque mid-clone auth error.
+
+    Shape::
+
+        git_sync:
+          user_name: Omnigent Agent      # optional; default "Omnigent Managed Host"
+          user_email: agent@example.com  # optional; default = session owner
+          token_env: GIT_TOKEN           # optional; must appear in daytona.env
+
+    :param raw: The raw ``sandbox`` mapping (provider known to be daytona).
+    :param env: The parsed ``sandbox.daytona.env`` names, for ``token_env``
+        validation, or ``None`` when no env passthrough is configured.
+    :returns: ``(user_name, user_email)`` — ``user_name`` defaulted to
+        :data:`DEFAULT_MANAGED_GIT_USER_NAME` when the block is present but
+        unset; both ``None`` when the block is absent (git sync off).
+    :raises ValueError: When the block or a field is malformed, or
+        ``token_env`` is not present in ``sandbox.daytona.env``.
+    """
+    daytona_raw = raw.get("daytona")
+    if not isinstance(daytona_raw, dict):
+        return None, None
+    git_sync = daytona_raw.get("git_sync")
+    if git_sync is None:
+        return None, None
+    if not isinstance(git_sync, dict):
+        raise ValueError("server config 'sandbox.daytona.git_sync' must be a mapping")
+    allowed = {"user_name", "user_email", "token_env"}
+    unknown = sorted(set(git_sync) - allowed)
+    if unknown:
+        raise ValueError(
+            f"server config 'sandbox.daytona.git_sync' has unknown key(s): "
+            f"{', '.join(unknown)} (allowed: {', '.join(sorted(allowed))})"
+        )
+    user_name = _optional_str_field(git_sync, "user_name", "sandbox.daytona.git_sync.user_name")
+    user_email = _optional_str_field(git_sync, "user_email", "sandbox.daytona.git_sync.user_email")
+    token_env = _optional_str_field(git_sync, "token_env", "sandbox.daytona.git_sync.token_env")
+    if token_env is not None and token_env not in (env or []):
+        raise ValueError(
+            f"server config 'sandbox.daytona.git_sync.token_env' names "
+            f"'{token_env}' but it is not in 'sandbox.daytona.env' — add it so "
+            "the token is forwarded into the sandbox by reference (the host "
+            "image's git credential helper reads it for private-repo "
+            "clone / push / fetch)"
+        )
+    return (user_name or DEFAULT_MANAGED_GIT_USER_NAME), user_email
+
+
+def _validate_context_path(path: str, index: int) -> str:
+    """
+    Validate a context-repo destination path (absolute or workspace-relative).
+
+    The path is interpolated into an in-sandbox shell command (``shlex``-quoted
+    there, so shell-safe), but a ``..`` segment could still escape the workspace
+    — reject those and any whitespace so a typo fails loud at config parse.
+
+    :param path: The raw ``path`` value, e.g. ``".claude/skills"`` or
+        ``"/root/.claude/skills"``.
+    :param index: The repo's index in the list, for the error message.
+    :returns: The path, unchanged.
+    :raises ValueError: When the path contains whitespace or a ``..`` segment.
+    """
+    if any(ch.isspace() for ch in path) or ".." in path.split("/"):
+        raise ValueError(
+            f"server config 'sandbox.daytona.context_repos[{index}].path' "
+            f"('{path}') must be a clean absolute or workspace-relative path "
+            "with no whitespace or '..' segments"
+        )
+    return path
+
+
+def _parse_daytona_context_repos(raw: dict[str, object]) -> tuple[ContextRepo, ...]:
+    """
+    Parse the OPTIONAL ``sandbox.daytona.context_repos`` list.
+
+    Each entry designates a git repository (the skills / memory-files bus)
+    cloned into the sandbox at a path the harness reads, with the same
+    clone-at-branch + all-branches-refspec + credential-helper-auth machinery
+    as the primary workspace repo, so edits round-trip via commit / push / pull.
+
+    Shape::
+
+        context_repos:
+          - url: https://github.com/me/skills#main   # <repo>[#<branch>]
+            path: .claude/skills                       # workspace-relative or absolute
+
+    :param raw: The raw ``sandbox`` mapping (provider known to be daytona).
+    :returns: The validated context repos, empty when none configured.
+    :raises ValueError: When the list or any entry is malformed.
+    """
+    daytona_raw = raw.get("daytona")
+    if not isinstance(daytona_raw, dict):
+        return ()
+    items = daytona_raw.get("context_repos")
+    if items is None:
+        return ()
+    if not isinstance(items, list) or not items:
+        raise ValueError(
+            "server config 'sandbox.daytona.context_repos' must be a non-empty "
+            "list of {url, path} mappings"
+        )
+    repos: list[ContextRepo] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"server config 'sandbox.daytona.context_repos[{index}]' must be "
+                "a mapping with 'url' and 'path'"
+            )
+        unknown = sorted(set(item) - {"url", "path"})
+        if unknown:
+            raise ValueError(
+                f"server config 'sandbox.daytona.context_repos[{index}]' has "
+                f"unknown key(s): {', '.join(unknown)} (allowed: path, url)"
+            )
+        url = item.get("url")
+        path = item.get("path")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError(
+                f"server config 'sandbox.daytona.context_repos[{index}].url' must "
+                "be a non-empty repository URL, e.g. "
+                "'https://github.com/me/skills#main'"
+            )
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(
+                f"server config 'sandbox.daytona.context_repos[{index}].path' must "
+                "be a non-empty path the harness reads, e.g. '.claude/skills'"
+            )
+        # Reuse the primary-workspace URL grammar (validates the URL form and any
+        # '#branch' fragment, rejecting commit SHAs that would detach HEAD).
+        parsed = parse_repo_workspace(url.strip())
+        repos.append(
+            ContextRepo(
+                url=parsed.url,
+                branch=parsed.branch,
+                dest=_validate_context_path(path.strip(), index),
+            )
+        )
+    return tuple(repos)
 
 
 def _boxlite_launcher_factory(
@@ -1871,6 +2092,36 @@ async def relaunch_managed_host(
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
 
+def _resolve_git_identity(
+    config: ManagedSandboxConfig, owner: str
+) -> tuple[str | None, str | None]:
+    """
+    Resolve the in-sandbox commit identity for a managed launch.
+
+    Bidirectional git sync is ON when the deployment configured a git
+    identity (``sandbox.daytona.git_sync``) OR any context repos — either
+    needs a committable identity for the round-trip to work. When on, the
+    ``user.name`` falls back to :data:`DEFAULT_MANAGED_GIT_USER_NAME` and the
+    ``user.email`` to the session *owner* (the more meaningful per-session
+    value than any static config). When off, both are ``None`` so
+    :meth:`SandboxLauncher.start_host` leaves git untouched — preserving the
+    prior behavior for sessions that don't opt in.
+
+    :param config: The deployment's sandbox config.
+    :param owner: The session owner, e.g. ``"alice@example.com"``, used as
+        the default commit email.
+    :returns: ``(user_name, user_email)`` — both ``None`` when git sync is
+        not enabled for this deployment.
+    """
+    sync_enabled = config.git_user_name is not None or bool(config.context_repos)
+    if not sync_enabled:
+        return None, None
+    return (
+        config.git_user_name or DEFAULT_MANAGED_GIT_USER_NAME,
+        config.git_user_email or owner,
+    )
+
+
 async def _arm_and_start_host(
     *,
     launcher: SandboxLauncher,
@@ -1935,6 +2186,7 @@ async def _arm_and_start_host(
         # a token that already resolves. The exec-model default execs in; the
         # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
         # unpacked into primitives — the launcher API takes no RepoWorkspace.
+        git_user_name, git_user_email = _resolve_git_identity(config, owner)
         workspace = await asyncio.to_thread(
             launcher.start_host,
             sandbox_id,
@@ -1945,6 +2197,9 @@ async def _arm_and_start_host(
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
+            git_user_name=git_user_name,
+            git_user_email=git_user_email,
+            context_repos=config.context_repos or None,
             on_stage=on_stage,
         )
         await _wait_for_host_online(host_store, host_id)
@@ -2138,6 +2393,12 @@ async def resume_managed_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
+            # The persistent volume already holds the workspace AND the
+            # ~/.gitconfig identity from the original launch, so neither is
+            # re-cloned nor re-configured here. Re-asserting the identity is
+            # cheap and idempotent — it guards against a host whose home volume
+            # predates git sync being enabled.
+            git_user_name, git_user_email = _resolve_git_identity(config, host.owner)
             await asyncio.to_thread(
                 launcher.start_host,
                 sandbox_id,
@@ -2146,6 +2407,8 @@ async def resume_managed_host(
                 host_name=host.name,
                 server_url=config.server_url,
                 repo_url=None,  # the persistent volume already holds the workspace
+                git_user_name=git_user_name,
+                git_user_email=git_user_email,
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
