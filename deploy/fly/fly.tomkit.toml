@@ -1,0 +1,80 @@
+# Fly.io config for the FORK's own server image (app: omnigent-tomkit).
+#
+# WHY THIS FILE EXISTS (and is separate from deploy/fly/fly.toml):
+# Upstream's deploy/fly/fly.toml pulls the PREBUILT public image
+# `ghcr.io/omnigent-ai/omnigent-server:latest`. That image is built with NO
+# optional extras, so OMNIGENT_EXTRAS is empty and the `daytona` Python SDK is
+# absent. The `omnigent-tomkit` app runs managed `sandbox.provider: daytona`
+# sessions, and the launcher (omnigent/onboarding/sandboxes/daytona.py,
+# `_ensure_sdk` -> `import daytona`) lazily imports that SDK — so the prebuilt
+# image fails every managed Daytona launch with:
+#   "The Daytona SDK is required for the 'daytona' sandbox provider."
+#
+# This config instead BUILDS the server image from deploy/docker/Dockerfile and
+# passes `OMNIGENT_EXTRAS = "daytona"` so the `daytona` extra
+# (pyproject: daytona = ["daytona>=0.180,<1"]) is baked in. The Dockerfile's
+# server-builder stage runs `uv pip install -e ".[${OMNIGENT_EXTRAS}]"` only
+# when OMNIGENT_EXTRAS is non-empty (deploy/docker/Dockerfile ~:148-154).
+#
+# Kept as a NEW, additive file (not an edit to upstream's fly.toml) so it
+# survives `git rebase` onto upstream cleanly — the fork's customizations live
+# as commits on top of upstream. See FORK.md.
+#
+# Deploy (builds from source via Fly's remote builder, then swaps the image in
+# place — the named volume and the fly secrets, incl. DAYTONA_API_KEY, are
+# untouched):
+#   fly deploy -c deploy/fly/fly.tomkit.toml -a omnigent-tomkit
+#
+# A regression guard (tests/deploy/test_fly_fork_daytona_extra.py) fails if
+# this build config ever stops declaring `daytona` in OMNIGENT_EXTRAS.
+
+app = "omnigent-tomkit"
+primary_region = "iad"
+
+[build]
+  # Build the fork's own image from source instead of pulling the upstream
+  # prebuilt (which lacks the daytona extra). Relative to the repo root, which
+  # is the build context `fly deploy` uses.
+  dockerfile = "deploy/docker/Dockerfile"
+
+  [build.args]
+    # Bake the managed-sandbox `daytona` extra into the deployed image. This is
+    # the whole point of this file — DO NOT drop it (guard test enforces it).
+    # The Dockerfile's registry build-args keep their public-registry defaults.
+    OMNIGENT_EXTRAS = "daytona"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8000"
+  ARTIFACT_DIR = "/data/artifacts"
+  OMNIGENT_ADMIN_CREDENTIALS_PATH = "/data/admin-credentials"
+  OMNIGENT_AUTH_PROVIDER = "accounts"
+  # SQLite on the persistent volume — no separate Postgres app. Mirrors the
+  # live machine's env exactly so a deploy only swaps the image.
+  DATABASE_URL = "sqlite:////data/artifacts/chat.db"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+# Persistent artifact + SQLite store. This is the EXISTING live volume
+# (name `artifact_data`, 1 GB, iad) — do NOT recreate it; `fly deploy`
+# reattaches it by name.
+[mounts]
+  source = "artifact_data"
+  destination = "/data/artifacts"
+
+# Matches the live machine: shared-cpu-1x, 1 GB (the 256 MB default OOM-loops
+# the server, which idles ~275 MB RSS).
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
