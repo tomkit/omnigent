@@ -151,6 +151,7 @@ def create_runner_tunnel_router(
     on_runner_connect: Callable[[str], Awaitable[None]] | None = None,
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    resolve_owner_for_runner_id: Callable[[str], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -180,6 +181,22 @@ def create_runner_tunnel_router(
         before (or after) connecting, so waiting clients fail fast
         instead of polling to a timeout. ``None`` (e.g. minimal test
         wiring, or a server without host support) omits the field.
+    :param resolve_owner_for_runner_id: Optional resolver that maps a
+        runner id to the owning user id by looking up the session(s) the
+        server bound to that runner. Consulted ONLY as a last resort —
+        when an auth provider is configured but the peer presented no
+        authenticated user identity (no cookie / Bearer) — and only for a
+        token-bound runner id (no-allow-list mode, the deployed posture),
+        i.e. one already proven equal to
+        ``token_bound_runner_id(presented token)``. This is the auth path
+        for SERVER-MANAGED sandbox runners, which carry the per-runner
+        binding token the server minted (and stamped into the session's
+        ``runner_id``) but no user credential — mirroring how
+        ``host_tunnel.py`` resolves a managed host from its launch token.
+        Returning ``None`` (unknown / ambiguous binding) leaves the
+        handshake rejected, so an unknown or rotated-out binding token is
+        still refused. ``None`` (the default) preserves the prior
+        reject-on-no-user behavior for callers that don't wire it.
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
@@ -341,9 +358,32 @@ def create_runner_tunnel_router(
             is_loopback=is_loopback,
         )
         if tunnel_owner is None and auth_provider is not None:
+            # No user identity. Before failing closed, try to resolve the
+            # owner from the server-minted per-runner binding token — the
+            # auth path for SERVER-MANAGED sandbox runners, which have a
+            # binding token but no user credential (no `omnigent login`
+            # in a disposable sandbox).
+            #
+            # ``expected_runner_id is not None`` restricts this to the
+            # no-allow-list deployed posture, where it equals
+            # ``token_bound_runner_id(presented token)`` and was already
+            # checked equal to ``runner_id`` above. So reaching here means
+            # the peer proved knowledge of a token whose SHA-256 derivation
+            # IS this runner_id; preimage resistance means only the holder
+            # of the token the server minted for a session can produce a
+            # runner_id that matches that session. The resolver returns the
+            # owner of the session(s) bound to this runner_id — exactly the
+            # owner the token was minted for, and ``None`` for an unknown /
+            # rotated-out / ambiguous binding (still rejected below). This
+            # is the same "tunnel token bound to the session's runner id"
+            # trust model the runner request-auth path already relies on.
+            if resolve_owner_for_runner_id is not None and expected_runner_id is not None:
+                tunnel_owner = await asyncio.to_thread(resolve_owner_for_runner_id, runner_id)
+        if tunnel_owner is None and auth_provider is not None:
             # Auth is enabled but this non-loopback peer presented no
-            # authenticated identity (no cookie / Bearer). Refuse the
-            # handshake instead of registering an owner-less runner.
+            # authenticated identity (no cookie / Bearer) and no resolvable
+            # binding token. Refuse the handshake instead of registering an
+            # owner-less runner.
             await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
             return
 

@@ -7,6 +7,7 @@ import os
 import tarfile
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -962,6 +963,49 @@ def _ensure_default_polly_agent(
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
     )
+
+
+def resolve_owner_for_runner_id(
+    conversation_store: ConversationStore,
+    runner_id: str,
+) -> str | None:
+    """Resolve a runner's owner from the session(s) it is bound to.
+
+    The runner-tunnel auth fallback for SERVER-MANAGED sandbox runners:
+    they present the per-runner binding token the server minted (whose
+    ``token_bound_runner_id`` IS this ``runner_id``, which the tunnel
+    route has already verified equals the handshake path id), but carry
+    no user credential — a disposable sandbox never ran ``omnigent
+    login``. The owning user is the owner of the session(s) the server
+    bound to this runner: the ``runner_id``↔session binding (written via
+    ``set_runner_id`` / ``replace_runner_id`` when the token was minted)
+    is the server's source of truth for runner ownership, so no separate
+    token store is needed and no raw secret is persisted. This is the same
+    "tunnel token bound to the session's runner id" trust model the runner
+    request-auth path already enforces (see
+    ``_require_cost_control_label_authority``).
+
+    Fails closed: returns ``None`` unless every bound session resolves to
+    exactly one distinct owner. An unknown / rotated-out ``runner_id``
+    matches no session (``None``), and the single-owner guard refuses the
+    ambiguous case rather than guessing — so the caller still rejects the
+    handshake.
+
+    :param conversation_store: Store to look the binding up in.
+    :param runner_id: Token-bound runner id from the tunnel handshake,
+        e.g. ``"runner_token_a1b2c3..."``.
+    :returns: The single owning user id, e.g. ``"alice@example.com"``, or
+        ``None`` when no session is bound or the owner is ambiguous.
+    """
+    convs = conversation_store.list_conversations_by_runner_id(runner_id)
+    owners = {
+        owner
+        for conv in convs
+        if (owner := conversation_store.get_session_owner(conv.id)) is not None
+    }
+    if len(owners) == 1:
+        return next(iter(owners))
+    return None
 
 
 def create_app(
@@ -2024,6 +2068,7 @@ def create_app(
             on_runner_connect=_on_runner_connect,
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
+            resolve_owner_for_runner_id=partial(resolve_owner_for_runner_id, conversation_store),
         ),
         prefix="/v1",
         tags=["runners"],

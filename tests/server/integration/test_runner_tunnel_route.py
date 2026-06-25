@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
 
@@ -121,6 +121,7 @@ def _tunnel_route_app(
     *,
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
+    resolve_owner_for_runner_id: Callable[[str], str | None] | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -129,6 +130,10 @@ def _tunnel_route_app(
     :param auth_provider: Optional auth provider wired into the route.
         ``None`` keeps the no-auth single-user posture; a provider
         activates owner recording and the fail-closed gate.
+    :param resolve_owner_for_runner_id: Optional binding-token owner
+        resolver wired into the route, modeling the server's lookup of
+        the owner of the session(s) bound to a runner id. ``None`` keeps
+        the prior reject-on-no-user behavior.
     :returns: The FastAPI app and registry owned by its route.
     """
     registry = TunnelRegistry()
@@ -139,6 +144,7 @@ def _tunnel_route_app(
             registry,
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
+            resolve_owner_for_runner_id=resolve_owner_for_runner_id,
         ),
         prefix="/v1",
     )
@@ -878,6 +884,191 @@ async def test_ws_tunnel_loopback_unauthenticated_registers_as_local() -> None:
         # Loopback + no credential → reserved local identity, so
         # single-user ownership checks remain coherent.
         assert route_app.registry.runner_owner(_RUNNER_ID) == RESERVED_USER_LOCAL
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=1.0)
+
+
+# ── managed-sandbox runner authenticates via its binding token ──
+#
+# A SERVER-MANAGED sandbox runner carries the per-runner binding token
+# the server minted (and stamped into the session's runner_id) but no
+# user credential — a disposable sandbox never ran `omnigent login`. The
+# route resolves its owner from the session(s) bound to the runner id,
+# mirroring how host_tunnel.py resolves a managed host from its launch
+# token. This is the fix for managed sessions failing with HTTP 403.
+
+
+async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token() -> None:
+    """A managed runner with a valid binding token registers under its owner.
+
+    No user cookie / Bearer is presented (the sandbox has none), but the
+    binding token's ``token_bound_runner_id`` IS the path runner id, and
+    the server-side resolver maps that runner id to the owning user of the
+    session the token was minted for. The handshake must accept and the
+    registry must record that resolved owner so later ownership checks
+    forbid a different user from binding to it.
+
+    :returns: None.
+    """
+    token = "managed-sandbox-binding-token"
+    runner_id = token_bound_runner_id(token)
+    # Stand-in for the server's lookup: the runner id is bound to a
+    # session owned by alice. Asserts it is only ever queried for the
+    # exact runner id the token derives.
+    resolved: dict[str, str] = {runner_id: "alice@example.com"}
+
+    def _resolve(rid: str) -> str | None:
+        return resolved.get(rid)
+
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        resolve_owner_for_runner_id=_resolve,
+    )
+    communicator = await _connect_route(
+        route_app.app,
+        f"/v1/runners/{runner_id}/tunnel",
+        headers=[
+            (RUNNER_TUNNEL_TOKEN_HEADER.lower().encode("ascii"), token.encode("ascii")),
+        ],
+        client_host="203.0.113.7",
+    )
+
+    await _send_hello(communicator, route_app.registry, runner_id=runner_id)
+    try:
+        assert route_app.registry.online_runner_ids() == [runner_id]
+        # Owner came from the binding-token resolution, not user auth.
+        assert route_app.registry.runner_owner(runner_id) == "alice@example.com"
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=1.0)
+
+
+async def test_ws_tunnel_rejects_unknown_binding_token_even_with_resolver() -> None:
+    """An unknown / rotated-out binding token is still refused pre-accept.
+
+    The resolver is wired, but the presented token derives a runner id
+    that maps to no session (resolution returns ``None``) — an unknown,
+    expired, or rotated-out binding. The handshake must be refused with
+    4004 *before* ``accept()`` exactly as when no resolver is wired: the
+    fallback must never become a bypass for a token the server didn't mint
+    for a live session.
+
+    :returns: None.
+    """
+
+    def _resolve(_rid: str) -> str | None:
+        # No session is bound to any runner id → every lookup misses.
+        return None
+
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        resolve_owner_for_runner_id=_resolve,
+    )
+
+    attacker_token = "attacker-chosen-token"
+    derived_runner_id = token_bound_runner_id(attacker_token)
+    communicator = ApplicationCommunicator(
+        route_app.app,
+        _websocket_scope(
+            f"/v1/runners/{derived_runner_id}/tunnel",
+            headers=[
+                (
+                    RUNNER_TUNNEL_TOKEN_HEADER.lower().encode("ascii"),
+                    attacker_token.encode("ascii"),
+                )
+            ],
+            client_host="203.0.113.7",
+        ),
+    )
+
+    await communicator.send_input({"type": "websocket.connect"})
+    closed = await communicator.receive_output(timeout=1.0)
+
+    # Refused before accept (no acceptance oracle): first output is close.
+    assert closed == {
+        "type": "websocket.close",
+        "code": 4004,
+        "reason": "unauthenticated",
+    }
+    assert route_app.registry.online_runner_ids() == []
+
+
+async def test_ws_tunnel_user_auth_preferred_over_binding_resolver() -> None:
+    """An authenticated peer registers under its user id, not the resolver's.
+
+    When a real user identity is present, the binding-token resolver is
+    a last resort that must not run — the authenticated owner wins. Here
+    the resolver would return a *different* user; the registry must record
+    the authenticated caller, proving the resolver never overrode it.
+
+    :returns: None.
+    """
+    token = "alice-runner-token"
+    runner_id = token_bound_runner_id(token)
+
+    resolver_calls: list[str] = []
+
+    def _resolve(rid: str) -> str | None:
+        resolver_calls.append(rid)
+        return "mallory@example.com"
+
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        resolve_owner_for_runner_id=_resolve,
+    )
+    communicator = await _connect_route(
+        route_app.app,
+        f"/v1/runners/{runner_id}/tunnel",
+        headers=[
+            (RUNNER_TUNNEL_TOKEN_HEADER.lower().encode("ascii"), token.encode("ascii")),
+            (b"x-test-user", b"alice@example.com"),
+        ],
+        client_host="203.0.113.7",
+    )
+
+    await _send_hello(communicator, route_app.registry, runner_id=runner_id)
+    try:
+        assert route_app.registry.runner_owner(runner_id) == "alice@example.com"
+        # The resolver must not have been consulted at all.
+        assert resolver_calls == []
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=1.0)
+
+
+async def test_ws_tunnel_loopback_does_not_consult_binding_resolver() -> None:
+    """Loopback runners still register as local without the resolver.
+
+    The reserved local identity short-circuits before the binding-token
+    fallback, so a loopback runner on an auth-enabled server keeps
+    registering as ``RESERVED_USER_LOCAL`` and the resolver is never hit.
+
+    :returns: None.
+    """
+    resolver_calls: list[str] = []
+
+    def _resolve(rid: str) -> str | None:
+        resolver_calls.append(rid)
+        return "someone@example.com"
+
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        resolve_owner_for_runner_id=_resolve,
+    )
+    communicator = await _connect_route(
+        route_app.app,
+        _TUNNEL_PATH,
+        client_host="127.0.0.1",
+    )
+
+    await _send_hello(communicator, route_app.registry)
+    try:
+        assert route_app.registry.runner_owner(_RUNNER_ID) == RESERVED_USER_LOCAL
+        assert resolver_calls == []
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
