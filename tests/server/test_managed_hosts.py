@@ -1488,6 +1488,117 @@ async def test_launch_clones_context_repos_beside_workspace(db_uri: str) -> None
     assert f"git config --global user.email {_OWNER}" in fake.commands
 
 
+# ── start_host git-identity / clone-destination guards ──────────
+#
+# Direct unit tests of the exec-model base ``start_host`` (via the recording
+# fake): the managed-launch path always supplies a both-or-neither identity and
+# distinct dests, so these caller-bug cases need a direct call to reach.
+
+
+@pytest.mark.parametrize(
+    ("git_user_name", "git_user_email", "present"),
+    [
+        ("Omni Agent", None, "user.name"),
+        (None, "agent@example.com", "user.email"),
+    ],
+)
+def test_start_host_rejects_half_configured_git_identity(
+    git_user_name: str | None, git_user_email: str | None, present: str
+) -> None:
+    """
+    A commit needs BOTH user.name and user.email, so ``start_host`` arms the
+    git identity as a unit. Supplying only one is a caller bug: it would widen
+    the fetch refspec (pull works) yet leave ``git commit`` aborting with
+    "Author identity unknown" — push-back silently broken. The guard fails
+    loud, before the host is ever started.
+    """
+    fake = FakeSandboxLauncher()
+    with pytest.raises(click.ClickException, match=r"both user\.name and user\.email") as exc:
+        fake.start_host(
+            "sb-1",
+            token="tok",
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="https://srv.example.com",
+            git_user_name=git_user_name,
+            git_user_email=git_user_email,
+        )
+    assert f"got only {present}" in exc.value.message
+    assert fake.host_starts == []
+
+
+def test_start_host_rejects_colliding_context_repo_destinations() -> None:
+    """
+    Two context repos resolving to the same in-sandbox path is a config error:
+    the second ``git clone`` would abort on a non-empty target and strand the
+    sandbox half-cloned. ``start_host`` detects the collision up front, naming
+    the path, and clones nothing.
+    """
+    fake = FakeSandboxLauncher()
+    with pytest.raises(click.ClickException, match="same clone destination"):
+        fake.start_host(
+            "sb-1",
+            token="tok",
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="https://srv.example.com",
+            context_repos=(
+                ContextRepo(url="https://github.com/me/a.git", branch=None, dest=".claude/skills"),
+                ContextRepo(url="https://github.com/me/b.git", branch=None, dest=".claude/skills"),
+            ),
+        )
+    assert not any(c.startswith("git clone") for c in fake.commands)
+
+
+def test_start_host_rejects_context_repo_colliding_with_primary_clone() -> None:
+    """
+    A context repo whose resolved dest equals the primary clone dir collides
+    the same way — detected before either clone runs (the absolute dest here
+    matches ``<home>/workspace/<repo_name>``).
+    """
+    fake = FakeSandboxLauncher()
+    with pytest.raises(click.ClickException, match="same clone destination"):
+        fake.start_host(
+            "sb-1",
+            token="tok",
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="https://srv.example.com",
+            repo_url="https://github.com/org/myrepo.git",
+            repo_name="myrepo",
+            context_repos=(
+                ContextRepo(
+                    url="https://github.com/me/skills.git",
+                    branch=None,
+                    dest="/root/workspace/myrepo",
+                ),
+            ),
+        )
+    assert not any(c.startswith("git clone") for c in fake.commands)
+
+
+def test_start_host_refspec_failure_names_repo_and_operation() -> None:
+    """
+    If widening the cloned repo's fetch refspec fails, the error names the repo
+    and the operation (bidirectional sync) — consistent with how a clone
+    failure is reported — instead of an opaque "sandbox command exited
+    non-zero".
+    """
+    fake = FakeSandboxLauncher(fail_on_command="remote.origin.fetch")
+    with pytest.raises(click.ClickException, match="widen the fetch refspec"):
+        fake.start_host(
+            "sb-1",
+            token="tok",
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="https://srv.example.com",
+            repo_url="https://github.com/org/myrepo.git",
+            repo_name="myrepo",
+            git_user_name="Omni Agent",
+            git_user_email="agent@example.com",
+        )
+
+
 async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> None:
     """
     A failed clone (bad URL, missing branch, private repo) cleans up

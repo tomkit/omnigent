@@ -318,9 +318,12 @@ class SandboxLauncher(ABC):
         :param repo_name: Directory the clone lands in under the workspace, or
             ``None`` when *repo_url* is ``None``.
         :param git_user_name: ``user.name`` for in-sandbox commits, or ``None``
-            to leave git identity unset (no commit/push-back configured).
+            to leave git identity unset (no commit/push-back configured). Must
+            be passed together with *git_user_email* — a commit needs both, so
+            supplying just one raises ``click.ClickException``.
         :param git_user_email: ``user.email`` for in-sandbox commits, or
-            ``None`` to leave git identity unset.
+            ``None`` to leave git identity unset. Both-or-neither with
+            *git_user_name* (see above).
         :param context_repos: Extra repositories to clone into the sandbox (the
             skills / memory-files git bus), or ``None`` for none.
         :param on_stage: Progress observer invoked with ``"cloning"`` before the
@@ -344,35 +347,57 @@ class SandboxLauncher(ABC):
         self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace_base)}")
         # Identity first: it is global (~/.gitconfig), so it applies to the
         # primary clone, the context-repo clones, and every later agent commit
-        # in any of them.
-        self._configure_git_identity(sandbox_id, git_user_name, git_user_email)
-        bidirectional = git_user_name is not None or git_user_email is not None
-        # The returned workspace is the primary clone dir (or the base when the
-        # session has no repo); context repos clone alongside it, never changing
-        # what the session binds.
-        workspace = workspace_base
-        if repo_url is not None:
-            if on_stage is not None:
-                on_stage("cloning")
-            clone_dir = f"{workspace_base}/{repo_name}"
-            self._clone_repo(
-                sandbox_id, repo_url, repo_branch, clone_dir, bidirectional=bidirectional
+        # in any of them. A commit needs BOTH user.name and user.email, so the
+        # two are a unit — armed together or not at all. The server's
+        # _resolve_git_identity always supplies both-or-neither; guard the
+        # invariant so a future caller passing just one fails loud here, rather
+        # than silently arming the sync path (refspec widening below) against a
+        # sandbox whose `git commit` would still abort with "Author identity
+        # unknown" — push-back broken with no error.
+        if (git_user_name is None) != (git_user_email is None):
+            raise click.ClickException(
+                "bidirectional git sync needs both user.name and user.email "
+                "(or neither) — got only "
+                f"{'user.name' if git_user_name is not None else 'user.email'}"
             )
-            workspace = clone_dir
+        self._configure_git_identity(sandbox_id, git_user_name, git_user_email)
+        bidirectional = git_user_name is not None
+        # Resolve every clone destination up front. The primary repo (when the
+        # session has one) clones into <base>/<repo_name>; each context repo
+        # into its absolute dest as-is (e.g. a "$HOME"-relative skills path the
+        # operator pins), or under <base> for a relative one — beside the repo,
+        # NOT inside the primary clone dir. Two repos resolving to the same path
+        # is a config error: the second `git clone` would abort on a non-empty
+        # target and strand the sandbox half-cloned, so detect collisions BEFORE
+        # cloning anything.
+        clone_specs: list[tuple[str, str | None, str]] = []
+        if repo_url is not None:
+            clone_specs.append((repo_url, repo_branch, f"{workspace_base}/{repo_name}"))
         for context in context_repos or ():
-            if on_stage is not None:
-                on_stage("cloning")
-            # Absolute dests land as-is (e.g. "$HOME"-relative skills paths the
-            # operator pins); relative dests resolve under the session workspace
-            # base, NOT the primary clone dir, so they sit beside the repo.
             dest = (
                 context.dest
                 if context.dest.startswith("/")
                 else f"{workspace_base}/{context.dest}"
             )
-            self._clone_repo(
-                sandbox_id, context.url, context.branch, dest, bidirectional=bidirectional
-            )
+            clone_specs.append((context.url, context.branch, dest))
+        seen: set[str] = set()
+        for _, _, dest in clone_specs:
+            key = dest.rstrip("/")
+            if key in seen:
+                raise click.ClickException(
+                    f"two repositories resolve to the same clone destination "
+                    f"'{dest}' inside the sandbox — the primary workspace and "
+                    "every context repo must clone into a distinct path"
+                )
+            seen.add(key)
+        # The returned workspace is the primary clone dir (or the base when the
+        # session has no repo); context repos clone alongside it, never changing
+        # what the session binds.
+        workspace = f"{workspace_base}/{repo_name}" if repo_url is not None else workspace_base
+        for url, branch, dest in clone_specs:
+            if on_stage is not None:
+                on_stage("cloning")
+            self._clone_repo(sandbox_id, url, branch, dest, bidirectional=bidirectional)
         # "starting" covers from here through host registration — the caller's
         # online poll resolves it.
         if on_stage is not None:
@@ -480,12 +505,21 @@ class SandboxLauncher(ABC):
             # A --single-branch clone pins remote.origin.fetch to just the
             # cloned branch, so `git fetch` would never see other branches.
             # Reset it to the standard all-branches refspec so the sandbox can
-            # pull whatever branch the MacBook host pushed.
-            self.run(
-                sandbox_id,
-                f"git -C {shlex.quote(clone_dir)} config remote.origin.fetch "
-                "'+refs/heads/*:refs/remotes/origin/*'",
-            )
+            # pull whatever branch the MacBook host pushed. Wrap like the clone
+            # above so a failure names the repo and the operation it was wiring,
+            # instead of surfacing as an opaque "sandbox command exited
+            # non-zero" — a configured-but-broken sync should fail loud.
+            refspec = shlex.quote("+refs/heads/*:refs/remotes/origin/*")
+            try:
+                self.run(
+                    sandbox_id,
+                    f"git -C {shlex.quote(clone_dir)} config remote.origin.fetch {refspec}",
+                )
+            except click.ClickException as exc:
+                raise click.ClickException(
+                    f"failed to widen the fetch refspec for bidirectional sync "
+                    f"of '{repo_url}': {exc.message}"
+                ) from exc
 
     def attach(self, sandbox_id: str) -> None:
         """

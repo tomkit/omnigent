@@ -581,11 +581,13 @@ def test_provision_forwards_git_token_by_reference_for_push_back(
     fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Item 3 / item 1 seam: GIT_TOKEN is forwarded into the sandbox by
-    reference (value read from the server env at provision time, name only
-    in config), so the in-sandbox git credential helper can authenticate the
-    bidirectional clone / push / fetch without any token living in config or
-    being uploaded as a file.
+    GIT_TOKEN is forwarded into the sandbox BY REFERENCE — its value is read
+    from the server env at provision time and injected as a workload env var,
+    with only the NAME in config (no token in config, none uploaded as a file).
+    This asserts that forwarding, which is the prerequisite the in-sandbox git
+    credential helper reads to authenticate clone / push / fetch; the
+    clone/push/fetch wiring itself is covered by the managed-launch tests in
+    ``tests/server/test_managed_hosts.py``.
     """
     monkeypatch.setenv("GIT_TOKEN", "ghp-secret-789")
 
