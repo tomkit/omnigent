@@ -102,9 +102,21 @@ jobs:
           echo "tags=${IMAGE}:sha-${SHORT_SHA},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
           echo "Publishing: ${IMAGE}:sha-${SHORT_SHA} + ${IMAGE}:latest"
 
-      # No build-args: the Dockerfile ARGs default to public registries (matches
-      # the upstream server build). Multi-arch manifest list (amd64 + arm64);
-      # the Fly machine is amd64 and pulls the amd64 variant from the list.
+      # Build-args: the registry ARGs default to public registries (matches the
+      # upstream server build), but OMNIGENT_EXTRAS defaults to EMPTY in the
+      # server-builder stage, which skips the optional managed-sandbox provider
+      # SDKs. This fork's `omnigent-tomkit` Fly app runs `sandbox.provider:
+      # daytona` managed sessions, and the launcher (omnigent/onboarding/
+      # sandboxes/daytona.py) lazily imports the `daytona` SDK — without the
+      # extra the managed launch fails with "The Daytona SDK is required for the
+      # 'daytona' sandbox provider". So pass OMNIGENT_EXTRAS=daytona to bake the
+      # `daytona` extra (pyproject: daytona>=0.180,<1) into the image. The
+      # daytona relay (sandbox.daytona.server_url → a Cloudflare Worker, read by
+      # the SDK as DAYTONA_API_URL) is just an API endpoint the SDK reaches over
+      # its own bundled HTTP stack — it needs no additional omnigent extra, so
+      # `daytona` alone is sufficient for the managed-launch path end to end.
+      # Multi-arch manifest list (amd64 + arm64); the Fly machine is amd64 and
+      # pulls the amd64 variant from the list.
       - name: Build and push
         id: build-server
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -114,6 +126,8 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            OMNIGENT_EXTRAS=daytona
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
