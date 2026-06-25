@@ -577,6 +577,26 @@ def test_provision_env_passthrough_resolves_from_server_env(
     }
 
 
+def test_provision_forwards_git_token_by_reference_for_push_back(
+    fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    GIT_TOKEN is forwarded into the sandbox BY REFERENCE — its value is read
+    from the server env at provision time and injected as a workload env var,
+    with only the NAME in config (no token in config, none uploaded as a file).
+    This asserts that forwarding, which is the prerequisite the in-sandbox git
+    credential helper reads to authenticate clone / push / fetch; the
+    clone/push/fetch wiring itself is covered by the managed-launch tests in
+    ``tests/server/test_managed_hosts.py``.
+    """
+    monkeypatch.setenv("GIT_TOKEN", "ghp-secret-789")
+
+    DaytonaSandboxLauncher(env=["GIT_TOKEN"]).provision("push-back")
+
+    [create] = fake_daytona.create_calls
+    assert create.params.env_vars == {"GIT_TOKEN": "ghp-secret-789"}
+
+
 def test_provision_env_passthrough_env_var_fallback(
     fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
