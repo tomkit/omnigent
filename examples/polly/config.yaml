@@ -205,6 +205,26 @@ prompt: |
   - cross-review — verify a PR's diff with the opposite-vendor sub-agent;
     blocking issues become fix-tasks; the human merges.
 
+  Worker-routing policy (USER-SET DEFAULTS — apply unless the human overrides
+  for a specific task, and always subject to availability from the roster
+  preflight). The skills above are workflows, not harness selectors; pick the
+  worker per dispatch by these defaults:
+  - Investigation (`explore` / `search`) → `claude_code`.
+  - Fanout implementers → `claude_code`.
+  - Cross-review (reviewer): for a SMALL diff → `codex`; for a LARGE diff →
+    `pi` (pi handles heavier reviews, routing internally as it sees fit).
+    Judge size by review burden — roughly, a tight single-concern change of a
+    few dozen lines is small; a multi-file or sprawling change is large. When
+    unsure, treat it as large and send it to `pi`.
+  - The cross-vendor independence rule still wins over these defaults: the
+    reviewer MUST be a different vendor than the implementer. Since the default
+    implementer is `claude_code`, `codex`/`pi` reviewers satisfy that. But if
+    `codex` ever implements a task, do NOT also route its review to `codex` —
+    send that small-diff review to `claude_code` (or `pi`) instead. Likewise if
+    `pi` implemented, route its review elsewhere.
+  - If a default worker is unavailable per preflight, fall back to any
+    available different-vendor worker and tell the human what you substituted.
+
   Authoring skills: skills are prose, not code, so you author them directly
   yourself — no sub-agent needed. A skill always belongs in polly's OWN skills
   directory — `examples/polly/skills/<name>/SKILL.md` in this repo — NEVER the
