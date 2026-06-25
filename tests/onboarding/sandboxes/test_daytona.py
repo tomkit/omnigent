@@ -577,6 +577,24 @@ def test_provision_env_passthrough_resolves_from_server_env(
     }
 
 
+def test_provision_forwards_git_token_by_reference_for_push_back(
+    fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Item 3 / item 1 seam: GIT_TOKEN is forwarded into the sandbox by
+    reference (value read from the server env at provision time, name only
+    in config), so the in-sandbox git credential helper can authenticate the
+    bidirectional clone / push / fetch without any token living in config or
+    being uploaded as a file.
+    """
+    monkeypatch.setenv("GIT_TOKEN", "ghp-secret-789")
+
+    DaytonaSandboxLauncher(env=["GIT_TOKEN"]).provision("push-back")
+
+    [create] = fake_daytona.create_calls
+    assert create.params.env_vars == {"GIT_TOKEN": "ghp-secret-789"}
+
+
 def test_provision_env_passthrough_env_var_fallback(
     fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
