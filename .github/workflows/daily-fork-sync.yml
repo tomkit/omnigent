@@ -1,0 +1,285 @@
+# Daily fork sync — keep this fork (tomkit/omnigent) rebased on upstream
+# (omnigent-ai/omnigent) WITHOUT losing the fork's custom commits, with Claude
+# Code in the loop to resolve any rebase conflicts.
+#
+# Remote naming INSIDE the runner (note: different from a local dev clone):
+#   origin   = THIS fork (tomkit/omnigent)        <- we push here
+#   upstream = omnigent-ai/omnigent (added below) <- we rebase onto here
+#
+# Outcome policy (SAFE by default):
+#   * Clean rebase (no conflicts)            -> force-push main, then DEPLOY.
+#   * Claude had to resolve conflicts        -> push a fork-sync/<ts> branch and
+#                                               open a PR for human review; do
+#                                               NOT deploy unless force_deploy.
+#   * Nothing new upstream (noop)            -> do nothing.
+#
+# Required secrets (repo Settings -> Secrets and variables -> Actions):
+#   * CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY — for the Claude Code action.
+#   * FLY_API_TOKEN — for the deploy job. If absent, the deploy job SKIPS loudly
+#     instead of failing.
+name: daily-fork-sync
+
+on:
+  schedule:
+    # 20:00 UTC daily == 04:00 the next day in the user's local time (UTC+8),
+    # a low-traffic hour. Adjust the cron if your quiet window moves.
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: >-
+          Deploy even when Claude had to resolve conflicts (skips the
+          human-review PR gate). Leave false for the safe default.
+        type: boolean
+        default: false
+
+# Never let two syncs race — a second run waits rather than rebasing/pushing
+# on top of an in-flight one. We do NOT cancel-in-progress: a half-done rebase
+# push should finish.
+concurrency:
+  group: daily-fork-sync
+  cancel-in-progress: false
+
+# Minimal permissions. We resolve conflicts with the headless `claude` CLI
+# authenticated by a direct API key / OAuth token (NOT the Claude GitHub App),
+# so OIDC is not used and `id-token: write` is deliberately NOT granted. (The
+# `anthropics/claude-code-action` GitHub-App path WOULD need `id-token: write`;
+# we avoid that path entirely — see the resolver step below.)
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REMOTE: upstream
+  UPSTREAM_URL: https://github.com/omnigent-ai/omnigent.git
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    name: Rebase fork onto upstream
+    runs-on: ubuntu-latest
+    outputs:
+      outcome: ${{ steps.decide.outputs.outcome }}
+      deploy: ${{ steps.publish.outputs.deploy }}
+      deploy_ref: ${{ steps.publish.outputs.deploy_ref }}
+      sync_branch: ${{ steps.publish.outputs.sync_branch }}
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          # Keep the default GITHUB_TOKEN credentials so we can push back.
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add "${UPSTREAM_REMOTE}" "${UPSTREAM_URL}" 2>/dev/null \
+            || git remote set-url "${UPSTREAM_REMOTE}" "${UPSTREAM_URL}"
+          git fetch --no-tags "${UPSTREAM_REMOTE}" "${UPSTREAM_BRANCH}"
+
+      - name: Attempt rebase
+        id: rebase
+        run: bash .github/scripts/rebase-fork.sh
+
+      # ---- Claude in the loop: only when the rebase paused on conflicts ----
+      # IMPORTANT: the `anthropics/claude-code-action` REFUSES destructive git
+      # ops (rebase / merge / rebase --continue / force-push) — the refusal is
+      # baked into its system prompt and fires even with Bash allowed. So we do
+      # NOT use that action. Instead we install the headless Claude Code CLI and
+      # let our own script (resolve-rebase.sh) OWN the git rebase loop, calling
+      # `claude -p` with file-editing tools ONLY (no Bash) to fix the conflicted
+      # file contents. The shell runs every `git add` / `rebase --continue`.
+      - name: Install Claude Code CLI
+        if: steps.rebase.outputs.outcome == 'conflict'
+        run: |
+          # Pin the CLI for a reproducible daily production run; bump deliberately.
+          npm install -g @anthropic-ai/claude-code@2.1.191
+          claude --version
+
+      - name: Resolve rebase conflicts (shell-driven loop, Claude edits files)
+        if: steps.rebase.outputs.outcome == 'conflict'
+        env:
+          # Use ONE credential (prefer the OAuth token for Claude subscribers;
+          # swap to ANTHROPIC_API_KEY if you use a pay-as-you-go API key). The
+          # CLI reads whichever of these env vars is set.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAX_ITERS: "20"
+        run: bash .github/scripts/resolve-rebase.sh
+
+      - name: Verify rebase completed and landed on upstream
+        if: steps.rebase.outputs.outcome == 'conflict'
+        run: |
+          if [ -d "$(git rev-parse --git-path rebase-merge)" ] || \
+             [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
+            echo "::error::Rebase is still in progress after resolution — conflicts were not fully resolved."
+            git status
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Working tree is not clean after rebase resolution."
+            git status
+            exit 1
+          fi
+          # Prove the rebase actually landed on upstream: upstream must be an
+          # ancestor of HEAD AND HEAD must have moved from where we started. This
+          # stops an aborted/empty resolution from masquerading as success.
+          if ! git merge-base --is-ancestor "${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}" HEAD; then
+            echo "::error::HEAD is not a descendant of ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH} — rebase did not land on upstream."
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" = "${{ steps.rebase.outputs.head_before }}" ]; then
+            echo "::error::HEAD did not move during conflict resolution — suspect an aborted rebase."
+            exit 1
+          fi
+          echo "Rebase completed, tree clean, HEAD descends from upstream."
+
+      - name: Decide outcome
+        id: decide
+        run: |
+          raw="${{ steps.rebase.outputs.outcome }}"
+          case "$raw" in
+            noop)     outcome=noop ;;
+            clean)    outcome=clean ;;
+            conflict) outcome=conflict-resolved ;;   # verify step proved it
+            *)        echo "::error::Unexpected rebase outcome '$raw'"; exit 1 ;;
+          esac
+          echo "outcome=$outcome" >>"$GITHUB_OUTPUT"
+          echo "Final sync outcome: $outcome"
+
+      # ---- Publish: clean -> force-push main + deploy; conflict -> PR (+gated deploy) ----
+      - name: Publish result
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy }}
+        run: |
+          set -euo pipefail
+          outcome="${{ steps.decide.outputs.outcome }}"
+          sha="$(git rev-parse HEAD)"
+
+          if [ "$outcome" = "noop" ]; then
+            echo "Nothing new from upstream — no push, no deploy."
+            {
+              echo "deploy=false"
+              echo "deploy_ref="
+              echo "sync_branch="
+            } >>"$GITHUB_OUTPUT"
+            echo "### Daily fork sync: up to date :white_check_mark:" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$outcome" = "clean" ]; then
+            echo "Clean rebase — force-pushing ${FORK_BRANCH} and enabling deploy."
+            git push --force-with-lease origin "HEAD:${FORK_BRANCH}"
+            {
+              echo "deploy=true"
+              echo "deploy_ref=${sha}"
+              echo "sync_branch=${FORK_BRANCH}"
+            } >>"$GITHUB_OUTPUT"
+            {
+              echo "### Daily fork sync: clean rebase :white_check_mark:"
+              echo "Pushed \`${FORK_BRANCH}\` at \`${sha}\` and triggered deploy."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # outcome == conflict-resolved
+          ts="$(date -u +%Y%m%d-%H%M%S)"
+          branch="fork-sync/${ts}"
+          echo "Conflicts were resolved by Claude — pushing ${branch} and opening a PR."
+          git push origin "HEAD:${branch}"
+
+          # The review PR is REQUIRED. If it cannot be created we fail the job —
+          # a conflict-resolved tree must never exist without a review gate, and
+          # the force_deploy path must never run an unreviewed deploy. The ONLY
+          # tolerated failure is "a PR already exists for this branch" (e.g. a
+          # re-run): we detect that specifically and reuse the existing PR URL.
+          body="Automated daily rebase of \`${FORK_BRANCH}\` onto \`${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}\`. Conflicts were resolved by Claude Code in CI. **Review the resolution before merging** — auto-deploy is withheld pending this human gate (unless re-run with force_deploy)."
+          if pr_url="$(gh pr create \
+                --base "${FORK_BRANCH}" \
+                --head "${branch}" \
+                --title "Daily fork sync (conflict-resolved) ${ts}" \
+                --body "${body}" 2>err.txt)"; then
+            echo "Opened review PR: ${pr_url}"
+          else
+            if grep -qiE 'already exists' err.txt; then
+              pr_url="$(gh pr list --head "${branch}" --state open --json url --jq '.[0].url' 2>/dev/null || true)"
+              if [ -z "${pr_url}" ]; then
+                echo "::error::gh reported an existing PR for ${branch} but none could be found."
+                cat err.txt; exit 1
+              fi
+              echo "Reusing existing review PR: ${pr_url}"
+            else
+              echo "::error::gh pr create failed — refusing to leave a conflict-resolved tree without a review PR."
+              cat err.txt; exit 1
+            fi
+          fi
+
+          if [ "${FORCE_DEPLOY}" = "true" ]; then
+            echo "force_deploy is set — deploying the conflict-resolved tree anyway."
+            deploy=true
+          else
+            echo "Safe default — NOT deploying a conflict-resolved tree. Merge the PR after review."
+            deploy=false
+          fi
+          {
+            echo "deploy=${deploy}"
+            echo "deploy_ref=${sha}"
+            echo "sync_branch=${branch}"
+          } >>"$GITHUB_OUTPUT"
+          {
+            echo "### Daily fork sync: conflicts resolved by Claude :warning:"
+            echo "Review PR for branch \`${branch}\`: ${pr_url}"
+            echo "Deploy gated: \`force_deploy=${FORCE_DEPLOY}\` (deploy=${deploy})."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Build + deploy Fly image (daytona extra)
+    needs: sync
+    if: needs.sync.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: omnigent-tomkit
+    steps:
+      - name: Guard — require FLY_API_TOKEN
+        id: guard
+        run: |
+          if [ -z "${FLY_API_TOKEN}" ]; then
+            echo "::warning::FLY_API_TOKEN is not set — skipping the Fly deploy."
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout rebased tree
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.deploy_ref }}
+          fetch-depth: 1
+
+      - name: Set up flyctl
+        if: steps.guard.outputs.skip != 'true'
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly (OMNIGENT_EXTRAS=daytona)
+        if: steps.guard.outputs.skip != 'true'
+        # The in-flight `daytona-extra-deploy-and-guard` PR wires
+        # OMNIGENT_EXTRAS=daytona into deploy/fly/fly.toml's build config; we
+        # RELY on that and ALSO pass --build-arg here as belt-and-suspenders so
+        # the daytona extra is baked in regardless of merge ordering. The
+        # Dockerfile honors this arg (deploy/docker/Dockerfile:152-154).
+        run: |
+          flyctl deploy \
+            --config deploy/fly/fly.toml \
+            --app "${FLY_APP}" \
+            --build-arg OMNIGENT_EXTRAS=daytona \
+            --remote-only
