@@ -214,10 +214,17 @@ class _FakeSandbox:
         self.state = _FakeSandboxState.STARTED
         self.refresh_data_calls: int = 0
         self.start_calls: int = 0
+        self.stop_calls: int = 0
+        # Exception ``start`` raises (models a sandbox stuck in ERROR
+        # state), or ``None`` for a normal start.
+        self.start_raises: Exception | None = None
         self.autostop_intervals: list[int] = []
         # Exception ``set_autostop_interval`` raises (models a
         # provider rejection), or ``None`` for normal configuration.
         self.autostop_raises: Exception | None = None
+        # Exception ``stop`` raises (models a provider rejection), or
+        # ``None`` for a normal stop.
+        self.stop_raises: Exception | None = None
 
     def refresh_data(self) -> None:
         """Record the state refresh."""
@@ -225,8 +232,17 @@ class _FakeSandbox:
 
     def start(self) -> None:
         """Record the start and transition to STARTED."""
+        if self.start_raises is not None:
+            raise self.start_raises
         self.start_calls += 1
         self.state = _FakeSandboxState.STARTED
+
+    def stop(self) -> None:
+        """Record the stop and transition to STOPPED."""
+        if self.stop_raises is not None:
+            raise self.stop_raises
+        self.stop_calls += 1
+        self.state = _FakeSandboxState.STOPPED
 
     def set_autostop_interval(self, interval: int) -> None:
         """Record the configured idle auto-stop interval."""
@@ -444,6 +460,23 @@ def test_provision_defaults_official_image_and_disables_autostop(
     # default only covers the warm path.
     assert create.timeout > 60
     assert create.has_log_callback is True
+
+
+def test_provision_idle_minutes_enables_autostop(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """
+    A launcher configured with ``idle_minutes`` provisions the sandbox
+    with that non-zero auto-stop interval — Daytona then idle-suspends
+    the host and the server's wake path resumes it in place (vs the
+    always-on default that disables auto-stop).
+    """
+    sandbox_id = DaytonaSandboxLauncher(idle_minutes=30).provision("managed-abc")
+
+    [create] = fake_daytona.create_calls
+    # Non-zero = idle-suspend armed at the configured interval.
+    assert create.params.auto_stop_interval == 30
+    assert sandbox_id == "dt-new-1"
 
 
 def test_provision_image_resolution_order(
@@ -758,6 +791,128 @@ def test_keep_alive_soft_fails_on_provider_rejection(
     # The warning names the failure so the user knows the idle-stop
     # risk exists; silence would hide it until the host vanished.
     assert "could not disable idle auto-stop" in capsys.readouterr().out
+
+
+# ── resume / suspend (idle-suspend lifecycle) ───────────────
+
+
+def test_launcher_advertises_resume_capability() -> None:
+    """
+    The launcher declares it can resume a stopped sandbox in place — the
+    flag the server's wake path checks before reviving a dormant host
+    onto its retained disk (a stopped Daytona sandbox keeps its disk).
+    """
+    assert DaytonaSandboxLauncher.can_resume is True
+
+
+def test_resume_starts_stopped_sandbox(fake_daytona: _FakeDaytonaState) -> None:
+    """
+    Resuming a stopped sandbox starts it in place — the wake path revives
+    the SAME sandbox id onto its retained disk rather than provisioning a
+    fresh, empty box.
+    """
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    sandbox.state = _FakeSandboxState.STOPPED
+
+    launcher.resume(sandbox_id)
+
+    # State refreshed before the decision (a cached handle is stale) and
+    # exactly one start issued.
+    assert sandbox.refresh_data_calls == 1
+    assert sandbox.start_calls == 1
+    assert sandbox.state == _FakeSandboxState.STARTED
+
+
+def test_resume_running_sandbox_skips_start(fake_daytona: _FakeDaytonaState) -> None:
+    """
+    A sandbox already STARTED resumes without a start call — issuing one
+    anyway would be a pointless state-change the provider may reject.
+    """
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+
+    launcher.resume(sandbox_id)
+
+    assert fake_daytona.sandboxes[sandbox_id].start_calls == 0
+
+
+def test_resume_wraps_sdk_errors_with_provider_reason(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """
+    A start failure during resume surfaces the provider's reason through
+    the launcher contract — the wake path reports it as the 502 detail
+    instead of an opaque internal error.
+    """
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    sandbox.state = _FakeSandboxState.STOPPED
+    sandbox.start_raises = _FakeDaytonaError("sandbox stuck in error state")
+
+    with pytest.raises(click.ClickException, match=r"resume.*sandbox stuck"):
+        launcher.resume(sandbox_id)
+
+
+def test_resume_unknown_sandbox_fails_with_hint(fake_daytona: _FakeDaytonaState) -> None:
+    """A vanished sandbox surfaces as a clear error naming the id."""
+    with pytest.raises(click.ClickException, match="dt-gone"):
+        DaytonaSandboxLauncher().resume("dt-gone")
+
+
+def test_suspend_stops_sandbox(fake_daytona: _FakeDaytonaState) -> None:
+    """
+    Suspend stops the sandbox (releasing compute) while leaving it
+    STOPPED, not deleted — its disk survives for a later resume.
+    """
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+
+    launcher.suspend(sandbox_id)
+
+    assert sandbox.stop_calls == 1
+    assert sandbox.state == _FakeSandboxState.STOPPED
+    # A stop is not a delete — the disk (and the sandbox) must remain.
+    assert fake_daytona.deleted == []
+
+
+def test_suspend_wraps_sdk_errors_with_provider_reason(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """
+    A stop failure surfaces the provider's reason through the launcher
+    contract — same posture as run/provision/resume.
+    """
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    fake_daytona.sandboxes[sandbox_id].stop_raises = _FakeDaytonaError("toolbox down")
+
+    with pytest.raises(click.ClickException, match=r"stop.*toolbox down"):
+        launcher.suspend(sandbox_id)
+
+
+def test_suspend_unknown_sandbox_fails_with_hint(fake_daytona: _FakeDaytonaState) -> None:
+    """A vanished sandbox surfaces as a clear error naming the id."""
+    with pytest.raises(click.ClickException, match="dt-gone"):
+        DaytonaSandboxLauncher().suspend("dt-gone")
+
+
+def test_keep_alive_sets_configured_idle_interval(fake_daytona: _FakeDaytonaState) -> None:
+    """
+    With idle-suspend enabled, keep_alive re-asserts the CONFIGURED idle
+    interval rather than forcing always-on (0) — so an attached sandbox
+    created outside this flow idle-suspends consistently with provisioned
+    ones instead of being pinned on forever.
+    """
+    launcher = DaytonaSandboxLauncher(idle_minutes=30)
+    sandbox_id = launcher.provision("a")
+
+    launcher.keep_alive(sandbox_id)
+
+    assert fake_daytona.sandboxes[sandbox_id].autostop_intervals == [30]
 
 
 # ── put / wheel_install_command ─────────────────────────────
