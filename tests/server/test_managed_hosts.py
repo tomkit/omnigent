@@ -174,6 +174,7 @@ def test_parse_valid_daytona_config_builds_parameterized_factory(
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "idle_minutes": 30,
+                "archive_minutes": 4320,
             },
         }
     )
@@ -189,6 +190,10 @@ def test_parse_valid_daytona_config_builds_parameterized_factory(
     # idle_minutes opts the host into idle-suspend; it must reach the
     # launcher so provision sets a non-zero Daytona auto-stop interval.
     assert fake.idle_minutes == 30
+    # archive_minutes caps how long the idle-suspended host may stay
+    # stopped before Daytona archives its disk; it must reach the launcher
+    # so provision pins auto-archive instead of trusting provider defaults.
+    assert fake.archive_minutes == 4320
 
 
 def test_parse_daytona_without_section_defaults(
@@ -210,6 +215,9 @@ def test_parse_daytona_without_section_defaults(
     # No idle_minutes → always-on preserved (the launcher disables
     # auto-stop), so current deployments don't regress into idle-stops.
     assert fake.idle_minutes is None
+    # No archive_minutes → launcher uses the provider's maximal retention
+    # for any stopped box (moot while always-on, but threaded through).
+    assert fake.archive_minutes is None
 
 
 def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
@@ -598,6 +606,26 @@ def test_parse_kubernetes_invalid_block_fails_loud(
         (
             {"provider": "daytona", "server_url": "https://s", "daytona": {"idle_minutes": "30"}},
             "sandbox.daytona.idle_minutes",
+        ),
+        (
+            {"provider": "daytona", "server_url": "https://s", "daytona": {"archive_minutes": 0}},
+            "sandbox.daytona.archive_minutes",
+        ),
+        (
+            {
+                "provider": "daytona",
+                "server_url": "https://s",
+                "daytona": {"archive_minutes": -1},
+            },
+            "sandbox.daytona.archive_minutes",
+        ),
+        (
+            {
+                "provider": "daytona",
+                "server_url": "https://s",
+                "daytona": {"archive_minutes": "4320"},
+            },
+            "sandbox.daytona.archive_minutes",
         ),
         # boxlite section present but malformed.
         ({"provider": "boxlite", "server_url": "https://s", "boxlite": "x"}, "sandbox.boxlite"),
