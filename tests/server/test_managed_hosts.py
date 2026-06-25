@@ -1510,7 +1510,7 @@ def test_start_host_rejects_half_configured_git_identity(
     git identity as a unit. Supplying only one is a caller bug: it would widen
     the fetch refspec (pull works) yet leave ``git commit`` aborting with
     "Author identity unknown" — push-back silently broken. The guard fails
-    loud, before the host is ever started.
+    loud, before any sandbox-mutating command runs.
     """
     fake = FakeSandboxLauncher()
     with pytest.raises(click.ClickException, match=r"both user\.name and user\.email") as exc:
@@ -1525,6 +1525,9 @@ def test_start_host_rejects_half_configured_git_identity(
         )
     assert f"got only {present}" in exc.value.message
     assert fake.host_starts == []
+    # Pre-side-effect: nothing mutated the sandbox — only the read-only $HOME
+    # probe ran (no mkdir, no git config, no clone).
+    assert not any(c.startswith(("mkdir", "git ")) for c in fake.commands)
 
 
 def test_start_host_rejects_colliding_context_repo_destinations() -> None:
@@ -1547,7 +1550,8 @@ def test_start_host_rejects_colliding_context_repo_destinations() -> None:
                 ContextRepo(url="https://github.com/me/b.git", branch=None, dest=".claude/skills"),
             ),
         )
-    assert not any(c.startswith("git clone") for c in fake.commands)
+    # Pre-side-effect: the collision is caught before mkdir or any clone.
+    assert not any(c.startswith(("mkdir", "git ")) for c in fake.commands)
 
 
 def test_start_host_rejects_context_repo_colliding_with_primary_clone() -> None:
@@ -1574,7 +1578,8 @@ def test_start_host_rejects_context_repo_colliding_with_primary_clone() -> None:
                 ),
             ),
         )
-    assert not any(c.startswith("git clone") for c in fake.commands)
+    # Pre-side-effect: the collision is caught before mkdir or any clone.
+    assert not any(c.startswith(("mkdir", "git ")) for c in fake.commands)
 
 
 def test_start_host_refspec_failure_names_repo_and_operation() -> None:

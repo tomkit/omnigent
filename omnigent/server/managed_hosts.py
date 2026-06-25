@@ -2393,13 +2393,16 @@ async def resume_managed_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
-            # The persistent volume already holds the cloned workspace, every
-            # context repo, and the ~/.gitconfig identity from the original
-            # launch, so resume re-clones NOTHING: passing repo_url /
-            # context_repos here would re-run `git clone` onto non-empty
-            # directories and fail. (A context repo added to config AFTER the
-            # original launch therefore won't appear until the next fresh
-            # launch — the same persistence trade-off the primary repo makes.)
+            # The persistent volume already holds the workspace and the
+            # ~/.gitconfig identity from the original launch, so resume
+            # re-clones NOTHING. Two cases for context repos:
+            #   (a) those cloned at the original launch are on the volume
+            #       already, so a blind re-clone would hit their non-empty
+            #       dirs and fail — hence resume passes no context_repos;
+            #   (b) a context repo ADDED to config AFTER the original launch
+            #       is therefore intentionally NOT materialized on resume — it
+            #       appears only on the next fresh launch (the same persistence
+            #       trade-off the primary repo makes).
             # The identity, by contrast, IS re-applied: a `git config --global`
             # is cheap and idempotent (a no-op when unchanged), so a host whose
             # home volume predates git sync being enabled still gets one.

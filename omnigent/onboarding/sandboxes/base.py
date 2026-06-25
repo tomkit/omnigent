@@ -344,11 +344,14 @@ class SandboxLauncher(ABC):
                 "the configured image must provide a usable shell environment"
             )
         workspace_base = f"{home}/workspace"
-        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace_base)}")
-        # Identity first: it is global (~/.gitconfig), so it applies to the
-        # primary clone, the context-repo clones, and every later agent commit
-        # in any of them. A commit needs BOTH user.name and user.email, so the
-        # two are a unit — armed together or not at all. The server's
+        # Validate the WHOLE request before any sandbox-MUTATING command (the
+        # mkdir / clones below), so a rejected launch leaves the sandbox
+        # untouched. The only sandbox call these guards lean on is the $HOME
+        # probe above — a read-only query (collision detection resolves
+        # relative dests under <workspace_base>, which needs $HOME).
+        #
+        # Identity guard: a commit needs BOTH user.name and user.email, so the
+        # identity is a unit — armed together or not at all. The server's
         # _resolve_git_identity always supplies both-or-neither; guard the
         # invariant so a future caller passing just one fails loud here, rather
         # than silently arming the sync path (refspec widening below) against a
@@ -360,16 +363,14 @@ class SandboxLauncher(ABC):
                 "(or neither) — got only "
                 f"{'user.name' if git_user_name is not None else 'user.email'}"
             )
-        self._configure_git_identity(sandbox_id, git_user_name, git_user_email)
-        bidirectional = git_user_name is not None
-        # Resolve every clone destination up front. The primary repo (when the
-        # session has one) clones into <base>/<repo_name>; each context repo
-        # into its absolute dest as-is (e.g. a "$HOME"-relative skills path the
-        # operator pins), or under <base> for a relative one — beside the repo,
-        # NOT inside the primary clone dir. Two repos resolving to the same path
-        # is a config error: the second `git clone` would abort on a non-empty
-        # target and strand the sandbox half-cloned, so detect collisions BEFORE
-        # cloning anything.
+        # Collision guard: resolve every clone destination. The primary repo
+        # (when the session has one) clones into <base>/<repo_name>; each
+        # context repo into its absolute dest as-is (e.g. a "$HOME"-relative
+        # skills path the operator pins), or under <base> for a relative one —
+        # beside the repo, NOT inside the primary clone dir. Two repos resolving
+        # to the same path is a config error: the second `git clone` would abort
+        # on a non-empty target and strand the sandbox half-cloned, so reject
+        # collisions here, before anything is created.
         clone_specs: list[tuple[str, str | None, str]] = []
         if repo_url is not None:
             clone_specs.append((repo_url, repo_branch, f"{workspace_base}/{repo_name}"))
@@ -390,6 +391,12 @@ class SandboxLauncher(ABC):
                     "every context repo must clone into a distinct path"
                 )
             seen.add(key)
+        # Request validated — now mutate the sandbox.
+        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace_base)}")
+        # Identity is global (~/.gitconfig), so it applies to the primary clone,
+        # the context-repo clones, and every later agent commit in any of them.
+        self._configure_git_identity(sandbox_id, git_user_name, git_user_email)
+        bidirectional = git_user_name is not None
         # The returned workspace is the primary clone dir (or the base when the
         # session has no repo); context repos clone alongside it, never changing
         # what the session binds.
