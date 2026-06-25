@@ -203,6 +203,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.disk_gb: int | None = None
         self.idle_pause_after_s: int | None = None
         self.idle_minutes: int | None = None
+        self.archive_minutes: int | None = None
         self.cluster: str | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
         self.namespace: str | None = None
@@ -352,8 +353,9 @@ def install_fake_daytona_launcher(
     Substitute the fake for ``DaytonaSandboxLauncher`` at its public seam.
 
     The managed flow constructs ``DaytonaSandboxLauncher(image=…,
-    env=…, idle_minutes=…)``; the shim records each on the fake and
-    hands the fake back, so production code runs unmodified against it.
+    env=…, idle_minutes=…, archive_minutes=…)``; the shim records each on
+    the fake and hands the fake back, so production code runs unmodified
+    against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
     :param fake: The fake launcher to substitute.
@@ -365,11 +367,13 @@ def install_fake_daytona_launcher(
         image: str | None = None,
         env: list[str] | None = None,
         idle_minutes: int | None = None,
+        archive_minutes: int | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
         fake.idle_minutes = idle_minutes
+        fake.archive_minutes = archive_minutes
         return fake
 
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)

@@ -27,9 +27,12 @@ Platform notes that shape this launcher:
   is deleted (or the dead-sandbox relaunch path replaces a crashed one).
   Operators who prefer to reclaim idle compute can opt into idle-suspend
   with ``sandbox.daytona.idle_minutes``: the sandbox is provisioned with
-  that auto-stop interval and a stop RETAINS its disk (only auto-delete,
-  off by default, removes a stopped sandbox), so the server's wake path
-  (:meth:`resume`) revives it in place onto the same workspace.
+  that auto-stop interval, and — because a STOPPED sandbox is otherwise
+  subject to provider auto-archive (and auto-delete if enabled) that
+  would reclaim its disk — provision also pins those lifecycle params so
+  the stop RETAINS the disk until the server's wake path (:meth:`resume`)
+  revives it in place onto the same workspace. The archive ceiling is
+  tunable via ``sandbox.daytona.archive_minutes``.
 - **Workload env rides sandbox creation.** Daytona has no named-secret
   store to attach at create time; harness credentials are injected as
   literal ``env_vars``, resolved BY NAME from the server process
@@ -108,10 +111,31 @@ _CREATE_TIMEOUT_S: float = 900.0
 # sandbox after that idle period and the server's wake path
 # (:func:`~omnigent.server.managed_hosts.resume_managed_host`) resumes
 # it IN PLACE, reattaching its persistent disk. The stop retains the
-# filesystem — only auto-delete (disabled by Daytona's default) removes
-# a stopped sandbox — so the cloned workspace + omnigent host install
-# survive the resume.
+# filesystem so the cloned workspace + omnigent host install survive the
+# resume — PROVIDED a STOPPED sandbox is not reclaimed first (see the
+# auto-archive / auto-delete constants below).
 _AUTO_STOP_DISABLED: int = 0
+
+# A STOPPED Daytona sandbox is not inert: the provider auto-ARCHIVES it
+# after ``auto_archive_interval`` minutes of being continuously stopped
+# (live default observed at 7 days / 10080 min, with sandboxes reporting
+# ``recoverable: false``), and would auto-DELETE it if
+# ``auto_delete_interval`` were enabled. Either reclaims the workspace
+# disk out from under a pending :meth:`resume`, breaking the idle-suspend
+# contract that the cloned repo + omnigent install survive until the host
+# is woken. So when idle-suspend is enabled, :meth:`provision` sets these
+# EXPLICITLY rather than trusting provider defaults:
+#
+# - ``auto_delete_interval`` is forced to the SDK's "disabled" sentinel
+#   (a NEGATIVE value; ``create`` accepts it and only validates the
+#   stop/archive intervals as non-negative).
+# - ``auto_archive_interval`` defaults to the SDK's "maximum interval"
+#   sentinel (0) — the longest retention the provider offers, the
+#   closest thing to "never archive". Operators can override it with a
+#   finite ``sandbox.daytona.archive_minutes`` (e.g. to reclaim disk on a
+#   known cadence) at the cost of a resume failing once the box archives.
+_AUTO_DELETE_DISABLED: int = -1
+_AUTO_ARCHIVE_MAX: int = 0
 
 # Terminate retries when Daytona reports a state-change conflict (e.g.
 # a deletion another cleanup path already started). 3 attempts × 2 s
@@ -201,8 +225,9 @@ class DaytonaSandboxLauncher(SandboxLauncher):
     # Daytona preview links are sandbox→public only; there is no
     # local→sandbox path for the App OAuth callback port.
     supports_local_port_forward: ClassVar[bool] = False
-    # A stopped Daytona sandbox keeps its persistent disk (only
-    # auto-delete, disabled by default, removes it), so the server's wake
+    # A stopped Daytona sandbox keeps its persistent disk — provided it
+    # isn't reclaimed by provider auto-archive/auto-delete, which
+    # idle-suspend provisioning pins to safe values — so the server's wake
     # path can resume it in place onto the same workspace rather than
     # provisioning a fresh box. See :meth:`resume` / :meth:`suspend`.
     can_resume: ClassVar[bool] = True
@@ -213,6 +238,7 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         image: str | None = None,
         env: Sequence[str] | None = None,
         idle_minutes: int | None = None,
+        archive_minutes: int | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -237,10 +263,21 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             place on the next message. ``None`` (the default) keeps the
             always-on behavior (auto-stop disabled), so existing
             deployments do not regress.
+        :param archive_minutes: Optional auto-archive interval in minutes
+            — the server's managed-host ``sandbox.daytona.archive_minutes``
+            config. Only meaningful WITH ``idle_minutes`` (a STOPPED
+            sandbox is what gets archived): it caps how long an
+            idle-suspended host may stay stopped before Daytona archives
+            its disk, after which a :meth:`resume` would wake to a wiped
+            box. ``None`` (the default) uses the SDK's "maximum interval"
+            sentinel so an idle-suspended host is effectively never
+            archived out from under a pending resume. Ignored when
+            idle-suspend is off (an always-on host never stops).
         """
         self._image_ref = image
         self._env_names = tuple(env) if env is not None else None
         self._idle_minutes = idle_minutes
+        self._archive_minutes = archive_minutes
         self._client: daytona_sdk.Daytona | None = None
         self._sandboxes: dict[str, DaytonaSandbox] = {}
 
@@ -257,6 +294,20 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         :returns: The auto-stop interval in minutes (0 = disabled).
         """
         return self._idle_minutes if self._idle_minutes is not None else _AUTO_STOP_DISABLED
+
+    def _archive_interval(self) -> int:
+        """
+        Resolve the auto-archive interval (minutes) for idle-suspend.
+
+        Returns the configured ``archive_minutes`` when set, otherwise
+        :data:`_AUTO_ARCHIVE_MAX` (the SDK's "maximum interval" sentinel
+        — the longest retention the provider offers). Only consulted by
+        :meth:`provision` when idle-suspend is enabled; an always-on host
+        never stops, so it never archives.
+
+        :returns: The auto-archive interval in minutes (0 = provider max).
+        """
+        return self._archive_minutes if self._archive_minutes is not None else _AUTO_ARCHIVE_MAX
 
     def _daytona(self) -> daytona_sdk.Daytona:
         """
@@ -364,10 +415,14 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         then lives until the managed-session machinery terminates it.
         When the launcher is configured with ``idle_minutes``, the
         sandbox is instead created with that auto-stop interval so it
-        idle-suspends and the server's wake path resumes it in place.
-        The first creation from a given image is slow (Daytona pulls it
-        and builds an internal snapshot); later creations reuse the
-        snapshot.
+        idle-suspends and the server's wake path resumes it in place. In
+        that mode provision ALSO pins the stopped-sandbox lifecycle
+        explicitly — auto-delete disabled, auto-archive at a safe (by
+        default maximal) interval — so the idle-suspended box is not
+        reclaimed before its resume (see :data:`_AUTO_DELETE_DISABLED` /
+        :data:`_AUTO_ARCHIVE_MAX`). The first creation from a given image
+        is slow (Daytona pulls it and builds an internal snapshot); later
+        creations reuse the snapshot.
 
         :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``.
             Recorded as a label; the returned id is the canonical
@@ -379,6 +434,19 @@ class DaytonaSandboxLauncher(SandboxLauncher):
 
         resolved_ref = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
         env_vars = self._resolve_sandbox_env()
+        # When idle-suspend is on, this sandbox WILL sit stopped between
+        # turns, so don't trust provider defaults for a stopped box:
+        # explicitly disable auto-delete and pin auto-archive to a safe
+        # (by default maximal) interval, so it can't be reclaimed out from
+        # under the pending resume that owns its workspace disk. When off
+        # (always-on), leave both at the provider default (None) — an
+        # always-on host never stops, so prior behavior is preserved.
+        if self._idle_minutes is not None:
+            auto_archive_interval: int | None = self._archive_interval()
+            auto_delete_interval: int | None = _AUTO_DELETE_DISABLED
+        else:
+            auto_archive_interval = None
+            auto_delete_interval = None
         click.echo(f"▸ Creating Daytona sandbox '{name}' from {resolved_ref}")
         try:
             handle = self._daytona().create(
@@ -388,10 +456,12 @@ class DaytonaSandboxLauncher(SandboxLauncher):
                     labels={"omnigent-name": name},
                     # Idle auto-stop: disabled by default (Daytona's
                     # 15-minute default would kill the host between turns)
-                    # so the managed-session machinery owns termination;
-                    # a configured idle_minutes opts into idle-suspend,
-                    # whose stop retains the disk for an in-place resume.
+                    # so the managed-session machinery owns termination; a
+                    # configured idle_minutes opts into idle-suspend, whose
+                    # stop retains the disk for an in-place resume.
                     auto_stop_interval=self._autostop_interval(),
+                    auto_archive_interval=auto_archive_interval,
+                    auto_delete_interval=auto_delete_interval,
                     resources=daytona.Resources(cpu=_SANDBOX_CPU, memory=_SANDBOX_MEMORY_GIB),
                 ),
                 timeout=_CREATE_TIMEOUT_S,
@@ -436,8 +506,9 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         (:func:`~omnigent.server.managed_hosts.resume_managed_host`) when
         a host that idle-suspended gets a new message. Mechanically the
         same as :meth:`attach`'s restart of a stopped box — a stopped
-        Daytona sandbox keeps its disk (only auto-delete, disabled by
-        default, removes it), so the cloned workspace + omnigent install
+        Daytona sandbox keeps its disk as long as it isn't reclaimed by
+        provider auto-archive/auto-delete (which idle-suspend provisioning
+        pins to safe values), so the cloned workspace + omnigent install
         survive — but kept as its own method so the capability is
         explicit: :attr:`can_resume` advertises it and the wake path
         restarts ``omnigent host`` separately afterward.
@@ -492,8 +563,9 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         counterpart to Daytona's own idle auto-stop (provisioned via
         ``idle_minutes``): both leave the sandbox STOPPED, not deleted,
         so the cloned workspace + omnigent install survive for a later
-        wake (only auto-delete, disabled by default, would remove a
-        stopped sandbox).
+        wake — for as long as the stopped sandbox is retained (idle-suspend
+        provisioning pins auto-archive/auto-delete so a stopped box isn't
+        reclaimed before its resume).
 
         :param sandbox_id: The sandbox to stop (a UUID string).
         :raises click.ClickException: When the sandbox does not exist or
