@@ -54,6 +54,12 @@ stores into ``create_app``):
                                    # the next message (the stop keeps the
                                    # workspace disk). Omit to keep the host
                                    # always-on (auto-stop disabled).
+           archive_minutes: 4320   # optional (idle-suspend only): cap how
+                                   # long a stopped host may sit before
+                                   # Daytona archives its disk. Omit for the
+                                   # provider's maximal retention so an
+                                   # idle-suspended host is not archived
+                                   # before its resume.
          islo:                    # optional block (provider: islo)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -649,6 +655,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_daytona_image(raw),
             _parse_daytona_env(raw),
             _parse_provider_positive_int(raw, "daytona", "idle_minutes"),
+            _parse_provider_positive_int(raw, "daytona", "archive_minutes"),
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "boxlite":
@@ -807,6 +814,7 @@ def _daytona_launcher_factory(
     image: str | None,
     env: list[str] | None,
     idle_minutes: int | None,
+    archive_minutes: int | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: daytona`` path.
@@ -824,6 +832,12 @@ def _daytona_launcher_factory(
         idle-suspends after this long and the server's wake path resumes
         it in place — or ``None`` to keep the always-on default
         (auto-stop disabled), so existing deployments do not regress.
+    :param archive_minutes: Auto-archive ceiling in minutes for an
+        idle-suspended (stopped) host — how long it may stay stopped
+        before Daytona archives its disk — or ``None`` to use the
+        provider's maximal retention so an idle-suspended host is
+        effectively never archived before its resume. Only meaningful
+        alongside ``idle_minutes``.
     :returns: A factory producing parameterized Daytona launchers.
     """
 
@@ -831,7 +845,12 @@ def _daytona_launcher_factory(
         """Construct the Daytona launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
-        return DaytonaSandboxLauncher(image=image, env=env, idle_minutes=idle_minutes)
+        return DaytonaSandboxLauncher(
+            image=image,
+            env=env,
+            idle_minutes=idle_minutes,
+            archive_minutes=archive_minutes,
+        )
 
     return _build
 
