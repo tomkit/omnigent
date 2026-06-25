@@ -588,6 +588,18 @@ class SandboxLauncher(ABC):
         processes are reaped on exec return (e.g. OpenShell) override this
         to hold the exec stream open instead.
 
+        *command* is run via ``sh -c`` rather than spliced directly after
+        ``setsid nohup``. This is required for commands that carry a leading
+        ``VAR=value …`` environment prefix (e.g. the ``omnigent host`` launch
+        from :meth:`start_host`): in POSIX shell, ``NAME=value`` tokens that
+        follow a command word are ARGUMENTS, not assignments, so
+        ``setsid nohup VAR=value omnigent host …`` makes ``nohup`` try to exec
+        a program literally named ``VAR=value`` (exit 127) and the env vars
+        never reach the host — a failure masked by the trailing ``echo
+        launched``. Wrapping in ``sh -c '<command>'`` hands the prefix to a
+        fresh shell that parses it as a normal simple-command assignment, so
+        the vars are exported into the host's environment.
+
         :param sandbox_id: Target sandbox.
         :param command: Shell command to background, e.g.
             ``"ENV=val omnigent host --server https://…"``.
@@ -598,7 +610,8 @@ class SandboxLauncher(ABC):
         """
         return self.run(
             sandbox_id,
-            f"setsid nohup {command} > {log_path} 2>&1 < /dev/null & echo launched",
+            f"setsid nohup sh -c {shlex.quote(command)} "
+            f"> {log_path} 2>&1 < /dev/null & echo launched",
         )
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
