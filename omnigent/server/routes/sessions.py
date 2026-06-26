@@ -806,6 +806,85 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
 }
 
+# ── Managed-runner write authorization: per-event-type classification ──
+#
+# ``POST .../events`` authorizes either as a real user OR — for a
+# credential-less server-managed sandbox runner — via its tunnel binding token
+# (see ``_authorize_session_with_runner_fallback``). A binding token proves only
+# the *in-sandbox runner's* identity; it stands in for the AGENT's work, never
+# for the HUMAN decision-maker. So the token fallback is permitted ONLY for
+# runner-owned event types: the streaming / output / status / turn-control
+# events the in-sandbox runner legitimately emits to report the agent's work.
+#
+# Event types that act as the human decision-maker — resolving an elicitation /
+# approval gate or applying deferred policy-ask writes — MUST require a real
+# user identity and MUST NOT appear here. Today that is exactly ``approval``
+# (``_APPROVAL_TYPE``): its ``post_event`` branch calls ``_resolve_elicitation``
+# (whose only guard is session-scoped — a same-session runner token would pass
+# it) and ``_apply_pending_policy_ask_writes``. The managed runner never posts
+# ``approval`` to the server — server→runner is the only direction a verdict
+# flows (the runner forwards it to its local harness) — so excluding it from the
+# token fallback breaks no legitimate runner flow.
+#
+# Fail-safe by construction: this is an explicit ALLOWLIST, not a denylist. A
+# NEW event type added to ``_ALLOWED_EVENT_TYPES`` but left unclassified here
+# defaults to user-only at runtime (the token fallback is denied) AND trips the
+# partition assertion in ``test_sessions_managed_runner_rest_write_auth.py``,
+# forcing a deliberate runner-owned vs user-control decision before it can ship.
+_RUNNER_OWNED_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        # Item-typed agent output / lifecycle the runner persists or relays.
+        "message",
+        "function_call",
+        "function_call_output",
+        "error",
+        "reasoning",
+        "compaction",
+        "native_tool",
+        "resource_event",
+        "routing_decision",
+        "slash_command",
+        "terminal_command",
+        # Turn / session control the runner drives over its OWN work.
+        _INTERRUPT_TYPE,
+        # Surfaces an MCP prompt to the user; the human VERDICT arrives
+        # separately via ``approval`` (which is user-control, excluded below).
+        _MCP_ELICITATION_TYPE,
+        _COMPACT_TYPE,
+        # Additionally re-checks LEVEL_OWNER inside its branch, so a token
+        # still cannot stop a session even though the type is listed here.
+        _STOP_SESSION_TYPE,
+        # Terminal / forwarder observations streamed back to report the work.
+        _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+        _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+        # Reports an in-harness human resolution to clear the pending card;
+        # sets only a "resolved elsewhere" signal — no accept/deny verdict and
+        # no policy write — so it is runner-owned reporting, not a decision.
+        _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+        _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_COMPACTION_STATUS_TYPE,
+        _EXTERNAL_MODEL_CHANGE_TYPE,
+        _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        _EXTERNAL_SESSION_TODOS_TYPE,
+        _EXTERNAL_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    }
+)
+
+# Human-decision-maker event types: a credential-less runner binding token must
+# NEVER satisfy these on ``post_event`` — they resolve approval gates / apply
+# deferred policy-ask writes, i.e. they stand in for the human's verdict. Kept
+# as an explicit, named set (not computed by subtraction) so the
+# security-critical surface is auditable at a glance. Disjoint from
+# ``_RUNNER_OWNED_EVENT_TYPES``; together the two must partition
+# ``_ALLOWED_EVENT_TYPES`` (enforced by test).
+_USER_CONTROL_EVENT_TYPES: frozenset[str] = frozenset({_APPROVAL_TYPE})
+
 # Validates every dict that crosses the AP→client SSE boundary on
 # the session stream. Built once at module load.
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
@@ -11489,6 +11568,72 @@ async def _resolve_managed_runner_session_read(
     return _SessionAccess(level=LEVEL_READ, conversation=conv)
 
 
+async def _authorize_session_with_runner_fallback(
+    request: Request,
+    session_id: str,
+    *,
+    level: int,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> _SessionAccess:
+    """Authorize a session-scoped request at ``level``, with a managed-runner fallback.
+
+    The consolidated authorizer behind every route a server-managed sandbox
+    runner reaches without a user credential: READ snapshots *and* the
+    same-session WRITE callbacks (``POST .../events``, the non-privileged
+    ``PATCH /sessions/{id}`` fields, ``POST .../policies/evaluate``) it needs to
+    stream output back and complete a task.
+
+    Normal path is byte-for-byte the prior per-route behavior: when the request
+    carries a user identity, or auth is disabled entirely (no auth provider —
+    loopback / single-user), this is exactly ``require_access_and_level`` at
+    ``level``. User-auth and loopback callers never reach the fallback.
+
+    Fallback path — only when an auth provider is configured AND no user
+    identity is present: admit the session's own managed sandbox runner, proven
+    by a binding token whose ``token_bound_runner_id`` equals this session's
+    persisted ``runner_id`` (see :func:`_resolve_managed_runner_session_read`).
+    Anything else fails closed with the same 401 the user path raises.
+
+    Security cap: the binding token can NEVER satisfy a privileged level. A
+    request asking for more than ``LEVEL_EDIT`` (MANAGE / OWNER — archive,
+    permission grants, ownership transfer) is rejected with 401 *before* the
+    proof is even consulted, so a valid token cannot be widened into a
+    privileged grant. Privileged routes must keep requiring a real user.
+
+    :param request: The incoming request (auth + tunnel-token header).
+    :param session_id: Target session, e.g. ``"conv_abc123"``.
+    :param level: Minimum numeric level the route requires (1=read, 2=edit).
+    :param auth_provider: The server's auth provider, or ``None`` when auth is
+        disabled.
+    :param permission_store: Permission store, or ``None`` when disabled.
+    :param conversation_store: Conversation store for the fallback lookups.
+    :returns: A :class:`SessionAccess` granting at least ``level``.
+    :raises OmnigentError: 401 / 403 / 404 exactly as the user path does.
+    """
+    user_id = _get_user_id(request, auth_provider)
+    if user_id is not None or auth_provider is None:
+        return await _require_access_and_level(
+            user_id, session_id, level, permission_store, conversation_store
+        )
+    # HARD CAP — a binding token proves only the in-sandbox runner's identity,
+    # never an owning user. It must never reach a privileged (MANAGE/OWNER)
+    # grant, so reject before consulting the proof at all.
+    if level > LEVEL_EDIT:
+        raise OmnigentError(
+            "Authentication required",
+            code=ErrorCode.UNAUTHORIZED,
+        )
+    proven = await _resolve_managed_runner_session_read(request, session_id, conversation_store)
+    if proven is not None:
+        return _SessionAccess(level=level, conversation=proven.conversation)
+    raise OmnigentError(
+        "Authentication required",
+        code=ErrorCode.UNAUTHORIZED,
+    )
+
+
 async def _authorize_session_read_with_runner_fallback(
     request: Request,
     session_id: str,
@@ -11499,17 +11644,11 @@ async def _authorize_session_read_with_runner_fallback(
 ) -> _SessionAccess:
     """READ-authorize a session-scoped GET, with a managed-runner token fallback.
 
-    Normal path is byte-for-byte the prior behavior: when the request carries
-    a user identity, or auth is disabled entirely (no auth provider — loopback
-    / single-user), this is exactly ``require_access_and_level`` at
-    ``LEVEL_READ``. User-auth and loopback callers never reach the fallback.
-
-    Fallback path — only when an auth provider is configured AND no user
-    identity is present: admit the session's own managed sandbox runner,
-    proven by a binding token whose ``token_bound_runner_id`` equals this
-    session's persisted ``runner_id`` (see
-    :func:`_resolve_managed_runner_session_read`). Anything else fails closed
-    with the same 401 the user path raises.
+    Thin ``LEVEL_READ`` wrapper over
+    :func:`_authorize_session_with_runner_fallback`, kept so the three GET
+    routes read unchanged. Behavior is identical to the prior implementation:
+    user-auth / loopback take the normal path, and an unauthenticated caller is
+    admitted only when its binding token proves the session's bound runner.
 
     :param request: The incoming request (auth + tunnel-token header).
     :param session_id: Target session, e.g. ``"conv_abc123"``.
@@ -11520,17 +11659,13 @@ async def _authorize_session_read_with_runner_fallback(
     :returns: A :class:`SessionAccess` granting at least READ.
     :raises OmnigentError: 401 / 403 / 404 exactly as the user path does.
     """
-    user_id = _get_user_id(request, auth_provider)
-    if user_id is not None or auth_provider is None:
-        return await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-    access = await _resolve_managed_runner_session_read(request, session_id, conversation_store)
-    if access is not None:
-        return access
-    raise OmnigentError(
-        "Authentication required",
-        code=ErrorCode.UNAUTHORIZED,
+    return await _authorize_session_with_runner_fallback(
+        request,
+        session_id,
+        level=LEVEL_READ,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        conversation_store=conversation_store,
     )
 
 
@@ -14195,9 +14330,24 @@ def create_sessions_router(
         # the level the request actually requires gates both — no redundant
         # second permission-store read for archive/unarchive.
         required_level = LEVEL_OWNER if body.archived is not None else LEVEL_EDIT
-        await _require_access(
-            user_id, session_id, required_level, permission_store, conversation_store
-        )
+        if required_level > LEVEL_EDIT:
+            # Privileged (archive) branch: real owning user only, NO runner
+            # fallback. A binding token must never archive a session.
+            await _require_access(
+                user_id, session_id, required_level, permission_store, conversation_store
+            )
+        else:
+            # Non-privileged edits (title / labels / model / effort): the
+            # session's own managed runner may authorize via its binding token
+            # (capped at EDIT). User-auth callers take the unchanged path.
+            await _authorize_session_with_runner_fallback(
+                request,
+                session_id,
+                level=LEVEL_EDIT,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -15321,9 +15471,19 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body is malformed.
         """
+        # READ-level policy evaluation. A server-managed sandbox runner (no
+        # user credential) authorizes via its tunnel binding token; user-auth
+        # callers take the unchanged path. A token grants READ, so the runner's
+        # own hooks evaluate read-only. ``user_id`` (``None`` on the runner
+        # fallback path) is still the policy actor below.
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        access = await _authorize_session_with_runner_fallback(
+            request,
+            session_id,
+            level=LEVEL_READ,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:
@@ -17539,10 +17699,39 @@ def create_sessions_router(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        # Same-session EDIT write, authorized by event type BEFORE any side
+        # effect runs. A server-managed sandbox runner has no user credential,
+        # so it authorizes via its tunnel binding token (capped at EDIT) — the
+        # callback path the agent uses to stream output and complete tasks. But
+        # the token proves only the in-sandbox runner's identity, never the
+        # HUMAN decision-maker: a runner-owned event type takes the token
+        # fallback, while a user-control type (``approval`` — resolves an
+        # approval gate / applies deferred policy writes) and ANY unclassified
+        # type fall through to user-only auth and fail closed (401) for the
+        # credential-less runner. ``user_id`` (``None`` on the runner fallback
+        # path) is still the actor / attribution identity below; the owner-only
+        # ``stop_session`` branch re-checks LEVEL_OWNER, so a token can't
+        # escalate past EDIT here.
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-        )
+        if body.type in _RUNNER_OWNED_EVENT_TYPES:
+            access = await _authorize_session_with_runner_fallback(
+                request,
+                session_id,
+                level=LEVEL_EDIT,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+        else:
+            # User-control or unclassified event type: a binding token must
+            # never stand in for the human verdict. Require a real user, so the
+            # credential-less runner fails closed (401) here — before
+            # ``_resolve_elicitation`` / ``_apply_pending_policy_ask_writes``
+            # (the approval branch) can run any side effect.
+            user_id = _require_user(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            )
         conv = access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
