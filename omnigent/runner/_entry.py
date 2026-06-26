@@ -390,6 +390,41 @@ def _runner_tunnel_binding_token_from_env() -> str | None:
     return token.strip()
 
 
+def _server_client_headers() -> dict[str, str]:
+    """Build the default headers for the runner's shared server httpx client.
+
+    Always carries the sentinel ``Origin`` that marks the runner as a
+    first-party non-browser client (so the server's CSRF/origin guard on the
+    multipart routes lets ``sys_session_create`` / ``sys_upload_file``
+    through).
+
+    When the runner carries a tunnel binding token (every CLI / host-daemon /
+    managed-sandbox spawn path sets ``OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN``),
+    additionally attach it as ``X-Omnigent-Runner-Tunnel-Token``. This is what
+    lets a server-managed sandbox runner — which never ran ``omnigent login``
+    and so has no user credential — prove its identity to the server's
+    session-scoped REST routes on the plain-HTTP path (``GET
+    /v1/sessions/{id}``, ``.../agent``, ``.../agent/contents``). Additive: when
+    the env var is unset (external / local hosts), only the ``Origin`` header
+    is sent and the user/Databricks auth flow is unchanged. Tolerant of an
+    empty value (treated as unset) so client construction never crashes on it;
+    the WS tunnel path keeps its own fail-loud check.
+
+    :returns: Header dict for the shared server client.
+    """
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+    token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR)
+    if token is not None and token.strip():
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = token.strip()
+    return headers
+
+
 def _runner_parent_pid_from_env() -> int | None:
     """Return the optional parent process id from the environment.
 
@@ -656,7 +691,6 @@ def create_app(
     """
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
-        OMNIGENT_INTERNAL_WS_ORIGIN,
         OMNIGENT_SESSION_ENV_VALUE,
         OMNIGENT_SESSION_ENV_VAR,
         RUNNER_ID_ENV_VAR,
@@ -702,12 +736,13 @@ def create_app(
         base_url=server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
         # Announce the runner as a first-party non-browser client via the
-        # sentinel Origin. The server's require_trusted_origin CSRF guard on
-        # the multipart routes (POST /v1/sessions bundle create, file upload
-        # — both reached from tool_dispatch over this client) requires a
-        # trusted Origin; the runner sends none otherwise, so the sentinel is
-        # what lets sys_session_create / sys_upload_file through.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        # sentinel Origin (the server's require_trusted_origin CSRF guard on
+        # the multipart routes — POST /v1/sessions bundle create, file upload,
+        # both reached from tool_dispatch over this client — requires it), and,
+        # for managed-sandbox runners, the tunnel binding token that proves
+        # identity on the session-scoped REST routes. See
+        # :func:`_server_client_headers`.
+        headers=_server_client_headers(),
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the

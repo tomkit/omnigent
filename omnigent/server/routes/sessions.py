@@ -165,6 +165,9 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
+    SessionAccess as _SessionAccess,
+)
+from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -11430,6 +11433,109 @@ def _require_cost_control_label_authority(
     )
 
 
+async def _resolve_managed_runner_session_read(
+    request: Request,
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> _SessionAccess | None:
+    """Authorize a session READ for the session's own managed runner, or ``None``.
+
+    The REST analog of the runner-tunnel auth fallback (see
+    ``resolve_owner_for_runner_id`` in :mod:`omnigent.server.app`): a
+    server-managed sandbox runner never ran ``omnigent login``, so its
+    in-sandbox REST callbacks carry no user credential — only the per-runner
+    tunnel binding token the server minted, delivered as the
+    ``X-Omnigent-Runner-Tunnel-Token`` header. The same trust model the
+    ``cost_control.*`` label write already uses
+    (``_require_cost_control_label_authority``): the token is accepted iff its
+    ``token_bound_runner_id`` equals the target session's persisted
+    ``runner_id``. SHA-256 preimage resistance means only the rightful
+    in-sandbox runner holds a token whose digest is this session's runner id,
+    so possession proves identity without persisting any raw secret.
+
+    Scoped to exactly this one session and to READ. Fails closed — returns
+    ``None`` so the caller raises the same 401 the user path would — on a
+    missing / empty token, a token whose derived runner id does not match this
+    session, a session with no bound runner id, an unknown session, or a
+    session with no resolvable owner.
+
+    :param request: The incoming request (read for the tunnel-token header).
+    :param session_id: Target session, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store used to read the session's bound
+        ``runner_id`` and confirm a single owner.
+    :returns: A :class:`SessionAccess` (READ + the fetched conversation) when
+        the bound runner is proven, else ``None``.
+    """
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not token:
+        return None
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None or conv.runner_id is None:
+        return None
+    try:
+        derived_runner_id = token_bound_runner_id(token)
+    except RuntimeError:
+        # Empty/whitespace token — already guarded above, but stay defensive.
+        return None
+    if derived_runner_id != conv.runner_id:
+        return None
+    # Final fail-closed guard: the session must resolve to a real owner. A
+    # dangling runner binding on an ownerless session must not grant access.
+    # The owner identity itself is not needed downstream (access is already
+    # pinned to this session) — only its unambiguous existence matters.
+    owner = await asyncio.to_thread(conversation_store.get_session_owner, session_id)
+    if owner is None:
+        return None
+    return _SessionAccess(level=LEVEL_READ, conversation=conv)
+
+
+async def _authorize_session_read_with_runner_fallback(
+    request: Request,
+    session_id: str,
+    *,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> _SessionAccess:
+    """READ-authorize a session-scoped GET, with a managed-runner token fallback.
+
+    Normal path is byte-for-byte the prior behavior: when the request carries
+    a user identity, or auth is disabled entirely (no auth provider — loopback
+    / single-user), this is exactly ``require_access_and_level`` at
+    ``LEVEL_READ``. User-auth and loopback callers never reach the fallback.
+
+    Fallback path — only when an auth provider is configured AND no user
+    identity is present: admit the session's own managed sandbox runner,
+    proven by a binding token whose ``token_bound_runner_id`` equals this
+    session's persisted ``runner_id`` (see
+    :func:`_resolve_managed_runner_session_read`). Anything else fails closed
+    with the same 401 the user path raises.
+
+    :param request: The incoming request (auth + tunnel-token header).
+    :param session_id: Target session, e.g. ``"conv_abc123"``.
+    :param auth_provider: The server's auth provider, or ``None`` when auth is
+        disabled.
+    :param permission_store: Permission store, or ``None`` when disabled.
+    :param conversation_store: Conversation store for the fallback lookups.
+    :returns: A :class:`SessionAccess` granting at least READ.
+    :raises OmnigentError: 401 / 403 / 404 exactly as the user path does.
+    """
+    user_id = _get_user_id(request, auth_provider)
+    if user_id is not None or auth_provider is None:
+        return await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+    access = await _resolve_managed_runner_session_read(
+        request, session_id, conversation_store
+    )
+    if access is not None:
+        return access
+    raise OmnigentError(
+        "Authentication required",
+        code=ErrorCode.UNAUTHORIZED,
+    )
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -13439,14 +13545,20 @@ def create_sessions_router(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
-        user_id = _get_user_id(request, auth_provider)
         # Single permission pass: authorize + resolve the display level +
         # fetch the conversation once, then reuse the conversation in the
         # snapshot (the snapshot's read is skipped). Replaces the former
         # require_access + get_permission_level + snapshot-get_conversation
-        # sequence, which made ~5-6 separate store round-trips.
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # sequence, which made ~5-6 separate store round-trips. The
+        # managed-runner fallback admits the session's own in-sandbox runner
+        # (binding token, no user creds) for READ; user/loopback paths
+        # are unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         return await _get_session_snapshot(
             conversation_store,
@@ -18969,9 +19081,16 @@ def create_sessions_router(
         :returns: The bound agent's :class:`AgentObject`.
         :raises OmnigentError: If the session or agent is not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Managed-runner fallback: the in-sandbox runner fetches its own agent
+        # spec here on cache miss, carrying only its tunnel binding token (no
+        # user creds). READ access, scoped to its own session; user/loopback
+        # paths unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         conv = access.conversation
         if conv is None:
@@ -19020,9 +19139,16 @@ def create_sessions_router(
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Managed-runner fallback: the in-sandbox runner downloads its agent
+        # bundle here on cache miss, carrying only its tunnel binding token (no
+        # user creds). READ access, scoped to its own session; user/loopback
+        # paths unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         conv = access.conversation
         if conv is None:
