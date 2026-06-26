@@ -806,6 +806,85 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
 }
 
+# ── Managed-runner write authorization: per-event-type classification ──
+#
+# ``POST .../events`` authorizes either as a real user OR — for a
+# credential-less server-managed sandbox runner — via its tunnel binding token
+# (see ``_authorize_session_with_runner_fallback``). A binding token proves only
+# the *in-sandbox runner's* identity; it stands in for the AGENT's work, never
+# for the HUMAN decision-maker. So the token fallback is permitted ONLY for
+# runner-owned event types: the streaming / output / status / turn-control
+# events the in-sandbox runner legitimately emits to report the agent's work.
+#
+# Event types that act as the human decision-maker — resolving an elicitation /
+# approval gate or applying deferred policy-ask writes — MUST require a real
+# user identity and MUST NOT appear here. Today that is exactly ``approval``
+# (``_APPROVAL_TYPE``): its ``post_event`` branch calls ``_resolve_elicitation``
+# (whose only guard is session-scoped — a same-session runner token would pass
+# it) and ``_apply_pending_policy_ask_writes``. The managed runner never posts
+# ``approval`` to the server — server→runner is the only direction a verdict
+# flows (the runner forwards it to its local harness) — so excluding it from the
+# token fallback breaks no legitimate runner flow.
+#
+# Fail-safe by construction: this is an explicit ALLOWLIST, not a denylist. A
+# NEW event type added to ``_ALLOWED_EVENT_TYPES`` but left unclassified here
+# defaults to user-only at runtime (the token fallback is denied) AND trips the
+# partition assertion in ``test_sessions_managed_runner_rest_write_auth.py``,
+# forcing a deliberate runner-owned vs user-control decision before it can ship.
+_RUNNER_OWNED_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        # Item-typed agent output / lifecycle the runner persists or relays.
+        "message",
+        "function_call",
+        "function_call_output",
+        "error",
+        "reasoning",
+        "compaction",
+        "native_tool",
+        "resource_event",
+        "routing_decision",
+        "slash_command",
+        "terminal_command",
+        # Turn / session control the runner drives over its OWN work.
+        _INTERRUPT_TYPE,
+        # Surfaces an MCP prompt to the user; the human VERDICT arrives
+        # separately via ``approval`` (which is user-control, excluded below).
+        _MCP_ELICITATION_TYPE,
+        _COMPACT_TYPE,
+        # Additionally re-checks LEVEL_OWNER inside its branch, so a token
+        # still cannot stop a session even though the type is listed here.
+        _STOP_SESSION_TYPE,
+        # Terminal / forwarder observations streamed back to report the work.
+        _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+        _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+        # Reports an in-harness human resolution to clear the pending card;
+        # sets only a "resolved elsewhere" signal — no accept/deny verdict and
+        # no policy write — so it is runner-owned reporting, not a decision.
+        _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+        _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_COMPACTION_STATUS_TYPE,
+        _EXTERNAL_MODEL_CHANGE_TYPE,
+        _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        _EXTERNAL_SESSION_TODOS_TYPE,
+        _EXTERNAL_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    }
+)
+
+# Human-decision-maker event types: a credential-less runner binding token must
+# NEVER satisfy these on ``post_event`` — they resolve approval gates / apply
+# deferred policy-ask writes, i.e. they stand in for the human's verdict. Kept
+# as an explicit, named set (not computed by subtraction) so the
+# security-critical surface is auditable at a glance. Disjoint from
+# ``_RUNNER_OWNED_EVENT_TYPES``; together the two must partition
+# ``_ALLOWED_EVENT_TYPES`` (enforced by test).
+_USER_CONTROL_EVENT_TYPES: frozenset[str] = frozenset({_APPROVAL_TYPE})
+
 # Validates every dict that crosses the AP→client SSE boundary on
 # the session stream. Built once at module load.
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
@@ -17620,22 +17699,39 @@ def create_sessions_router(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
-        # Same-session EDIT write. A server-managed sandbox runner has no user
-        # credential, so it authorizes via its tunnel binding token (capped at
-        # EDIT) — this is the callback path the agent uses to stream output and
-        # complete tasks. User-auth callers take the unchanged path. ``user_id``
-        # (``None`` on the runner fallback path) is still the actor /
-        # attribution identity below; the owner-only ``stop_session`` branch
-        # re-checks LEVEL_OWNER, so a token can't escalate past EDIT here.
+        # Same-session EDIT write, authorized by event type BEFORE any side
+        # effect runs. A server-managed sandbox runner has no user credential,
+        # so it authorizes via its tunnel binding token (capped at EDIT) — the
+        # callback path the agent uses to stream output and complete tasks. But
+        # the token proves only the in-sandbox runner's identity, never the
+        # HUMAN decision-maker: a runner-owned event type takes the token
+        # fallback, while a user-control type (``approval`` — resolves an
+        # approval gate / applies deferred policy writes) and ANY unclassified
+        # type fall through to user-only auth and fail closed (401) for the
+        # credential-less runner. ``user_id`` (``None`` on the runner fallback
+        # path) is still the actor / attribution identity below; the owner-only
+        # ``stop_session`` branch re-checks LEVEL_OWNER, so a token can't
+        # escalate past EDIT here.
         user_id = _get_user_id(request, auth_provider)
-        access = await _authorize_session_with_runner_fallback(
-            request,
-            session_id,
-            level=LEVEL_EDIT,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
-        )
+        if body.type in _RUNNER_OWNED_EVENT_TYPES:
+            access = await _authorize_session_with_runner_fallback(
+                request,
+                session_id,
+                level=LEVEL_EDIT,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+        else:
+            # User-control or unclassified event type: a binding token must
+            # never stand in for the human verdict. Require a real user, so the
+            # credential-less runner fails closed (401) here — before
+            # ``_resolve_elicitation`` / ``_apply_pending_policy_ask_writes``
+            # (the approval branch) can run any side effect.
+            user_id = _require_user(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            )
         conv = access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
