@@ -25,6 +25,7 @@ mirroring ``test_sessions_managed_runner_rest_auth.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -41,9 +42,19 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server._elicitation_registry import (
+    _harness_elicitation_owners,
+    _harness_elicitation_registry,
+)
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
-from omnigent.server.routes.sessions import _authorize_session_with_runner_fallback
+from omnigent.server.routes.sessions import (
+    _ALLOWED_EVENT_TYPES,
+    _APPROVAL_TYPE,
+    _RUNNER_OWNED_EVENT_TYPES,
+    _USER_CONTROL_EVENT_TYPES,
+    _authorize_session_with_runner_fallback,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -159,10 +170,26 @@ def _bind_runner_token(db_uri: str, session_id: str, token: str) -> str:
     return runner_id
 
 
-# A bogus event type: it passes ``SessionEventInput`` validation but is
-# rejected by the route's ``_ALLOWED_EVENT_TYPES`` check — which runs *after*
-# auth. So a 400 proves the request cleared the auth gate, while a 401 proves
-# it did not. This isolates the auth decision without starting a real task.
+# A runner-owned event: ``external_output_text_delta`` is a pure streaming
+# observation (publish-only, returns 202, no DB writes, no bound-runner
+# dependency) — exactly the kind of callback the in-sandbox runner emits to
+# report the agent's work. The managed-runner token fallback IS permitted for
+# it. A 202 proves auth passed via the fallback; a 401 proves it was rejected.
+_RUNNER_OWNED_EVENT = {
+    "type": "external_output_text_delta",
+    "data": {"delta": "stream chunk from the runner"},
+}
+
+
+# A user-control event: ``approval`` resolves a human elicitation / approval
+# gate and applies deferred policy-ask writes. The runner token fallback must
+# NEVER satisfy it — it requires a real user identity.
+def _approval_event(elicitation_id: str) -> dict[str, Any]:
+    return {"type": "approval", "data": {"elicitation_id": elicitation_id, "action": "accept"}}
+
+
+# A bogus (unclassified) event type: not in ``_RUNNER_OWNED_EVENT_TYPES``, so it
+# must fail safe to user-only auth. Used to pin the fail-safe default.
 _BOGUS_EVENT = {"type": "definitely-not-a-real-event-type", "data": {}}
 
 
@@ -174,7 +201,8 @@ async def test_managed_runner_token_grants_edit_on_post_event(
     db_uri: str,
 ) -> None:
     """A valid binding token clears auth on POST .../events for its OWN
-    session (no user identity) — the fix for the 96x 401."""
+    session (no user identity) when the event is runner-owned — the fix for
+    the 96x 401."""
     sess = await _create_session_as(auth_client, "alice@example.com")
     session_id = sess["id"]
     token = "managed-runner-secret-token-events"
@@ -182,12 +210,12 @@ async def test_managed_runner_token_grants_edit_on_post_event(
 
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
     )
-    # 400 (unknown event type) proves auth PASSED; a regression would be 401.
-    assert resp.status_code == 400, resp.text
-    assert resp.status_code != 401
+    # 202 (event accepted) proves the token fallback authorized the runner-owned
+    # streaming callback; a regression would be 401.
+    assert resp.status_code == 202, resp.text
 
 
 async def test_post_event_mismatched_token_rejected(
@@ -202,7 +230,7 @@ async def test_post_event_mismatched_token_rejected(
 
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={RUNNER_TUNNEL_TOKEN_HEADER: "some-other-token-not-bound"},
     )
     assert resp.status_code == 401, resp.text
@@ -219,16 +247,16 @@ async def test_post_event_cross_session_token_rejected(
     _bind_runner_token(db_uri, sess_a["id"], token_a)
     _bind_runner_token(db_uri, sess_b["id"], "bobs-runner-token")
 
-    # Valid for A (clears auth -> 400 bogus event), rejected for B (401).
+    # Valid for A (token fallback authorizes -> 202), rejected for B (401).
     ok = await auth_client.post(
         f"/v1/sessions/{sess_a['id']}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={RUNNER_TUNNEL_TOKEN_HEADER: token_a},
     )
-    assert ok.status_code == 400, ok.text
+    assert ok.status_code == 202, ok.text
     cross = await auth_client.post(
         f"/v1/sessions/{sess_b['id']}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={RUNNER_TUNNEL_TOKEN_HEADER: token_a},
     )
     assert cross.status_code == 401, cross.text
@@ -243,12 +271,14 @@ async def test_post_event_missing_or_empty_token_rejected(
     session_id = sess["id"]
     _bind_runner_token(db_uri, session_id, "a-bound-token")
 
-    no_token = await auth_client.post(f"/v1/sessions/{session_id}/events", json=_BOGUS_EVENT)
+    no_token = await auth_client.post(
+        f"/v1/sessions/{session_id}/events", json=_RUNNER_OWNED_EVENT
+    )
     assert no_token.status_code == 401, no_token.text
 
     empty = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={RUNNER_TUNNEL_TOKEN_HEADER: "   "},
     )
     assert empty.status_code == 401, empty.text
@@ -266,27 +296,141 @@ async def test_post_event_user_auth_path_unchanged(
 
     owner = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={"X-Forwarded-Email": "alice@example.com"},
     )
-    assert owner.status_code == 400, owner.text  # cleared auth -> bogus event
+    assert owner.status_code == 202, owner.text  # user path unchanged
 
     stranger = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={"X-Forwarded-Email": "mallory@example.com"},
     )
     assert stranger.status_code in (403, 404), stranger.text
 
     stranger_with_token = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json=_BOGUS_EVENT,
+        json=_RUNNER_OWNED_EVENT,
         headers={
             "X-Forwarded-Email": "mallory@example.com",
             RUNNER_TUNNEL_TOKEN_HEADER: "mallorys-token",
         },
     )
     assert stranger_with_token.status_code in (403, 404), stranger_with_token.text
+
+
+# ── post_event: user-control (`approval`) must require a real user ──
+
+
+async def test_post_event_approval_rejected_for_runner_token(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A managed-runner token POSTing an `approval` event is rejected (401)
+    and the parked elicitation is NOT resolved — the rejection lands BEFORE
+    `_resolve_elicitation` / `_apply_pending_policy_ask_writes` run."""
+    sess = await _create_session_as(auth_client, "alice@example.com")
+    session_id = sess["id"]
+    token = "managed-runner-secret-token-approval"
+    _bind_runner_token(db_uri, session_id, token)
+
+    # Park a server-side elicitation Future owned by THIS session. The approval
+    # branch would set its result via `_resolve_elicitation` if it ran.
+    elicitation_id = "elicit_runner_must_not_resolve"
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+    _harness_elicitation_registry[elicitation_id] = future
+    _harness_elicitation_owners[elicitation_id] = session_id
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=_approval_event(elicitation_id),
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+        )
+        assert resp.status_code == 401, resp.text
+        # Side effect NOT applied: the human verdict Future is still pending.
+        assert not future.done(), "runner token resolved a human approval gate"
+    finally:
+        _harness_elicitation_registry.pop(elicitation_id, None)
+        _harness_elicitation_owners.pop(elicitation_id, None)
+        if not future.done():
+            future.cancel()
+
+
+async def test_post_event_approval_allowed_for_real_user(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A real owner CAN still resolve an approval via post_event (unchanged):
+    the parked elicitation Future is resolved — positive control proving the
+    rejection above is specific to the credential-less runner."""
+    sess = await _create_session_as(auth_client, "alice@example.com")
+    session_id = sess["id"]
+    # A binding is present, but the owner uses their user identity.
+    _bind_runner_token(db_uri, session_id, "alices-runner-token")
+
+    elicitation_id = "elicit_user_resolves_ok"
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+    _harness_elicitation_registry[elicitation_id] = future
+    _harness_elicitation_owners[elicitation_id] = session_id
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=_approval_event(elicitation_id),
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+        assert resp.status_code == 202, resp.text
+        # The owner's verdict resolved the parked Future.
+        assert future.done(), "owner approval did not resolve the elicitation"
+    finally:
+        _harness_elicitation_registry.pop(elicitation_id, None)
+        _harness_elicitation_owners.pop(elicitation_id, None)
+        if not future.done():
+            future.cancel()
+
+
+async def test_post_event_unknown_type_fails_safe_to_user_only(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An unclassified event type defaults to user-only auth: a runner token
+    is rejected (401, NOT 400), while a real user reaches the route's
+    unknown-type validation (400)."""
+    sess = await _create_session_as(auth_client, "alice@example.com")
+    session_id = sess["id"]
+    token = "managed-runner-secret-token-unknown"
+    _bind_runner_token(db_uri, session_id, token)
+
+    # Token + unclassified type -> fail safe to user-only -> 401 (not 400).
+    runner = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=_BOGUS_EVENT,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+    )
+    assert runner.status_code == 401, runner.text
+
+    # Real user + unclassified type -> auth passes -> 400 unknown event type.
+    user = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=_BOGUS_EVENT,
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert user.status_code == 400, user.text
+
+
+# ── Classification invariant: allowlist partitions the allowed set ──
+
+
+async def test_event_type_classification_partitions_allowed_types() -> None:
+    """The runner-owned allowlist and the user-control set are disjoint and
+    together partition every allowed event type — so a NEW allowed type must
+    be consciously classified (else it fails safe to user-only AND trips
+    this test)."""
+    assert _APPROVAL_TYPE in _USER_CONTROL_EVENT_TYPES
+    assert _APPROVAL_TYPE not in _RUNNER_OWNED_EVENT_TYPES
+    assert _RUNNER_OWNED_EVENT_TYPES.isdisjoint(_USER_CONTROL_EVENT_TYPES)
+    assert (_RUNNER_OWNED_EVENT_TYPES | _USER_CONTROL_EVENT_TYPES) == _ALLOWED_EVENT_TYPES
 
 
 # ── update_session: non-privileged EDIT fields get the fallback ──
