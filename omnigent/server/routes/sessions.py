@@ -11525,9 +11525,7 @@ async def _authorize_session_read_with_runner_fallback(
         return await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-    access = await _resolve_managed_runner_session_read(
-        request, session_id, conversation_store
-    )
+    access = await _resolve_managed_runner_session_read(request, session_id, conversation_store)
     if access is not None:
         return access
     raise OmnigentError(

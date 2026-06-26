@@ -170,9 +170,7 @@ async def test_managed_runner_token_grants_read_on_own_session(
     assert snap.json()["id"] == session_id
 
     # GET /v1/sessions/{id}/agent
-    agent = await auth_client.get(
-        f"/v1/sessions/{session_id}/agent", headers=runner_headers
-    )
+    agent = await auth_client.get(f"/v1/sessions/{session_id}/agent", headers=runner_headers)
     assert agent.status_code == 200, agent.text
     assert agent.json()["name"] == "test-agent"
 
