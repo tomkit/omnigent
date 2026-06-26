@@ -523,6 +523,77 @@ def test_runner_tunnel_binding_token_from_env_strips_value(
     assert _runner_tunnel_binding_token_from_env() == "bind-token"
 
 
+def test_server_client_headers_omits_token_without_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a binding token the shared client sends only the Origin.
+
+    External / local hosts keep their prior behavior — no
+    ``X-Omnigent-Runner-Tunnel-Token`` header is attached.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner._entry import _server_client_headers
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
+
+    headers = _server_client_headers()
+
+    assert headers["Origin"] == OMNIGENT_INTERNAL_WS_ORIGIN
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in headers
+
+
+def test_server_client_headers_attaches_binding_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed sandbox runner attaches its binding token (stripped).
+
+    The header is what lets the in-sandbox runner authenticate its
+    session-scoped REST callbacks without a user credential.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner._entry import _server_client_headers
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "  sandbox-bind-token  ")
+
+    headers = _server_client_headers()
+
+    assert headers["Origin"] == OMNIGENT_INTERNAL_WS_ORIGIN
+    assert headers[RUNNER_TUNNEL_TOKEN_HEADER] == "sandbox-bind-token"
+
+
+def test_server_client_headers_tolerates_empty_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty binding token is treated as unset (no crash, no header).
+
+    Client construction must never fail on a misconfigured-empty value;
+    the WS tunnel path keeps its own fail-loud check.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner._entry import _server_client_headers
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "   ")
+
+    headers = _server_client_headers()
+
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in headers
+
+
 def test_runner_parent_pid_from_env_returns_none_without_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
