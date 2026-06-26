@@ -1,4 +1,4 @@
-# Fork-owned server image publish (tomkit).
+# Fork-owned image publish (tomkit): server image + host image.
 #
 # WHY THIS EXISTS: the upstream `Publish images (public)` workflow
 # (.github/workflows/oss-publish-images.yml) is gated to
@@ -7,25 +7,51 @@
 # `omnigent-tomkit` Fly app keeps pulling the UPSTREAM
 # `ghcr.io/omnigent-ai/omnigent-server:latest`, which OVERWRITES our merged
 # fork patches (idle-suspend/reclaim-retention, bidirectional context sync) on
-# every redeploy. This workflow builds the SAME server image from
-# `deploy/docker/Dockerfile` and publishes it to OUR GHCR namespace so the fork
-# code actually runs in production.
+# every redeploy. This workflow builds the SAME images from
+# `deploy/docker/Dockerfile` and publishes them to OUR GHCR namespace so the
+# fork code actually runs in production.
+#
+# TWO IMAGES, published in lockstep from the same commit (so a managed session's
+# server half and runner half always run the same fork code):
+#
+#   omnigent-server  (default target) — the FastAPI/WS coordinator the Fly app
+#                    runs. Carries the fork server patches AND the server-side
+#                    401 fallback added by PR #14.
+#
+#   omnigent-host    (`host` target)  — the prebaked HOST image that managed
+#                    Daytona sandboxes boot from. ROOT CAUSE this image now
+#                    exists: managed sandboxes default to the UPSTREAM host
+#                    image `ghcr.io/omnigent-ai/omnigent-host:latest`
+#                    (DEFAULT_HOST_IMAGE), which ships the UPSTREAM
+#                    `omnigent/runner/_entry.py` WITHOUT PR #14's runner-side
+#                    token-attach change. So the in-sandbox runner sends no
+#                    `X-Omnigent-Runner-Tunnel-Token`, the server's 401 fallback
+#                    can't trigger, the runner's REST callbacks 401, and the
+#                    native Claude terminal never starts. Building the host image
+#                    from the fork bakes in the patched `_entry.py` (the `host`
+#                    target installs the full omnigent package via the shared
+#                    `builder` stage). The server can then be pointed at this
+#                    fork host image (sandbox.daytona.image /
+#                    OMNIGENT_DAYTONA_HOST_IMAGE) so both halves match.
 #
 # Self-contained: GHCR auth uses the built-in `GITHUB_TOKEN` (no org secrets).
 # The optional Fly auto-deploy leg is fully gated on a `FLY_API_TOKEN` repo
 # secret existing — with no secret it is inert, so this is safe to merge before
-# any secret is wired and CI still passes.
+# any secret is wired and CI still passes. The Fly deploy swaps only the SERVER
+# image; the host image is consumed by managed sandboxes, not Fly.
 #
 # Tag scheme (deliberately minimal vs upstream's release/rc/nightly matrix —
-# the fork tracks main, not semver releases):
+# the fork tracks main, not semver releases), applied to BOTH images:
 #   :sha-<short>   immutable per-commit pin, published on every build. Deploys
 #                  pin to this so a redeploy is reproducible.
-#   :latest        moves to the newest main build. `fly.tomkit.toml` points here.
+#   :latest        moves to the newest main build. `fly.tomkit.toml` points the
+#                  server image here.
 #
-# FIRST RUN creates the `omnigent-server` package PRIVATE under the user's GHCR
-# packages. Flip it to PUBLIC once in the package settings so Fly can pull it
-# unauthenticated (cannot be done from CI). See deploy/fly/RUNBOOK.tomkit.md.
-name: Publish fork server image
+# FIRST RUN creates the `omnigent-server` AND `omnigent-host` packages PRIVATE
+# under the user's GHCR packages. Flip BOTH to PUBLIC once in the package
+# settings so the Fly remote builder / Daytona can pull them unauthenticated
+# (cannot be done from CI). See deploy/fly/RUNBOOK.tomkit.md.
+name: Publish fork images
 
 on:
   push:
@@ -51,7 +77,7 @@ permissions:
 
 concurrency:
   # Key by SHA so back-to-back merges each build; don't cancel mid-push.
-  group: fork-publish-server-${{ github.sha }}
+  group: fork-publish-images-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -68,6 +94,7 @@ jobs:
     outputs:
       short-sha: ${{ steps.tags.outputs.short_sha }}
       digest: ${{ steps.build-server.outputs.digest }}
+      host-digest: ${{ steps.build-host.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -97,10 +124,15 @@ jobs:
           set -euo pipefail
           OWNER_LC=$(echo "${GH_OWNER}" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${OWNER_LC}/omnigent-server"
+          HOST_IMAGE="ghcr.io/${OWNER_LC}/omnigent-host"
           SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "tags=${IMAGE}:sha-${SHORT_SHA},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-          echo "Publishing: ${IMAGE}:sha-${SHORT_SHA} + ${IMAGE}:latest"
+          {
+            echo "short_sha=${SHORT_SHA}"
+            echo "tags=${IMAGE}:sha-${SHORT_SHA},${IMAGE}:latest"
+            echo "host_tags=${HOST_IMAGE}:sha-${SHORT_SHA},${HOST_IMAGE}:latest"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing server: ${IMAGE}:sha-${SHORT_SHA} + ${IMAGE}:latest"
+          echo "Publishing host:   ${HOST_IMAGE}:sha-${SHORT_SHA} + ${HOST_IMAGE}:latest"
 
       # Build-args: the registry ARGs default to public registries (matches the
       # upstream server build), but OMNIGENT_EXTRAS defaults to EMPTY in the
@@ -128,6 +160,32 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             OMNIGENT_EXTRAS=daytona
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: true
+
+      # Host image: same Dockerfile, `host` target, also multi-arch (amd64 +
+      # arm64). Mirrors the UPSTREAM host build (oss-publish-images.yml) exactly:
+      # NO build-args. The `host` stage does NOT consume OMNIGENT_EXTRAS (that
+      # arg lives only in the server-builder stage) — it installs the full
+      # omnigent package via the shared `builder` stage's editable
+      # `uv pip install -e .`, so the fork's patched omnigent/runner/_entry.py
+      # (PR #14's runner-side token-attach) is baked in with no extras needed.
+      # The managed-host runtime deps (git/tmux/harness CLIs/agy) are baked by
+      # the Dockerfile's host stage itself, not via extras. Runs after the
+      # server build so it reuses the shared builder-stage layers from the gha
+      # cache (cached per platform).
+      - name: Build and push host image
+        id: build-host
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: host
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.host_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
