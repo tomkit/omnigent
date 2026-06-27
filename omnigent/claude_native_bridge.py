@@ -899,6 +899,9 @@ def ensure_env_api_key_approved() -> None:
     concurrency posture.
 
     :returns: None.
+    :raises RuntimeError: If ``ANTHROPIC_API_KEY`` is set but shorter than
+        the 20-char identifier length, so its last-20-char "identifier"
+        would be the whole key — refuse to persist a full secret.
     :raises ValueError: If an existing ``~/.claude.json`` (or its
         ``customApiKeyResponses`` block) is not the expected JSON shape.
     :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is not
@@ -908,6 +911,16 @@ def ensure_env_api_key_approved() -> None:
     api_key = os.environ.get(_ANTHROPIC_API_KEY_ENV, "").strip()
     if not api_key:
         return
+    # The approval identifier is the key's last 20 chars. For a key shorter
+    # than that, ``api_key[-20:]`` is the WHOLE key — persisting it would
+    # write the full secret to disk. Real Anthropic keys are well over 20
+    # chars, so a sub-20 value is a malformed/misconfigured env: fail loud
+    # and persist nothing rather than leak it.
+    if len(api_key) < _CUSTOM_API_KEY_ID_LEN:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is too short to derive a safe approval identifier; "
+            "refusing to persist it."
+        )
 
     config_path = Path.home() / ".claude.json"
     if config_path.exists():
@@ -946,6 +959,13 @@ def ensure_env_api_key_approved() -> None:
         changed = True
 
     if not changed:
+        # Even when the content is unchanged, guarantee the file is
+        # owner-only: this config also holds the Claude OAuth account block,
+        # so a pre-existing world/group-readable ~/.claude.json must not be
+        # left with loose perms. _atomic_write_user_json pins 0600 on the
+        # write paths; this covers the no-write early return.
+        if config_path.exists() and stat.S_IMODE(config_path.stat().st_mode) != 0o600:
+            config_path.chmod(0o600)
         return
     _atomic_write_user_json(config_path, data)
 

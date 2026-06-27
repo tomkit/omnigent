@@ -4872,6 +4872,56 @@ def test_ensure_env_api_key_idempotent_does_not_rewrite(
     assert config_path.read_bytes() == before
 
 
+def test_ensure_env_api_key_refuses_short_key_without_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-20-char key fails loud and the full secret never reaches disk.
+
+    For a key shorter than the 20-char identifier, ``key[-20:]`` is the
+    WHOLE key — persisting it would leak the full secret. Real Anthropic
+    keys are far longer, so a short value is malformed: the helper must
+    raise and write nothing (no ``~/.claude.json`` created at all).
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    short_key = "sk-ant-short"  # < 20 chars
+    monkeypatch.setenv("ANTHROPIC_API_KEY", short_key)
+
+    with pytest.raises(RuntimeError, match="too short"):
+        ensure_env_api_key_approved()
+
+    # No file was created, so the key could not have been written anywhere.
+    assert not config_path.exists()
+
+
+def test_ensure_env_api_key_idempotent_enforces_owner_only_perms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The already-approved no-write path still tightens loose file perms.
+
+    ``~/.claude.json`` holds the OAuth account block, so a pre-existing
+    world/group-readable config must be pulled back to 0600 even when the
+    approval content needs no change — and the approved list must not be
+    duplicated or grown.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
+    already = {"customApiKeyResponses": {"approved": [_FAKE_API_KEY_ID], "rejected": []}}
+    config_path.write_text(json.dumps(already))
+    config_path.chmod(0o644)  # loose perms, as a prior tool might have left
+
+    ensure_env_api_key_approved()
+
+    # Perms tightened despite no content change.
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    # The approved list is unchanged — not duplicated or grown.
+    data = json.loads(config_path.read_text())
+    assert data["customApiKeyResponses"]["approved"] == [_FAKE_API_KEY_ID]
+
+
 def test_ensure_env_api_key_refuses_malformed_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
