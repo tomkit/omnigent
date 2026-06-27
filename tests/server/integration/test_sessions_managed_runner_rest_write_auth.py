@@ -38,6 +38,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -199,6 +200,8 @@ _BOGUS_EVENT = {"type": "definitely-not-a-real-event-type", "data": {}}
 
 _PERMISSION_HOOKS: tuple[tuple[str, str], ...] = (
     ("claude", "/hooks/permission-request"),
+    ("codex", "/hooks/codex-elicitation-request"),
+    ("antigravity", "/hooks/antigravity-elicitation-request"),
     ("cursor", "/hooks/cursor-permission-request"),
     ("native", "/hooks/native-permission-request"),
 )
@@ -235,6 +238,41 @@ def _permission_hook_payload(hook_name: str, session_id: str) -> tuple[dict[str,
                 "operation_type": "shell",
                 "message": "Run this command?",
                 "content_preview": "echo hi",
+            },
+            elicitation_id,
+        )
+    if hook_name == "codex":
+        request_id = 7
+        method = "mcpServer/elicitation/request"
+        return (
+            {
+                "id": request_id,
+                "method": method,
+                "params": {
+                    "threadId": "thread_123",
+                    "turnId": "turn_123",
+                    "serverName": "booking",
+                    "mode": "form",
+                    "message": "Pick a date",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"date": {"type": "string"}},
+                    },
+                },
+            },
+            codex_elicitation_id(session_id, method, request_id),
+        )
+    if hook_name == "antigravity":
+        elicitation_id = f"elicit_agy_{suffix}"
+        return (
+            {
+                "elicitation_id": elicitation_id,
+                "params": {
+                    "mode": "form",
+                    "message": "Antigravity needs your input",
+                    "phase": "agy_ask_question",
+                    "policy_name": "agy_native_ask_question",
+                },
             },
             elicitation_id,
         )
@@ -300,6 +338,10 @@ def _assert_permission_hook_accept_response(hook_name: str, resp: httpx.Response
                 "decision": {"behavior": "allow"},
             }
         }
+    elif hook_name == "codex":
+        assert resp.json() == {"action": "accept", "content": None, "_meta": None}
+    elif hook_name == "antigravity":
+        assert resp.json() == {"action": "accept", "content": None}
     else:
         assert resp.json() == {"action": "accept"}
 
@@ -567,6 +609,8 @@ async def test_permission_hook_rejects_absent_mismatched_and_cross_session_token
     """Absent, mismatched, and cross-session binding tokens fail closed on
     all permission-request create/surface hooks."""
     monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(sessions_route, "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(sessions_route, "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S", 0.1)
     monkeypatch.setattr(sessions_route, "_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.1)
     monkeypatch.setattr(sessions_route, "_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.1)
     pending_elicitations.reset_for_tests()
