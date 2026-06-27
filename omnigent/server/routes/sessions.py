@@ -13733,9 +13733,16 @@ def create_sessions_router(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Native runner bridge setup resolves labels during harness spawn, so
+        # the managed-runner fallback admits the session's own in-sandbox
+        # runner (binding token, no user creds) for READ — identical trust
+        # model to GET /v1/sessions/{id}. User / loopback paths are unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         conv = access.conversation
         if conv is None:

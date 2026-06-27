@@ -390,6 +390,32 @@ def _runner_tunnel_binding_token_from_env() -> str | None:
     return token.strip()
 
 
+def _attach_runner_tunnel_token(headers: dict[str, str]) -> dict[str, str]:
+    """Attach the runner's tunnel binding token header in place, if present.
+
+    Single source of truth for the ``X-Omnigent-Runner-Tunnel-Token`` header
+    every runner->server client uses to prove its identity on the
+    session-scoped REST routes without a user credential (the shared server
+    client AND the native-forwarder clients both route through here). When
+    ``OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN`` is unset or empty the mapping is
+    left untouched — external / local / Databricks flows stay byte-identical —
+    so client construction never crashes on a misconfigured-empty value; the
+    WS tunnel path keeps its own fail-loud check.
+
+    :param headers: Header mapping to mutate in place.
+    :returns: The same mapping, for call-site convenience.
+    """
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR)
+    if token is not None and token.strip():
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = token.strip()
+    return headers
+
+
 def _server_client_headers() -> dict[str, str]:
     """Build the default headers for the runner's shared server httpx client.
 
@@ -400,29 +426,47 @@ def _server_client_headers() -> dict[str, str]:
 
     When the runner carries a tunnel binding token (every CLI / host-daemon /
     managed-sandbox spawn path sets ``OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN``),
-    additionally attach it as ``X-Omnigent-Runner-Tunnel-Token``. This is what
-    lets a server-managed sandbox runner — which never ran ``omnigent login``
-    and so has no user credential — prove its identity to the server's
-    session-scoped REST routes on the plain-HTTP path (``GET
-    /v1/sessions/{id}``, ``.../agent``, ``.../agent/contents``). Additive: when
-    the env var is unset (external / local hosts), only the ``Origin`` header
-    is sent and the user/Databricks auth flow is unchanged. Tolerant of an
-    empty value (treated as unset) so client construction never crashes on it;
-    the WS tunnel path keeps its own fail-loud check.
+    additionally attach it as ``X-Omnigent-Runner-Tunnel-Token`` (via
+    :func:`_attach_runner_tunnel_token`). This is what lets a server-managed
+    sandbox runner — which never ran ``omnigent login`` and so has no user
+    credential — prove its identity to the server's session-scoped REST routes
+    on the plain-HTTP path (``GET /v1/sessions/{id}``, ``.../agent``,
+    ``.../agent/contents``). Additive: when the env var is unset (external /
+    local hosts), only the ``Origin`` header is sent and the user/Databricks
+    auth flow is unchanged.
 
     :returns: Header dict for the shared server client.
     """
-    from omnigent.runner.identity import (
-        OMNIGENT_INTERNAL_WS_ORIGIN,
-        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
-        RUNNER_TUNNEL_TOKEN_HEADER,
-    )
+    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
     headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
-    token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR)
-    if token is not None and token.strip():
-        headers[RUNNER_TUNNEL_TOKEN_HEADER] = token.strip()
-    return headers
+    return _attach_runner_tunnel_token(headers)
+
+
+def _runner_forwarder_headers(auth_token: str | None) -> dict[str, str]:
+    """Static headers for the runner's native-forwarder server clients.
+
+    These are the clients that POST ``/v1/sessions/{id}/events`` (cost,
+    ``external_conversation_item``, the message-turn, ...) and write the native
+    bridge / hook configs that call the server back. Carries the user /
+    Databricks bearer when one is available — exactly the prior
+    ``{"Authorization": ...}``-or-empty mapping these call sites built inline,
+    so external / local / Databricks flows are byte-identical — and, for a
+    server-managed sandbox runner that has no user credential, the tunnel
+    binding token as ``X-Omnigent-Runner-Tunnel-Token`` (via
+    :func:`_attach_runner_tunnel_token`) so those callbacks are accepted by the
+    server's managed-runner fallback authorizer. Additive: the binding-token
+    header only appears when the env var is set, so non-managed flows are
+    unchanged.
+
+    :param auth_token: One-shot bearer snapshot, or ``None`` when the runner
+        has no user / Databricks credential (e.g. a managed sandbox runner).
+    :returns: Header dict for a native-forwarder server client.
+    """
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    return _attach_runner_tunnel_token(headers)
 
 
 def _runner_parent_pid_from_env() -> int | None:
