@@ -15152,9 +15152,13 @@ def create_sessions_router(
             400 if the body fails JSON parse or is missing
             ``tool_name``.
         """
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        await _authorize_session_with_runner_fallback(
+            request,
+            session_id,
+            level=LEVEL_READ,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         try:
             payload = await request.json()
@@ -15717,9 +15721,13 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session does not exist,
             400 if the request envelope is malformed or unsupported.
         """
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        await _authorize_session_with_runner_fallback(
+            request,
+            session_id,
+            level=LEVEL_READ,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         try:
             payload = await request.json()
@@ -15796,9 +15804,13 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session does not exist, 400 if
             the request body is malformed.
         """
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        await _authorize_session_with_runner_fallback(
+            request,
+            session_id,
+            level=LEVEL_READ,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         try:
             payload = await request.json()
@@ -15885,9 +15897,13 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session does not exist, 400 if the
             body is malformed.
         """
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        await _authorize_session_with_runner_fallback(
+            request,
+            session_id,
+            level=LEVEL_READ,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         try:
             payload = await request.json()
@@ -15992,9 +16008,13 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session does not exist, 400 if the
             body is malformed.
         """
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        await _authorize_session_with_runner_fallback(
+            request,
+            session_id,
+            level=LEVEL_READ,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         try:
             payload = await request.json()
