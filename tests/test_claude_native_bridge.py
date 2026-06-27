@@ -22,7 +22,9 @@ import pytest
 
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
+    _claude_pane_interactive,
     _claude_prompt_rendered,
+    _claude_welcome_screen_visible,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
     augment_claude_args,
@@ -61,6 +63,26 @@ def _trust_tmp_bridge_parent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+
+
+def _mark_session_started(bridge_dir: Path, session_id: str = "sess-test-123") -> None:
+    """
+    Seed the bridge state as if Claude's ``SessionStart`` hook fired.
+
+    The injection readiness gate (:func:`_wait_for_claude_prompt_ready`)
+    requires a recorded Claude session id — the post-``SessionStart``
+    signal that the TUI is past its welcome/splash screen — before it
+    will type. Tests that drive the gate to its ready state must record
+    one first, matching what a live session does on startup.
+
+    :param bridge_dir: Bridge directory path.
+    :param session_id: Claude session uuid to record.
+    :returns: None.
+    """
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "session_id": session_id},
+    )
 
 
 @pytest.fixture
@@ -2332,6 +2354,7 @@ def test_inject_user_message_pastes_content_then_submits(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    _mark_session_started(bridge_dir)
 
     captured: list[list[str]] = []
     loaded_payloads: list[bytes] = []
@@ -2451,6 +2474,7 @@ def test_inject_user_message_raises_on_tmux_failure(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    _mark_session_started(bridge_dir)
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -2500,6 +2524,7 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    _mark_session_started(bridge_dir)
 
     send_keys: list[list[str]] = []
     # Prompt is absent for the first two polls (TUI still booting),
@@ -2561,6 +2586,101 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     assert submit[-1] == "Enter"
 
 
+def test_inject_user_message_waits_for_sessionstart_and_splash_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Injection waits for ``SessionStart`` AND the welcome screen to clear.
+
+    On a fresh managed session the welcome/splash renders an ``❯`` box
+    while still mid-``SessionStart``; the bare glyph scan read that as
+    ready and the first message was injected into the repaint and
+    dropped (no transcript, UI hangs forever). The gate must now hold
+    until Claude's session id is recorded (``SessionStart`` fired) AND
+    the splash banner is gone. No keystrokes may be sent before then.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    send_keys: list[list[str]] = []
+    captures = {"n": 0}
+    session_polls = {"n": 0}
+    # Pane shows the welcome/splash (glyph present, but a "Welcome"
+    # banner) until the session is past startup, then the live box.
+    tui = {"pane": "\n".join([" ✻ Welcome to Claude Code!", "❯ "])}
+
+    def _fake_session_id(_bridge_dir: Path) -> str | None:
+        """
+        SessionStart "fires" after a couple of polls.
+
+        Before that the bridge has recorded no Claude session id, which
+        must keep the gate closed regardless of the pane.
+
+        :param _bridge_dir: Bridge directory path (ignored).
+        :returns: A session id once SessionStart fired, else ``None``.
+        """
+        session_polls["n"] += 1
+        return "sess-xyz" if session_polls["n"] >= 2 else None
+
+    monkeypatch.setattr("omnigent.claude_native_bridge.read_claude_session_id", _fake_session_id)
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Serve the splash first, then a cleared interactive box.
+
+        Even once the session id is recorded, the FIRST capture still
+        shows the splash — the gate must reject it — and only the next
+        capture shows the cleared box. No keystrokes may be issued while
+        the welcome banner is on screen.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            captures["n"] += 1
+            if "Welcome" in tui["pane"]:
+                assert send_keys == [], "typed during the welcome/splash screen"
+                # Splash clears only on the second post-SessionStart
+                # capture; until then the gate must keep rejecting it.
+                # Only the splash is rewritten — later draft/empty panes
+                # (set by paste-buffer / Enter) are left untouched.
+                if captures["n"] >= 2:
+                    tui["pane"] = "❯ "
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "❯ hello"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "❯ "
+        send_keys.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="hello")
+
+    # The gate polled the session id until it was set, and the splash was
+    # rejected for at least one capture before the box cleared.
+    assert session_polls["n"] >= 2, (
+        f"Expected the gate to wait for SessionStart, polled {session_polls['n']} time(s)."
+    )
+    assert captures["n"] >= 2, (
+        f"Expected the splash to be rejected before readiness, got {captures['n']} capture(s)."
+    )
+    # Five delivery calls only after readiness: C-a, C-k, load, paste, Enter.
+    assert len(send_keys) == 5, (
+        f"Expected 5 tmux delivery calls after readiness, got {len(send_keys)}."
+    )
+
+
 def test_inject_user_message_raises_when_prompt_never_renders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2579,6 +2699,9 @@ def test_inject_user_message_raises_when_prompt_never_renders(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    # SessionStart fired, so the gate's only blocker is the empty pane —
+    # this exercises the prompt-never-renders path specifically.
+    _mark_session_started(bridge_dir)
     send_keys: list[list[str]] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -2621,6 +2744,9 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    # SessionStart already fired, so the only reason the gate must not
+    # pass is the pane itself (glyph only in scrollback).
+    _mark_session_started(bridge_dir)
     # `❯` only on an early line; the last several non-empty lines (the
     # tail the gate scans) do not contain it.
     scrollback = "\n".join(
@@ -2682,6 +2808,7 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    _mark_session_started(bridge_dir)
 
     enters: list[list[str]] = []
     # Input-box state machine: the paste deposits the draft; the FIRST
@@ -2745,6 +2872,7 @@ def test_inject_user_message_raises_when_draft_never_submits(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    _mark_session_started(bridge_dir)
 
     tui = {"pane": "❯ "}
 
@@ -2770,6 +2898,55 @@ def test_inject_user_message_raises_when_draft_never_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="message was not delivered"):
         inject_user_message(bridge_dir, content="fix the flaky test")
+
+
+def test_inject_user_message_raises_when_paste_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Injection fails loud when an identifiable draft never reaches the box.
+
+    Readiness passes, the paste is issued, but the draft never appears
+    in the input box (the paste was dropped — e.g. it landed during a
+    repaint that beat the gate). Previously the helper submitted blind
+    and returned success, so the turn completed with nothing delivered
+    and the UI hung forever. The verified-submit step must now RAISE so
+    the executor surfaces an ExecutorError. No Enter-driven success path
+    may swallow this.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    _mark_session_started(bridge_dir)
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Pass readiness, but never let the pasted draft appear.
+
+        ``capture-pane`` always returns an empty (cleared) input box, so
+        the draft-committed poll never sees the message — the paste was
+        dropped. ``paste-buffer`` is a no-op (the draft does not land).
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns "❯ ".
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="❯ ", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="paste was dropped"):
+        inject_user_message(bridge_dir, content="run the migration")
 
 
 def test_inject_interrupt_sends_escape_keystroke(
@@ -4727,6 +4904,60 @@ def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_pane_interactive_rejects_welcome_screen() -> None:
+    """
+    The welcome/splash screen must NOT count as an interactive prompt.
+
+    Claude Code renders an ``❯`` input box on its WELCOME screen while
+    the session is still mid-``SessionStart`` and not yet accepting
+    keystrokes. The bare glyph scan reads that as ready, so the first
+    injected message lands during the repaint and is dropped — the bug
+    this guards. A welcome pane must therefore fail
+    :func:`_claude_pane_interactive` even though the glyph is present.
+    """
+    welcome_pane = "\n".join(
+        [
+            " ✻ Welcome to Claude Code!",
+            "",
+            "   /help for help, /status for your current setup",
+            "",
+            "   cwd: /home/alice/proj",
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+            "  ⏵⏵ accept edits on (shift+tab to cycle)",
+        ]
+    )
+    # The glyph is present (the splash has an input box)...
+    assert _claude_prompt_rendered(welcome_pane) is True
+    # ...but the welcome banner means it is NOT interactive yet.
+    assert _claude_welcome_screen_visible(welcome_pane) is True
+    assert _claude_pane_interactive(welcome_pane) is False
+
+
+def test_claude_pane_interactive_accepts_post_sessionstart_prompt() -> None:
+    """
+    A genuinely-interactive pane (welcome gone) counts as ready.
+
+    Once Claude Code is past ``SessionStart`` the splash banner is gone
+    and only the live input box (plus its footer) remains. That pane
+    must pass :func:`_claude_pane_interactive` so 1st+ messages inject
+    without waiting out the full timeout.
+    """
+    live_pane = "\n".join(
+        [
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+            "  alice: /home/alice/proj",
+            "  Opus 4.8 (1M context) | effort:high",
+            "  ⏵⏵ accept edits on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_welcome_screen_visible(live_pane) is False
+    assert _claude_pane_interactive(live_pane) is True
+
+
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
     """
     Append raw JSONL lines to the bridge deltas file.
@@ -5082,6 +5313,7 @@ def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatc
 
 def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     On a readiness timeout, the RuntimeError carries Claude Code's own
@@ -5106,6 +5338,7 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
+            tmp_path,
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
