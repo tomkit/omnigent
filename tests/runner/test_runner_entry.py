@@ -23,6 +23,7 @@ from omnigent.runner._entry import (
     _resolve_agent_spec_from_server,
     _run_inactivity_monitor,
     _run_parent_death_killer,
+    _runner_forwarder_headers,
     _runner_parent_pid_from_env,
     _runner_tunnel_binding_token_from_env,
     _runner_workspace_from_env,
@@ -592,6 +593,103 @@ def test_server_client_headers_tolerates_empty_token(
     headers = _server_client_headers()
 
     assert RUNNER_TUNNEL_TOKEN_HEADER not in headers
+
+
+def test_runner_forwarder_headers_omit_token_without_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a binding token the forwarder client headers are unchanged.
+
+    External / local / Databricks flows must stay byte-identical to the
+    prior ``{"Authorization": ...}``-or-empty mapping: no
+    ``X-Omnigent-Runner-Tunnel-Token`` header is added in either case.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
+
+    # No user credential (managed-sandbox shape, but no binding token set):
+    # byte-identical to the prior empty mapping.
+    assert _runner_forwarder_headers(None) == {}
+    # A user / Databricks bearer is carried exactly as before.
+    assert _runner_forwarder_headers("user-tok") == {"Authorization": "Bearer user-tok"}
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in _runner_forwarder_headers("user-tok")
+
+
+def test_runner_forwarder_headers_attach_binding_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed sandbox runner attaches its binding token (stripped).
+
+    This is what lets the credential-less in-sandbox runner authenticate the
+    transcript forwarder's ``POST /v1/sessions/{id}/events`` (cost,
+    external_conversation_item, message-turn) callbacks.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "  sandbox-bind-token  ")
+
+    # Managed runner: no user credential, only the binding token.
+    no_user = _runner_forwarder_headers(None)
+    assert no_user == {RUNNER_TUNNEL_TOKEN_HEADER: "sandbox-bind-token"}
+
+    # If a user bearer is ALSO present it is carried alongside the binding token.
+    with_user = _runner_forwarder_headers("user-tok")
+    assert with_user["Authorization"] == "Bearer user-tok"
+    assert with_user[RUNNER_TUNNEL_TOKEN_HEADER] == "sandbox-bind-token"
+
+
+def test_runner_forwarder_headers_tolerate_empty_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty binding token is treated as unset (no crash, no header).
+
+    Client construction must never fail on a misconfigured-empty value.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "   ")
+
+    assert _runner_forwarder_headers(None) == {}
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in _runner_forwarder_headers("user-tok")
+
+
+@pytest.mark.asyncio
+async def test_runner_forwarder_events_client_carries_binding_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The httpx events client built from the headers carries the token.
+
+    Mirrors how ``claude_native_forwarder`` constructs its client
+    (``httpx.AsyncClient(headers=_runner_forwarder_headers(...))``) for
+    ``POST /v1/sessions/{id}/events``: with the binding-token env set the
+    header rides on every request the client makes; without it, it does not.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "events-bind-token")
+    async with httpx.AsyncClient(
+        base_url="http://test", headers=_runner_forwarder_headers(None)
+    ) as client:
+        assert client.headers[RUNNER_TUNNEL_TOKEN_HEADER] == "events-bind-token"
+
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
+    async with httpx.AsyncClient(
+        base_url="http://test", headers=_runner_forwarder_headers(None)
+    ) as client_no_token:
+        assert RUNNER_TUNNEL_TOKEN_HEADER not in client_no_token.headers
 
 
 def test_runner_parent_pid_from_env_returns_none_without_pid(
