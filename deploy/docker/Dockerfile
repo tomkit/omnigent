@@ -278,12 +278,12 @@ RUN curl -fsSL https://cli.kiro.dev/install | bash \
 # a visible, conscious bump. To adopt a new agy: re-verify the coupled behavior,
 # then bump AGY_EXPECTED_VERSION (override at build with --build-arg if needed).
 #
-# 2026-06-26: bumped 1.0.10 -> 1.0.12 to match the version the installer now
+# 2026-06-27: bumped 1.0.12 -> 1.0.13 to match the version the installer now
 # serves (the old pin failed every fresh build once antigravity.google started
-# serving 1.0.12). NOTE: this is a version-match bump only — the native harness
-# behavior was NOT re-verified against 1.0.12 yet (follow-up tracked separately);
+# serving 1.0.13). NOTE: this is a version-match bump only — the native harness
+# behavior was NOT re-verified against 1.0.13 yet (follow-up tracked separately);
 # the guard's own message asks for that re-verification before adopting a new agy.
-ARG AGY_EXPECTED_VERSION=1.0.12
+ARG AGY_EXPECTED_VERSION=1.0.13
 RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
  && install -m 0755 "${HOME:-/root}/.local/bin/agy" /usr/local/bin/agy \
  && test -x /usr/local/bin/agy \
