@@ -183,6 +183,74 @@ async def test_managed_runner_token_grants_read_on_own_session(
     assert contents.content  # non-empty bundle bytes
 
 
+async def test_managed_runner_token_grants_read_on_own_session_labels(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A valid binding token gets READ on GET .../labels — no user identity.
+
+    Native runner bridge setup resolves labels during harness spawn, so the
+    managed-runner READ fallback must admit the session's own in-sandbox
+    runner exactly as it does for the session snapshot."""
+    sess = await _create_session_as(auth_client, "alice@example.com", title="Demo Title")
+    session_id = sess["id"]
+    token = "managed-runner-labels-token-xyz789"
+    _bind_runner_token(db_uri, session_id, token)
+
+    runner_headers = {RUNNER_TUNNEL_TOKEN_HEADER: token}
+    labels = await auth_client.get(f"/v1/sessions/{session_id}/labels", headers=runner_headers)
+    assert labels.status_code == 200, labels.text
+    assert labels.json()["id"] == session_id
+    assert isinstance(labels.json()["labels"], dict)
+
+
+async def test_labels_mismatched_or_absent_runner_token_still_401(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """GET .../labels fails closed on a mismatched / absent binding token.
+
+    Same trust model as the snapshot route: a token whose digest != the
+    session's runner_id, and a request with no token at all, both 401 when
+    no user identity is present."""
+    sess = await _create_session_as(auth_client, "alice@example.com")
+    session_id = sess["id"]
+    _bind_runner_token(db_uri, session_id, "the-real-bound-token")
+
+    wrong = await auth_client.get(
+        f"/v1/sessions/{session_id}/labels",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "some-other-token-not-bound"},
+    )
+    assert wrong.status_code in (401, 403), wrong.text
+
+    no_token = await auth_client.get(f"/v1/sessions/{session_id}/labels")
+    assert no_token.status_code == 401, no_token.text
+
+    empty = await auth_client.get(
+        f"/v1/sessions/{session_id}/labels",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "   "},
+    )
+    assert empty.status_code == 401, empty.text
+
+
+async def test_labels_token_for_other_session_cannot_cross_access(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A token bound to session A's runner must not read session B's labels."""
+    sess_a = await _create_session_as(auth_client, "alice@example.com")
+    sess_b = await _create_session_as(auth_client, "bob@example.com")
+    token_a = "alices-runner-token"
+    _bind_runner_token(db_uri, sess_a["id"], token_a)
+    _bind_runner_token(db_uri, sess_b["id"], "bobs-runner-token")
+
+    headers_a = {RUNNER_TUNNEL_TOKEN_HEADER: token_a}
+    ok = await auth_client.get(f"/v1/sessions/{sess_a['id']}/labels", headers=headers_a)
+    assert ok.status_code == 200, ok.text
+    cross = await auth_client.get(f"/v1/sessions/{sess_b['id']}/labels", headers=headers_a)
+    assert cross.status_code in (401, 403), cross.text
+
+
 # ── Tests: every mismatch fails closed ───────────────────────
 
 
