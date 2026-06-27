@@ -130,6 +130,15 @@ _CLAUDE_PROMPT_GLYPH = "❯"
 # people's statuslines run ~3 lines — so the ``❯`` row isn't the last
 # non-empty line.
 _PROMPT_SCAN_TAIL_LINES = 5
+# Markers that only appear on Claude Code's WELCOME / splash screen.
+# That screen renders an input box (so it carries the ``❯`` glyph) while
+# the session is still mid-``SessionStart`` and NOT yet accepting input —
+# a bracketed paste delivered then is silently dropped. The readiness
+# gate treats a pane carrying any of these as still-booting, not ready,
+# so the prompt glyph alone can't mistake the splash for interactivity.
+# Kept to banner text that never appears during normal interaction (the
+# input box is empty at the readiness stage, so it can't echo these).
+_CLAUDE_WELCOME_MARKERS: tuple[str, ...] = ("Welcome to Claude Code",)
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -2338,10 +2347,12 @@ def inject_user_message(
     Deliver a user message into the Claude terminal via tmux send-keys.
 
     Before typing, this waits for two readiness conditions: the runner
-    advertising ``tmux.json``, then Claude Code's input box rendering
-    (see :func:`_wait_for_claude_prompt_ready`). The second gate closes
-    a race on freshly-created sessions where the first message would
-    otherwise be typed into a still-booting TUI and silently dropped.
+    advertising ``tmux.json``, then Claude Code becoming truly
+    interactive (see :func:`_wait_for_claude_prompt_ready` — its
+    ``SessionStart`` hook fired AND the welcome/splash screen is gone).
+    The second gate closes a race on freshly-created sessions where the
+    first message would otherwise be typed into a still-booting TUI (or
+    its welcome screen) and silently dropped.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -2370,15 +2381,19 @@ def inject_user_message(
         (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
-        if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, or if the draft never leaves the input box
-        after repeated submit Enters (message not delivered).
+        if Claude never becomes interactive (``SessionStart`` / prompt),
+        if a ``tmux send-keys`` invocation fails, if an identifiable
+        draft never appears in the input box (the paste was dropped), or
+        if the draft never leaves the input box after repeated submit
+        Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # tmux.json only means the tmux session exists; Claude Code's input
-    # box mounts a few seconds later. Block until the prompt renders so
-    # the first message isn't typed into a still-booting TUI and dropped.
+    # tmux.json only means the tmux session exists; Claude Code becomes
+    # interactive a few seconds later (SessionStart fires, the welcome
+    # screen clears). Block until then so the first message isn't typed
+    # into a still-booting TUI / its splash and silently dropped.
     _wait_for_claude_prompt_ready(
+        bridge_dir,
         info["socket_path"],
         info["tmux_target"],
         timeout_s=timeout_s,
@@ -2425,10 +2440,7 @@ def inject_user_message(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
+    # load / large payloads); polling is deterministic.
     needle = _submit_needle(content)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
@@ -2440,9 +2452,23 @@ def inject_user_message(
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
     if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
+        if not needle:
+            # The draft is genuinely unidentifiable (whitespace-only
+            # first line, or a custom statusline that carries the glyph),
+            # so its absence proves nothing — verification would
+            # trivially "pass". Submit blind, matching the old behavior.
+            return
+        # The draft was identifiable but never appeared in the input box:
+        # the paste was dropped (e.g. injected during a still-booting /
+        # welcome-screen repaint that beat the readiness gate). Fail loud
+        # so the executor surfaces an ExecutorError instead of leaving
+        # the turn to hang forever with nothing delivered.
+        pane = _capture_pane(info["socket_path"], info["tmux_target"])
+        raise RuntimeError(
+            "Claude Code never showed the pasted message in its input box "
+            f"within {_PASTE_COMMIT_TIMEOUT_S}s (the paste was dropped). "
+            "The message was not delivered." + _format_terminal_failure_tail(pane)
+        )
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -2771,6 +2797,39 @@ def _claude_prompt_rendered(pane: str) -> bool:
     return any(_CLAUDE_PROMPT_GLYPH in line for line in non_empty[-_PROMPT_SCAN_TAIL_LINES:])
 
 
+def _claude_welcome_screen_visible(pane: str) -> bool:
+    """
+    Return whether a pane is showing Claude Code's welcome/splash screen.
+
+    The splash renders an input box — so it carries
+    :data:`_CLAUDE_PROMPT_GLYPH` — while the session is still
+    mid-``SessionStart`` and not yet accepting keystrokes. Matching any
+    of :data:`_CLAUDE_WELCOME_MARKERS` lets the readiness gate reject
+    that transient state instead of mistaking the glyph for an
+    interactive prompt.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the welcome/splash banner is on screen.
+    """
+    return any(marker in pane for marker in _CLAUDE_WELCOME_MARKERS)
+
+
+def _claude_pane_interactive(pane: str) -> bool:
+    """
+    Return whether a pane shows a truly-interactive Claude Code prompt.
+
+    Stronger than :func:`_claude_prompt_rendered`: the input box must be
+    mounted **and** the welcome/splash screen must be gone. The splash
+    renders an ``❯`` box before the TUI accepts input, so the bare glyph
+    scan alone reads it as ready and the first injected message lands
+    during the ``SessionStart`` repaint and is dropped.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the prompt is mounted past the splash.
+    """
+    return _claude_prompt_rendered(pane) and not _claude_welcome_screen_visible(pane)
+
+
 def _submit_needle(content: str) -> str:
     r"""
     Derive a short marker string used to spot a draft in the input box.
@@ -2856,20 +2915,39 @@ def _format_terminal_failure_tail(pane: str) -> str:
 
 
 def _wait_for_claude_prompt_ready(
+    bridge_dir: Path,
     socket_path: str,
     tmux_target: str,
     *,
     timeout_s: float,
 ) -> None:
     """
-    Block until Claude Code's TUI input box is ready for keystrokes.
+    Block until Claude Code's TUI is truly interactive for keystrokes.
 
     The runner advertises ``tmux.json`` as soon as the tmux session
     exists, but Claude Code's input box mounts a few seconds later
     (longer on a cold first boot). Keystrokes sent into that gap are
-    dropped, so the first web-UI message silently vanishes. This gate
-    polls ``capture-pane`` for the input prompt before injection;
-    it returns immediately once mounted, so 2nd+ messages are
+    dropped, so the first web-UI message silently vanishes. Worse, the
+    WELCOME / splash screen renders an ``❯`` input box *before* the
+    session is interactive (still mid-``SessionStart`` repaint), so the
+    bare glyph scan would read the splash as ready and the first message
+    would land during the repaint and be dropped.
+
+    Readiness therefore requires BOTH:
+
+    * Claude's ``SessionStart`` hook has fired — i.e.
+      :func:`read_claude_session_id` returns a non-``None`` id. This is
+      the authoritative signal that the session is past startup; the
+      bridge records it from the hook payload. On a fresh managed
+      session it is unset until ``SessionStart``, so this is what closes
+      the startup race the glyph alone missed.
+    * The pane shows a mounted prompt with the welcome/splash gone
+      (see :func:`_claude_pane_interactive`) — belt-and-suspenders for
+      the brief window where the id is set but the splash is still
+      painting.
+
+    It returns immediately once both hold, so 2nd+ messages (where the
+    session id is already recorded and the prompt is live) are
     unaffected.
 
     Claude-native only — this is called from :func:`inject_user_message`,
@@ -2877,31 +2955,42 @@ def _wait_for_claude_prompt_ready(
     used for generic terminals, whose programs never render
     :data:`_CLAUDE_PROMPT_GLYPH` and would always time out.
 
+    :param bridge_dir: Bridge directory path, used to read the
+        ``SessionStart``-recorded Claude session id.
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
+    :param timeout_s: Seconds to wait for readiness, e.g. ``30.0``.
     :returns: None.
-    :raises RuntimeError: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries the
-        tail of the captured pane (see :func:`_format_terminal_failure_tail`)
-        so Claude Code's own startup output surfaces in the caller's error.
+    :raises RuntimeError: If the session never becomes interactive
+        within *timeout_s* (Claude failed to boot, or ``SessionStart``
+        never fired). The message carries the tail of the captured pane
+        (see :func:`_format_terminal_failure_tail`) so Claude Code's own
+        startup output surfaces in the caller's error.
     """
     deadline = time.monotonic() + timeout_s
+    session_started = False
     while time.monotonic() < deadline:
-        if _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
+        # SessionStart fired? The bridge records the Claude session id
+        # from the hook payload, so a non-None id means the session is
+        # past the welcome/splash and accepting input. This is the
+        # signal that closes the fresh-session startup race.
+        session_started = read_claude_session_id(bridge_dir) is not None
+        if session_started and _claude_pane_interactive(_capture_pane(socket_path, tmux_target)):
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    # Timed out: Claude Code never rendered its input prompt. Capture the
-    # pane one last time and attach its tail so the real cause — often a
-    # startup crash like a ``JSON Parse error`` — surfaces in the web UI
-    # error banner this raises into, instead of only a generic timeout
-    # the user has to open the terminal to diagnose.
+    # Timed out: the session never became interactive — either Claude
+    # Code never got past startup, or its ``SessionStart`` hook never
+    # fired. Capture the pane one last time and attach its tail so the
+    # real cause — often a startup crash like a ``JSON Parse error`` —
+    # surfaces in the web UI error banner this raises into, instead of
+    # only a generic timeout the user has to open the terminal to
+    # diagnose.
     pane = _capture_pane(socket_path, tmux_target)
+    reason = "input prompt never rendered" if session_started else "SessionStart never fired"
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
-        "(input prompt never rendered). The message was not delivered."
-        + _format_terminal_failure_tail(pane)
+        f"({reason}). The message was not delivered." + _format_terminal_failure_tail(pane)
     )
 
 
