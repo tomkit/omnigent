@@ -4665,6 +4665,7 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native_bridge import (
         BRIDGE_ID_LABEL_KEY,
         ensure_claude_workspace_trusted,
+        ensure_env_api_key_approved,
         prepare_bridge_dir,
     )
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
@@ -4715,6 +4716,15 @@ async def _auto_create_claude_terminal(
     # nothing shown in the UI. Acute with per-session worktrees,
     # which launch Claude in a brand-new, untrusted directory.
     ensure_claude_workspace_trusted(Path(workspace))
+    # Managed (Daytona) sandboxes inject ANTHROPIC_API_KEY into the sandbox
+    # env, which this runner — and the Claude terminal it spawns — inherits.
+    # Claude Code shows a blocking "Detected a custom API key in your
+    # environment" prompt for an env key BEFORE SessionStart fires, and no
+    # one is at this host-spawned terminal to answer it, so the session never
+    # starts. Pre-approve the env key so launch proceeds to SessionStart.
+    # No-op when ANTHROPIC_API_KEY is unset (local / non-managed flows deliver
+    # the key via apiKeyHelper, not the env).
+    ensure_env_api_key_approved()
 
     from omnigent.runner._entry import (
         _make_auth_token_factory,

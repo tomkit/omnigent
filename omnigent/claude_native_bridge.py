@@ -89,6 +89,15 @@ _TMUX_FILE = "tmux.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+# Environment variable carrying a static Anthropic API key. When this is
+# present in the env Claude Code launches in, the CLI shows a blocking
+# "Detected a custom API key in your environment" trust prompt before its
+# SessionStart hook fires (see ``ensure_env_api_key_approved``).
+_ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+# Claude Code identifies an approved/rejected custom API key by the last
+# 20 characters of the key, recorded under ``customApiKeyResponses`` in
+# ``~/.claude.json``.
+_CUSTOM_API_KEY_ID_LEN = 20
 _MCP_SERVER_NAME = "omnigent"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 # Tools-changed: harness POSTs to the bridge MCP server's localhost
@@ -854,6 +863,109 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
         changed = True
 
     if not changed:
+        return
+    _atomic_write_user_json(config_path, data)
+
+
+def ensure_env_api_key_approved() -> None:
+    """
+    Pre-accept Claude Code's env-provided "custom API key" trust prompt.
+
+    When ``ANTHROPIC_API_KEY`` is set in the environment Claude Code
+    launches in, the CLI shows a blocking prompt — "Detected a custom API
+    key in your environment … Do you want to use this API key? 1.Yes /
+    2.No" — BEFORE the welcome screen and BEFORE the ``SessionStart``
+    hook fires. On a host-spawned (web-UI-driven) managed session nobody
+    is at the terminal to answer it, so the CLI parks on the prompt,
+    ``SessionStart`` never fires, and the turn fails the injection
+    readiness gate. Managed (Daytona) sandboxes inject the harness
+    credential into the sandbox env, which the runner — and thus the
+    Claude terminal it spawns — inherits, so this prompt is hit on every
+    managed claude-native launch.
+
+    Seed Claude Code's own approval record (``customApiKeyResponses``)
+    for the env key's identifier so the CLI proceeds straight to
+    ``SessionStart`` without a human. The full key is never written —
+    only its last-20-char identifier, matching Claude's own format — and
+    it lands only in the runner-owned, owner-only (``0o600``)
+    ``~/.claude.json``.
+
+    No-op when ``ANTHROPIC_API_KEY`` is unset, which is the local /
+    non-managed case: those flows deliver the credential via an
+    ``apiKeyHelper`` rather than the environment, so this prompt never
+    fires and nothing is written. This is read-modify-write of the same
+    file Claude rewrites; it runs once before launch and uses an atomic
+    replace, matching :func:`ensure_claude_workspace_trusted`'s
+    concurrency posture.
+
+    :returns: None.
+    :raises RuntimeError: If ``ANTHROPIC_API_KEY`` is set but shorter than
+        the 20-char identifier length, so its last-20-char "identifier"
+        would be the whole key — refuse to persist a full secret.
+    :raises ValueError: If an existing ``~/.claude.json`` (or its
+        ``customApiKeyResponses`` block) is not the expected JSON shape.
+    :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is not
+        valid JSON. Both surface rather than silently overwrite a corrupt
+        or unexpected user config (fail loud).
+    """
+    api_key = os.environ.get(_ANTHROPIC_API_KEY_ENV, "").strip()
+    if not api_key:
+        return
+    # The approval identifier is the key's last 20 chars. For a key shorter
+    # than that, ``api_key[-20:]`` is the WHOLE key — persisting it would
+    # write the full secret to disk. Real Anthropic keys are well over 20
+    # chars, so a sub-20 value is a malformed/misconfigured env: fail loud
+    # and persist nothing rather than leak it.
+    if len(api_key) < _CUSTOM_API_KEY_ID_LEN:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is too short to derive a safe approval identifier; "
+            "refusing to persist it."
+        )
+
+    config_path = Path.home() / ".claude.json"
+    if config_path.exists():
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"{config_path} is not a JSON object; refusing to overwrite.")
+    else:
+        data = {}
+
+    # Claude Code records per-key trust decisions under
+    # ``customApiKeyResponses`` as ``{"approved": [...], "rejected": [...]}``,
+    # keyed by the LAST 20 CHARACTERS of the key (never the full secret). A
+    # key whose identifier is in ``approved`` is used without the prompt.
+    key_id = api_key[-_CUSTOM_API_KEY_ID_LEN:]
+    responses = data.setdefault("customApiKeyResponses", {})
+    if not isinstance(responses, dict):
+        raise ValueError(
+            f"{config_path} 'customApiKeyResponses' is not a JSON object; refusing to overwrite."
+        )
+    approved = responses.setdefault("approved", [])
+    rejected = responses.setdefault("rejected", [])
+    if not isinstance(approved, list) or not isinstance(rejected, list):
+        raise ValueError(
+            f"{config_path} 'customApiKeyResponses.approved/rejected' is not a JSON array; "
+            "refusing to overwrite."
+        )
+
+    changed = False
+    if key_id not in approved:
+        approved.append(key_id)
+        changed = True
+    # A prior "No" (id in ``rejected``) would keep suppressing the key even
+    # once approved, so clear it.
+    if key_id in rejected:
+        responses["rejected"] = [item for item in rejected if item != key_id]
+        changed = True
+
+    if not changed:
+        # Even when the content is unchanged, guarantee the file is
+        # owner-only: this config also holds the Claude OAuth account block,
+        # so a pre-existing world/group-readable ~/.claude.json must not be
+        # left with loose perms. _atomic_write_user_json pins 0600 on the
+        # write paths; this covers the no-write early return.
+        if config_path.exists() and stat.S_IMODE(config_path.stat().st_mode) != 0o600:
+            config_path.chmod(0o600)
         return
     _atomic_write_user_json(config_path, data)
 

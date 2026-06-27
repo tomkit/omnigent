@@ -7,6 +7,7 @@ import json
 import os
 import select
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from omnigent.claude_native_bridge import (
     count_hook_events,
     display_cost_approval_popup,
     ensure_claude_workspace_trusted,
+    ensure_env_api_key_approved,
     inject_interrupt,
     inject_user_message,
     kill_session,
@@ -4734,6 +4736,210 @@ def test_ensure_trusted_refuses_malformed_config(
         ensure_claude_workspace_trusted(workspace)
 
     # The original (malformed) bytes are preserved — no clobber occurred.
+    assert config_path.read_text() == raw
+
+
+# ── ensure_env_api_key_approved ────────────────────────
+
+
+# A representative Anthropic key. The trailing 20 chars are the identifier
+# Claude Code records; the rest must never be written to disk.
+_FAKE_API_KEY = "sk-ant-api03-PREFIXSECRETMIDDLE-LAST20CHARIDENTIFIER!"
+_FAKE_API_KEY_ID = _FAKE_API_KEY[-20:]
+
+
+def test_ensure_env_api_key_seeds_approval_when_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A managed env key is pre-approved by its last-20-char identifier.
+
+    This is the core managed-sandbox case: the sandbox injects
+    ``ANTHROPIC_API_KEY`` into the env, and without a seeded approval
+    Claude Code blocks on the "Detected a custom API key" prompt before
+    SessionStart. The approval record must carry exactly the last 20
+    chars under ``approved`` with an empty ``rejected`` list.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
+
+    ensure_env_api_key_approved()
+
+    data = json.loads(config_path.read_text())
+    responses = data["customApiKeyResponses"]
+    assert responses["approved"] == [_FAKE_API_KEY_ID]
+    assert responses["rejected"] == []
+    # The 20-char identifier is exactly the key's suffix, never longer.
+    assert len(_FAKE_API_KEY_ID) == 20
+
+
+def test_ensure_env_api_key_never_writes_full_secret_and_is_owner_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only the identifier is persisted, and the file is owner-only 0600.
+
+    Security-critical: the raw key must not leak into ``~/.claude.json``
+    (the secret stays in the runner-owned env), and the config — which
+    also holds the OAuth account block — must be mode 0600 so it is not
+    readable by the agent or other sandbox users.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
+
+    ensure_env_api_key_approved()
+
+    raw = config_path.read_text()
+    # The secret prefix/middle must be absent; only the suffix id is stored.
+    assert "PREFIXSECRETMIDDLE" not in raw
+    assert _FAKE_API_KEY not in raw
+    # Owner-only permissions (matches the OAuth-bearing config's posture).
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_ensure_env_api_key_noop_when_env_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Local / non-managed flows (no env key) write nothing.
+
+    Those flows deliver the credential via an ``apiKeyHelper``, so the
+    env prompt never fires and the helper must not create or touch
+    ``~/.claude.json``.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    ensure_env_api_key_approved()
+
+    assert not config_path.exists()
+
+
+def test_ensure_env_api_key_preserves_state_and_clears_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Existing config survives, and a prior rejection of this key is cleared.
+
+    A key the user once answered "No" to sits in ``rejected``; leaving it
+    there would keep Claude suppressing the now-pre-approved key. The
+    helper must move it to ``approved`` while preserving unrelated state
+    and other recorded keys.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
+    existing = {
+        "oauthAccount": {"emailAddress": "user@example.com"},
+        "customApiKeyResponses": {
+            "approved": ["otherkeyidentifier12"],
+            "rejected": [_FAKE_API_KEY_ID],
+        },
+    }
+    config_path.write_text(json.dumps(existing))
+
+    ensure_env_api_key_approved()
+
+    data = json.loads(config_path.read_text())
+    assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
+    responses = data["customApiKeyResponses"]
+    # Pre-existing approval survives; ours is added; the rejection is cleared.
+    assert set(responses["approved"]) == {"otherkeyidentifier12", _FAKE_API_KEY_ID}
+    assert responses["rejected"] == []
+
+
+def test_ensure_env_api_key_idempotent_does_not_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the key is already approved, the file is left byte-for-byte alone.
+
+    The seed file is compact; the helper writes indent=2, so any rewrite
+    would change the bytes — this proves the no-op short-circuit holds.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
+    already = {"customApiKeyResponses": {"approved": [_FAKE_API_KEY_ID], "rejected": []}}
+    config_path.write_text(json.dumps(already, separators=(",", ":")))
+    before = config_path.read_bytes()
+
+    ensure_env_api_key_approved()
+
+    assert config_path.read_bytes() == before
+
+
+def test_ensure_env_api_key_refuses_short_key_without_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-20-char key fails loud and the full secret never reaches disk.
+
+    For a key shorter than the 20-char identifier, ``key[-20:]`` is the
+    WHOLE key — persisting it would leak the full secret. Real Anthropic
+    keys are far longer, so a short value is malformed: the helper must
+    raise and write nothing (no ``~/.claude.json`` created at all).
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    short_key = "sk-ant-short"  # < 20 chars
+    monkeypatch.setenv("ANTHROPIC_API_KEY", short_key)
+
+    with pytest.raises(RuntimeError, match="too short"):
+        ensure_env_api_key_approved()
+
+    # No file was created, so the key could not have been written anywhere.
+    assert not config_path.exists()
+
+
+def test_ensure_env_api_key_idempotent_enforces_owner_only_perms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The already-approved no-write path still tightens loose file perms.
+
+    ``~/.claude.json`` holds the OAuth account block, so a pre-existing
+    world/group-readable config must be pulled back to 0600 even when the
+    approval content needs no change — and the approved list must not be
+    duplicated or grown.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
+    already = {"customApiKeyResponses": {"approved": [_FAKE_API_KEY_ID], "rejected": []}}
+    config_path.write_text(json.dumps(already))
+    config_path.chmod(0o644)  # loose perms, as a prior tool might have left
+
+    ensure_env_api_key_approved()
+
+    # Perms tightened despite no content change.
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    # The approved list is unchanged — not duplicated or grown.
+    data = json.loads(config_path.read_text())
+    assert data["customApiKeyResponses"]["approved"] == [_FAKE_API_KEY_ID]
+
+
+def test_ensure_env_api_key_refuses_malformed_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A malformed ``customApiKeyResponses`` raises and never clobbers.
+
+    Fail-loud: a non-object responses block is an unexpected shape Claude
+    never writes, so refuse rather than overwrite the user's real config.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
+    raw = json.dumps({"customApiKeyResponses": [1, 2, 3]})
+    config_path.write_text(raw)
+
+    with pytest.raises(ValueError):
+        ensure_env_api_key_approved()
+
     assert config_path.read_text() == raw
 
 
