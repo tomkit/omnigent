@@ -1896,7 +1896,7 @@ async def _auto_create_pi_terminal(
         write_extension_files,
     )
     from omnigent.pi_native_bridge import extension_path as pi_extension_path
-    from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runner._entry import _make_auth_token_factory, _runner_forwarder_headers
 
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
@@ -1910,7 +1910,10 @@ async def _auto_create_pi_terminal(
     session_dir = pi_session_dir(bridge_dir)
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
-    auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    # Carry the user/Databricks bearer plus, for managed-sandbox runners, the
+    # tunnel binding token (fork). Upstream's pi path did not add the
+    # workspace-routing header here, so neither do we — parity preserved.
+    auth_headers = _runner_forwarder_headers(auth_token)
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's
@@ -3283,7 +3286,7 @@ async def _auto_create_kimi_terminal(
     )
     from omnigent.kimi_native_credentials import build_kimi_session_home
     from omnigent.kimi_native_forwarder import clear_kimi_bridge_state, supervise_kimi_forwarder
-    from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runner._entry import _make_auth_token_factory, _runner_forwarder_headers
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     # Stamp launch time before the TUI starts so the forwarder only adopts a kimi
@@ -3319,11 +3322,13 @@ async def _auto_create_kimi_terminal(
     _auth_factory = _make_auth_token_factory()
     _auth_token = _auth_factory() if _auth_factory is not None else None
     # The hook subprocess replays these static headers from its config (no
-    # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
-    # the workspace-routing header so neither is dropped.
+    # refresh-capable httpx.Auth of its own). Carry the bearer plus, for
+    # managed-sandbox runners, the tunnel binding token (fork), then fold in the
+    # workspace-routing header (upstream) so neither is dropped.
     from omnigent.cli_auth import databricks_request_headers
 
-    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
+    _runner_headers = _runner_forwarder_headers(_auth_token)
+    _runner_headers.update(databricks_request_headers(server_url))
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -3677,18 +3682,18 @@ async def _auto_create_codex_terminal(
     # separate subprocess that POSTs tool calls to /policies/evaluate, so
     # it reads a one-shot token snapshot from policy_hook.json — same as
     # the claude-native PermissionRequest hook on this host-spawned path.
-    from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runner._entry import _make_auth_token_factory, _runner_forwarder_headers
 
     _policy_auth_factory = _make_auth_token_factory()
     _policy_auth_token = _policy_auth_factory() if _policy_auth_factory is not None else None
     # The codex policy hook subprocess replays these static headers from its
-    # config (no refresh-capable auth of its own); the helper pairs the bearer
-    # with the workspace-routing header so neither is dropped.
+    # config (no refresh-capable auth of its own). Carry the bearer plus, for
+    # managed-sandbox runners, the tunnel binding token (fork), then fold in the
+    # workspace-routing header (upstream) so neither is dropped.
     from omnigent.cli_auth import databricks_request_headers
 
-    policy_headers = databricks_request_headers(
-        launch_config.policy_server_url, bearer_token=_policy_auth_token
-    )
+    policy_headers = _runner_forwarder_headers(_policy_auth_token)
+    policy_headers.update(databricks_request_headers(launch_config.policy_server_url))
 
     app_server = build_codex_native_server(
         socket_path=socket_path,
@@ -3890,6 +3895,7 @@ async def _codex_discover_thread_and_forward(
     )
     from omnigent.runner._entry import (
         _make_auth_token_factory,
+        _runner_forwarder_headers,
         _RunnerDatabricksAuth,
     )
 
@@ -3932,7 +3938,7 @@ async def _codex_discover_thread_and_forward(
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
         auth_token = auth_factory() if auth_factory is not None else None
-        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        headers = _runner_forwarder_headers(auth_token)
 
         # Mirror the discovered Codex thread id onto the Omnigent session as its
         # external_session_id, the same way claude-native records its
@@ -4020,13 +4026,14 @@ async def _codex_forward_known_thread(
     from omnigent.codex_native_forwarder import supervise_forwarder
     from omnigent.runner._entry import (
         _make_auth_token_factory,
+        _runner_forwarder_headers,
         _RunnerDatabricksAuth,
     )
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
-    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    headers = _runner_forwarder_headers(auth_token)
     try:
         await supervise_forwarder(
             base_url=server_url,
@@ -4312,12 +4319,16 @@ async def _auto_create_antigravity_terminal(
     #
     # Reconstruct the server URL + refresh-capable auth from the runner's own
     # environment, exactly like ``_auto_create_claude_terminal``.
-    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+    from omnigent.runner._entry import (
+        _make_auth_token_factory,
+        _runner_forwarder_headers,
+        _RunnerDatabricksAuth,
+    )
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
-    runner_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    runner_headers = _runner_forwarder_headers(auth_token)
 
     # Seed bridge state with the id known so far (the real id on resume; on a
     # fresh launch a placeholder the cold-start below replaces with agy's real
@@ -5405,7 +5416,11 @@ async def _auto_create_claude_terminal(
     # which launch Claude in a brand-new, untrusted directory.
     ensure_claude_workspace_trusted(Path(workspace))
 
-    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+    from omnigent.runner._entry import (
+        _make_auth_token_factory,
+        _runner_forwarder_headers,
+        _RunnerDatabricksAuth,
+    )
 
     # The Omnigent server URL + auth are needed in two places below: the
     # PermissionRequest hook (so Claude's approval prompts route to the
@@ -5425,11 +5440,13 @@ async def _auto_create_claude_terminal(
     # with a ``None`` factory is a safe no-op (local unauthenticated).
     _auth_token = _auth_factory() if _auth_factory is not None else None
     # The hook subprocess replays these static headers from its config (no
-    # refresh-capable auth of its own); the helper pairs the bearer with the
-    # workspace-routing header so neither is dropped.
+    # refresh-capable auth of its own). Carry the bearer plus, for
+    # managed-sandbox runners, the tunnel binding token (fork), then fold in the
+    # workspace-routing header (upstream) so neither is dropped.
     from omnigent.cli_auth import databricks_request_headers
 
-    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
+    _runner_headers = _runner_forwarder_headers(_auth_token)
+    _runner_headers.update(databricks_request_headers(server_url))
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_launcher import resolve_claude_launch
