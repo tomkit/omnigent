@@ -26,6 +26,8 @@ mirroring ``test_sessions_managed_runner_rest_auth.py``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json as _json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -36,11 +38,13 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
+from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -48,6 +52,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
+from omnigent.server.routes import sessions as sessions_route
 from omnigent.server.routes.sessions import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
@@ -191,6 +196,154 @@ def _approval_event(elicitation_id: str) -> dict[str, Any]:
 # A bogus (unclassified) event type: not in ``_RUNNER_OWNED_EVENT_TYPES``, so it
 # must fail safe to user-only auth. Used to pin the fail-safe default.
 _BOGUS_EVENT = {"type": "definitely-not-a-real-event-type", "data": {}}
+
+
+_PERMISSION_HOOKS: tuple[tuple[str, str], ...] = (
+    ("claude", "/hooks/permission-request"),
+    ("codex", "/hooks/codex-elicitation-request"),
+    ("antigravity", "/hooks/antigravity-elicitation-request"),
+    ("cursor", "/hooks/cursor-permission-request"),
+    ("native", "/hooks/native-permission-request"),
+)
+
+
+def _stable_hook_hex(hook_name: str, session_id: str) -> str:
+    """Return a deterministic 32-hex suffix for hook elicitation ids."""
+    return hashlib.sha256(f"{hook_name}:{session_id}".encode()).hexdigest()[:32]
+
+
+def _permission_hook_payload(hook_name: str, session_id: str) -> tuple[dict[str, Any], str]:
+    """Build a valid permission-hook payload and return its elicitation id."""
+    suffix = _stable_hook_hex(hook_name, session_id)
+    if hook_name == "claude":
+        elicitation_id = f"elicit_claude_{suffix}"
+        return (
+            {
+                "session_id": "claude_sess_abc",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/tmp/cwd",
+                "permission_mode": "default",
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+                "_omnigent_elicitation_id": elicitation_id,
+            },
+            elicitation_id,
+        )
+    if hook_name == "cursor":
+        elicitation_id = f"elicit_cursor_{suffix}"
+        return (
+            {
+                "elicitation_id": elicitation_id,
+                "operation_type": "shell",
+                "message": "Run this command?",
+                "content_preview": "echo hi",
+            },
+            elicitation_id,
+        )
+    if hook_name == "codex":
+        request_id = 7
+        method = "mcpServer/elicitation/request"
+        return (
+            {
+                "id": request_id,
+                "method": method,
+                "params": {
+                    "threadId": "thread_123",
+                    "turnId": "turn_123",
+                    "serverName": "booking",
+                    "mode": "form",
+                    "message": "Pick a date",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"date": {"type": "string"}},
+                    },
+                },
+            },
+            codex_elicitation_id(session_id, method, request_id),
+        )
+    if hook_name == "antigravity":
+        elicitation_id = f"elicit_agy_{suffix}"
+        return (
+            {
+                "elicitation_id": elicitation_id,
+                "params": {
+                    "mode": "form",
+                    "message": "Antigravity needs your input",
+                    "phase": "agy_ask_question",
+                    "policy_name": "agy_native_ask_question",
+                },
+            },
+            elicitation_id,
+        )
+    elicitation_id = f"elicit_native_{suffix}"
+    return (
+        {
+            "elicitation_id": elicitation_id,
+            "agent": "qwen",
+            "policy_name": "qwen_native_permission",
+            "operation_type": "run_shell_command",
+            "message": "qwen wants to run run_shell_command",
+            "content_preview": "echo hi",
+        },
+        elicitation_id,
+    )
+
+
+async def _wait_for_pending_elicitation(
+    session_id: str,
+    hook_task: asyncio.Task[httpx.Response],
+    *,
+    timeout_s: float = 3.0,
+) -> None:
+    """Wait until the hook has published exactly one pending elicitation."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        if hook_task.done():
+            resp = hook_task.result()
+            raise AssertionError(
+                f"permission hook returned before parking: {resp.status_code} {resp.text}"
+            )
+        if pending_elicitations.count_for(session_id) == 1:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"permission hook did not publish a pending elicitation; "
+        f"count={pending_elicitations.count_for(session_id)!r}"
+    )
+
+
+async def _post_approval_with_headers(
+    client: httpx.AsyncClient,
+    session_id: str,
+    elicitation_id: str,
+    headers: dict[str, str],
+) -> httpx.Response:
+    """Post an approval event with explicit auth headers."""
+    return await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=_approval_event(elicitation_id),
+        headers=headers,
+    )
+
+
+def _assert_permission_hook_accept_response(hook_name: str, resp: httpx.Response) -> None:
+    """Assert the permission hook returned its provider-specific accept shape."""
+    assert resp.status_code == 200, resp.text
+    if hook_name == "claude":
+        assert resp.json() == {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"},
+            }
+        }
+    elif hook_name == "codex":
+        assert resp.json() == {"action": "accept", "content": None, "_meta": None}
+    elif hook_name == "antigravity":
+        assert resp.json() == {"action": "accept", "content": None}
+    else:
+        assert resp.json() == {"action": "accept"}
 
 
 # ── post_event: the WRITE route that broke task completion ───
@@ -388,6 +541,152 @@ async def test_post_event_approval_allowed_for_real_user(
         _harness_elicitation_owners.pop(elicitation_id, None)
         if not future.done():
             future.cancel()
+
+
+# ── permission hooks: runner token can surface, but not answer ──
+
+
+@pytest.mark.parametrize(("hook_name", "hook_path"), _PERMISSION_HOOKS)
+async def test_permission_hook_runner_token_surfaces_but_cannot_approve(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    hook_name: str,
+    hook_path: str,
+) -> None:
+    """A same-session runner token may publish each permission hook's
+    elicitation, but the same token still cannot resolve it via `approval`."""
+    pending_elicitations.reset_for_tests()
+    sess = await _create_session_as(auth_client, "alice@example.com")
+    session_id = sess["id"]
+    token = f"managed-runner-token-{hook_name}"
+    _bind_runner_token(db_uri, session_id, token)
+    payload, elicitation_id = _permission_hook_payload(hook_name, session_id)
+
+    hook_task = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}{hook_path}",
+            json=payload,
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+        )
+    )
+    try:
+        await _wait_for_pending_elicitation(session_id, hook_task)
+
+        runner_verdict = await _post_approval_with_headers(
+            auth_client,
+            session_id,
+            elicitation_id,
+            {RUNNER_TUNNEL_TOKEN_HEADER: token},
+        )
+        assert runner_verdict.status_code == 401, runner_verdict.text
+        assert pending_elicitations.count_for(session_id) == 1
+
+        owner_verdict = await _post_approval_with_headers(
+            auth_client,
+            session_id,
+            elicitation_id,
+            {"X-Forwarded-Email": "alice@example.com"},
+        )
+        assert owner_verdict.status_code == 202, owner_verdict.text
+        resp = await hook_task
+        _assert_permission_hook_accept_response(hook_name, resp)
+        assert pending_elicitations.count_for(session_id) == 0
+    finally:
+        if not hook_task.done():
+            hook_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hook_task
+
+
+@pytest.mark.parametrize(("hook_name", "hook_path"), _PERMISSION_HOOKS)
+async def test_permission_hook_rejects_absent_mismatched_and_cross_session_token(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_name: str,
+    hook_path: str,
+) -> None:
+    """Absent, mismatched, and cross-session binding tokens fail closed on
+    all permission-request create/surface hooks."""
+    monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(sessions_route, "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(sessions_route, "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(sessions_route, "_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(sessions_route, "_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.1)
+    pending_elicitations.reset_for_tests()
+
+    sess = await _create_session_as(auth_client, "alice@example.com")
+    session_id = sess["id"]
+    _bind_runner_token(db_uri, session_id, "the-real-bound-token")
+    payload, _elicitation_id = _permission_hook_payload(hook_name, session_id)
+
+    no_token = await auth_client.post(
+        f"/v1/sessions/{session_id}{hook_path}",
+        json=payload,
+    )
+    assert no_token.status_code == 401, no_token.text
+
+    wrong = await auth_client.post(
+        f"/v1/sessions/{session_id}{hook_path}",
+        json=payload,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "some-other-token-not-bound"},
+    )
+    assert wrong.status_code == 401, wrong.text
+
+    sess_b = await _create_session_as(auth_client, "bob@example.com")
+    token_a = f"alice-cross-session-token-{hook_name}"
+    _bind_runner_token(db_uri, sess["id"], token_a)
+    _bind_runner_token(db_uri, sess_b["id"], f"bob-token-{hook_name}")
+    payload_b, _elicitation_id_b = _permission_hook_payload(hook_name, sess_b["id"])
+    cross = await auth_client.post(
+        f"/v1/sessions/{sess_b['id']}{hook_path}",
+        json=payload_b,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: token_a},
+    )
+    assert cross.status_code == 401, cross.text
+    assert pending_elicitations.count_for(session_id) == 0
+    assert pending_elicitations.count_for(sess_b["id"]) == 0
+
+
+@pytest.mark.parametrize(("hook_name", "hook_path"), _PERMISSION_HOOKS)
+async def test_permission_hook_user_auth_path_unchanged(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    hook_name: str,
+    hook_path: str,
+) -> None:
+    """A real session owner still authorizes each permission hook exactly as
+    before, independent of any runner binding."""
+    pending_elicitations.reset_for_tests()
+    sess = await _create_session_as(auth_client, "alice@example.com")
+    session_id = sess["id"]
+    _bind_runner_token(db_uri, session_id, f"managed-runner-user-path-{hook_name}")
+    payload, elicitation_id = _permission_hook_payload(hook_name, session_id)
+
+    hook_task = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}{hook_path}",
+            json=payload,
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    )
+    try:
+        await _wait_for_pending_elicitation(session_id, hook_task)
+        owner_verdict = await _post_approval_with_headers(
+            auth_client,
+            session_id,
+            elicitation_id,
+            {"X-Forwarded-Email": "alice@example.com"},
+        )
+        assert owner_verdict.status_code == 202, owner_verdict.text
+        resp = await hook_task
+        _assert_permission_hook_accept_response(hook_name, resp)
+        assert pending_elicitations.count_for(session_id) == 0
+    finally:
+        if not hook_task.done():
+            hook_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hook_task
 
 
 async def test_post_event_unknown_type_fails_safe_to_user_only(
