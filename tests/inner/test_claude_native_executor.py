@@ -203,6 +203,63 @@ async def test_run_turn_rejects_stale_session_after_clear(
 
 
 @pytest.mark.asyncio
+async def test_run_turn_surfaces_unverified_submit_as_executor_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A failed verified-submit surfaces as ExecutorError, not silent success.
+
+    When the bridge can't confirm the message left Claude's input box
+    (e.g. the paste was dropped on a still-booting session), it raises
+    ``RuntimeError`` instead of returning. The executor must translate
+    that into an :class:`ExecutorError` so the web UI shows a failure
+    rather than hanging on "Working…" forever with nothing delivered.
+    """
+    bridge_dir = tmp_path / "bridge"
+
+    def raise_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """
+        Simulate the bridge failing to verify the submit.
+
+        :param bridge_dir_arg: Bridge directory passed by the executor.
+        :param content: Text that would be typed into tmux.
+        :param timeout_s: tmux-target readiness timeout (ignored).
+        :returns: Never returns.
+        """
+        del bridge_dir_arg, content, timeout_s
+        raise RuntimeError(
+            "Claude Code never showed the pasted message in its input box "
+            "(the paste was dropped). The message was not delivered."
+        )
+
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        raise_inject_user_message,
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "deliver me"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "was not delivered" in events[0].message
+
+
+@pytest.mark.asyncio
 async def test_enqueue_session_message_rejects_stale_session_after_clear(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
