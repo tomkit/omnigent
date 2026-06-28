@@ -75,6 +75,9 @@ describe("createSession", () => {
       runnerId: undefined,
       hostId: null,
       hostResumable: false,
+      hostName: null,
+      hostType: null,
+      sandboxProvider: null,
       status: "idle",
       createdAt: 1704067200,
       title: null,
@@ -700,6 +703,62 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_top");
     expect(session.parentSessionId).toBeNull();
+  });
+
+  it("maps the managed-host environment fields from the wire", async () => {
+    // The header env badge reads host_type/host_name/sandbox_provider to
+    // show "Daytona" for a managed sandbox; they must survive the parse
+    // boundary in camelCase.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_managed",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        host_id: "host_daytona",
+        host_name: "managed-a1b2c3d4",
+        host_type: "managed",
+        sandbox_provider: "daytona",
+      }),
+    );
+    const session = await getSession("conv_managed");
+    expect(session.hostType).toBe("managed");
+    expect(session.hostName).toBe("managed-a1b2c3d4");
+    expect(session.sandboxProvider).toBe("daytona");
+  });
+
+  it("maps a local host with no provider and defaults env fields to null", async () => {
+    // External (user-connected) host: host_type="local", no provider. A
+    // host-less / older snapshot omits all three — they must default to
+    // null so the badge hides instead of rendering a fabricated value.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_local",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        host_id: "host_laptop",
+        host_name: "corey-laptop",
+        host_type: "local",
+      }),
+    );
+    const local = await getSession("conv_local");
+    expect(local.hostType).toBe("local");
+    expect(local.hostName).toBe("corey-laptop");
+    expect(local.sandboxProvider).toBeNull();
+
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_nohost",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+      }),
+    );
+    const hostless = await getSession("conv_nohost");
+    expect(hostless.hostType).toBeNull();
+    expect(hostless.hostName).toBeNull();
+    expect(hostless.sandboxProvider).toBeNull();
   });
 });
 

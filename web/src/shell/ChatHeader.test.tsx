@@ -39,6 +39,8 @@ function renderHeader(props: {
   isChildSession?: boolean;
   parentSessionId?: string;
   boundAgent?: Agent;
+  conversationId?: string;
+  hostEnv?: { type: "managed" | "local"; name: string | null; provider: string | null } | null;
 }) {
   return render(
     <MemoryRouter initialEntries={["/"]}>
@@ -48,11 +50,13 @@ function renderHeader(props: {
           onOpenSidebar={() => {}}
           isChildSession={props.isChildSession ?? false}
           parentSessionId={props.parentSessionId}
-          // No active session: PresenceAvatars / AgentInfoButton / right-panel
-          // toggle / mobile FAB all gate on conversationId and stay unmounted,
-          // isolating the left-slot affordances under test.
-          conversationId={undefined}
+          // No active session by default: PresenceAvatars / AgentInfoButton /
+          // right-panel toggle / mobile FAB all gate on conversationId and stay
+          // unmounted, isolating the left-slot affordances under test. Tests
+          // that exercise the env badge pass a conversationId explicitly.
+          conversationId={props.conversationId}
           boundAgent={props.boundAgent}
+          hostEnv={props.hostEnv}
           canShare={false}
           onShare={() => {}}
           hasAgentInfo={false}
@@ -128,5 +132,36 @@ describe("ChatHeader — sub-agent affordance", () => {
       "/c/parent-123",
     );
     expect(screen.getByText("Sub-agent")).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — host environment badge", () => {
+  it("shows the provider name for a managed sandbox session", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_managed",
+      hostEnv: { type: "managed", name: "managed-a1b2c3d4", provider: "daytona" },
+    });
+    // Managed sessions surface the human-recognizable provider name
+    // (capitalized) rather than the opaque sandbox hostname.
+    const badge = screen.getByTestId("session-host-env-badge");
+    expect(badge).toHaveTextContent("Daytona");
+  });
+
+  it("shows the machine hostname for a local/remote host session", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_local",
+      hostEnv: { type: "local", name: "corey-laptop", provider: null },
+    });
+    const badge = screen.getByTestId("session-host-env-badge");
+    expect(badge).toHaveTextContent("corey-laptop");
+  });
+
+  it("renders no badge when the session has no host binding", () => {
+    renderHeader({ sidebarOpen: true, conversationId: "conv_nohost", hostEnv: null });
+    // A host-less session must look exactly as before — no neutral
+    // placeholder pill.
+    expect(screen.queryByTestId("session-host-env-badge")).toBeNull();
   });
 });

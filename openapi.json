@@ -4512,6 +4512,18 @@
             "description": "Host that launched (or should launch) the runner for this session, e.g. `\"host_a1b2c3d4...\"`. `None` for CLI-initiated sessions.",
             "title": "Host Id"
           },
+          "host_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Display name of the bound host, e.g. `\"corey-laptop\"` for an external host (the machine hostname) or `\"managed-a1b2c3d4\"` for a managed sandbox. Read from the host row already loaded for `host_resumable` (no extra query). `None` when the session has no `host_id` or the host row is missing.",
+            "title": "Host Name"
+          },
           "host_online": {
             "anyOf": [
               {
@@ -4529,6 +4541,22 @@
             "description": "Whether this session is bound to a dormant managed host the server can wake in place (its provider sets `SandboxLauncher.can_resume`). The open view reads it only when `host_online` is `False`, to split a confirmed host-down into a recoverable \"asleep\" state (send a message \u2014 the relaunch path resumes the sandbox) versus the terminal `host_offline` dead-end (reconnect from your machine / fork). `False` for non-managed or non-resumable hosts.",
             "title": "Host Resumable",
             "type": "boolean"
+          },
+          "host_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "managed",
+                  "local"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Coarse session environment derived from the bound host's `sandbox_provider`: `\"managed\"` when the host is a server-managed sandbox (`sandbox_provider` non-null), `\"local\"` for an external (user-connected) host. `None` when the session has no `host_id` or the host row is missing.",
+            "title": "Host Type"
           },
           "id": {
             "description": "Unique session identifier (also the underlying conversation ID), e.g. `\"conv_abc123\"`.",
@@ -4714,6 +4742,18 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Raw sandbox provider backing a managed host, e.g. `\"daytona\"` / `\"modal\"` / `\"e2b\"`, so clients can label the provider by name. `None` for external (local / remote) hosts and for sessions with no host binding.",
+            "title": "Sandbox Provider"
           },
           "sandbox_status": {
             "anyOf": [
@@ -6176,7 +6216,7 @@
     },
     "/health": {
       "get": {
-        "description": "Liveness check with optional session-scoped runner status.\n\nWithout session params, returns `{\"status\": \"ok\"}` (bare\nliveness). With `session_id`, adds a single `session`\nobject. With `session_ids` (comma-separated), adds a\n`sessions` dict keyed by id \u2014 used by the sidebar to\nbatch-check all visible sessions in one request. The batch\npath runs a single SQL `IN` query, not N per-id round-trips.\n\nEach per-session object carries both `runner_online` (strict\nrunner reachability) and `host_online` (host tunnel live, or\n`None` when the session has no host binding) \u2014 see\n`~omnigent.server.routes.sessions.SessionLiveness`.\n\n**Returns:** `{\"status\": \"ok\"}` with optional `session` and/or `sessions` fields. Each session object has shape `{\"runner_online\": bool, \"host_online\": bool | None, \"host_version\": str | None}` (the single `session` object also includes its `id`). `host_version` is the bound host's reported version, or `None` when there's no host binding / the version isn't resolvable on this replica.",
+        "description": "Liveness check with optional session-scoped runner status.\n\nAlways returns `status` plus a `version` build identifier\n(detailed below). Without session params that bare object is the\nwhole response. With `session_id`, adds a single `session`\nobject. With `session_ids` (comma-separated), adds a\n`sessions` dict keyed by id \u2014 used by the sidebar to\nbatch-check all visible sessions in one request. The batch\npath runs a single SQL `IN` query, not N per-id round-trips.\n\nEach per-session object carries both `runner_online` (strict\nrunner reachability) and `host_online` (host tunnel live, or\n`None` when the session has no host binding) \u2014 see\n`~omnigent.server.routes.sessions.SessionLiveness`.\n\n**Returns:** `{\"status\": \"ok\", \"version\": \"<sha>\"}` with optional `session` and/or `sessions` fields. `version` is the git-sha build identifier baked into the image at build time (the `OMNIGENT_BUILD_SHA` env var, e.g. `\"sha-6d4847d\"`), or `\"unknown\"` when unset (local/dev). Each session object has shape `{\"runner_online\": bool, \"host_online\": bool | None, \"host_version\": str | None}` (the single `session` object also includes its `id`). `host_version` is the bound host's reported version, or `None` when there's no host binding / the version isn't resolvable on this replica.",
         "operationId": "health_health_get",
         "parameters": [
           {

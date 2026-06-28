@@ -18,6 +18,7 @@ from omnigent.server.routes.sessions import (
     _publish_subtree_cost_to_ancestors,
     _truncate_label,
 )
+from omnigent.stores.host_store import Host
 
 
 async def _drain_runner_skills(session_id: str) -> None:
@@ -1597,3 +1598,171 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
 
     assert captured["conv_456"]["omnigent.last_task_error_message"] == "Process exited with code 1"
     assert captured["conv_456"]["omnigent.last_task_error_code"] == "runner_error"
+
+
+class _HostStore:
+    """Minimal host store returning one canned host for any id.
+
+    The snapshot path reads the bound host (via ``get_host``) once to
+    populate the environment fields (``host_name`` / ``host_type`` /
+    ``sandbox_provider``) and the resumability signal. ``None`` models a
+    missing host row.
+    """
+
+    def __init__(self, host: Host | None) -> None:
+        self._host = host
+        self.get_host_calls: list[str] = []
+
+    def get_host(self, host_id: str) -> Host | None:
+        self.get_host_calls.append(host_id)
+        return self._host
+
+
+def _host(host_id: str, name: str, sandbox_provider: str | None) -> Host:
+    return Host(
+        host_id=host_id,
+        name=name,
+        owner="alice@example.com",
+        status="online",
+        created_at=1,
+        updated_at=1,
+        sandbox_provider=sandbox_provider,
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_marks_managed_host_environment() -> None:
+    """A session on a managed sandbox carries host_type="managed" + provider.
+
+    The web header badge reads these to show "Daytona" rather than a raw
+    machine hostname; ``sandbox_provider`` rides through verbatim so the
+    client can name the provider. One indexed host read serves all three.
+    """
+    conv = Conversation(
+        id="conv_managed",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_managed",
+        agent_id="ag_test",
+        host_id="host_daytona",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_managed": conv},
+    )
+    host_store = _HostStore(_host("host_daytona", "managed-a1b2c3d4", "daytona"))
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_managed",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.host_type == "managed"
+    assert snapshot.host_name == "managed-a1b2c3d4"
+    assert snapshot.sandbox_provider == "daytona"
+    # Single host read — the env fields reuse the same lookup the
+    # resumability signal needs (no second query).
+    assert host_store.get_host_calls == ["host_daytona"]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_marks_local_host_environment() -> None:
+    """An external (user-connected) host reads host_type="local", no provider.
+
+    A null ``sandbox_provider`` is the discriminator for an external host;
+    the badge then shows the machine hostname instead of a provider name.
+    """
+    conv = Conversation(
+        id="conv_local",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_local",
+        agent_id="ag_test",
+        host_id="host_laptop",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_local": conv},
+    )
+    host_store = _HostStore(_host("host_laptop", "corey-laptop", None))
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_local",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.host_type == "local"
+    assert snapshot.host_name == "corey-laptop"
+    assert snapshot.sandbox_provider is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_host_environment_absent_without_binding() -> None:
+    """A host-less (CLI/local) session leaves the env fields null.
+
+    No ``host_id`` means no host read at all, so host_type/host_name stay
+    None and ``sandbox_provider`` is null — the badge renders nothing.
+    """
+    conv = Conversation(
+        id="conv_nohost",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_nohost",
+        agent_id="ag_test",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_nohost": conv},
+    )
+    host_store = _HostStore(_host("unused", "unused", "daytona"))
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_nohost",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.host_type is None
+    assert snapshot.host_name is None
+    assert snapshot.sandbox_provider is None
+    # No host binding → the host store is never consulted.
+    assert host_store.get_host_calls == []
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_host_environment_absent_when_host_row_missing() -> None:
+    """A host_id pointing at a missing host row degrades the env fields to null.
+
+    The session references a host that the store can no longer resolve (the
+    row was deleted / never registered on this replica). The snapshot must
+    still consult the store, then degrade gracefully — host_name/host_type
+    null, sandbox_provider null, and not resumable — instead of crashing.
+    """
+    conv = Conversation(
+        id="conv_dead_host",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_dead_host",
+        agent_id="ag_test",
+        host_id="host_vanished",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_dead_host": conv},
+    )
+    host_store = _HostStore(None)
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_dead_host",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.host_name is None
+    assert snapshot.host_type is None
+    assert snapshot.sandbox_provider is None
+    assert snapshot.host_resumable is False
+    # The host_id is set, so the store IS consulted — it just returns None.
+    assert host_store.get_host_calls == ["host_vanished"]
