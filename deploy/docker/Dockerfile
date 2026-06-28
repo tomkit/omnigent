@@ -319,6 +319,13 @@ CMD ["sleep", "infinity"]
 # ── Server runtime (default target) ─────────────────────
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
+# Git-sha build identifier, passed by the publish workflow as the same short
+# sha that names the image tag (sha-<short>). Baked into the image as an env
+# var so GET /health can report which build is live. Empty by default for
+# local `docker build` runs — /health then degrades to "unknown".
+ARG OMNIGENT_BUILD_SHA=
+ENV OMNIGENT_BUILD_SHA=${OMNIGENT_BUILD_SHA}
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}"

@@ -1490,6 +1490,21 @@ class SessionResponse(BaseModel):
         path resumes the sandbox) versus the terminal ``host_offline``
         dead-end (reconnect from your machine / fork). ``False`` for
         non-managed or non-resumable hosts.
+    :param host_name: Display name of the bound host, e.g.
+        ``"corey-laptop"`` for an external host (the machine hostname)
+        or ``"managed-a1b2c3d4"`` for a managed sandbox. Read from the
+        host row already loaded for ``host_resumable`` (no extra query).
+        ``None`` when the session has no ``host_id`` or the host row is
+        missing.
+    :param host_type: Coarse session environment derived from the bound
+        host's ``sandbox_provider``: ``"managed"`` when the host is a
+        server-managed sandbox (``sandbox_provider`` non-null),
+        ``"local"`` for an external (user-connected) host. ``None`` when
+        the session has no ``host_id`` or the host row is missing.
+    :param sandbox_provider: Raw sandbox provider backing a managed
+        host, e.g. ``"daytona"`` / ``"modal"`` / ``"e2b"``, so clients
+        can label the provider by name. ``None`` for external (local /
+        remote) hosts and for sessions with no host binding.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -1667,6 +1682,9 @@ class SessionResponse(BaseModel):
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
+    host_name: str | None = None
+    host_type: Literal["managed", "local"] | None = None
+    sandbox_provider: str | None = None
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
