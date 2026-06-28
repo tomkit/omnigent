@@ -1310,6 +1310,26 @@ def _opencode_native_model_from_spec(agent_spec: Any | None) -> str | None:
         return None
 
 
+def _pi_native_model_from_spec(agent_spec: Any | None) -> str | None:
+    """
+    Resolve the pi-native default model from a resolved agent spec.
+
+    Used to pin a model id for the env-var credential fallback in managed
+    sandboxes (the environment carries credentials but no model).
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's executor model, or ``None``.
+    """
+    if agent_spec is None:
+        return None
+    try:
+        from omnigent.runtime.workflow import _resolve_spec_model
+
+        return _resolve_spec_model(getattr(agent_spec, "spec", agent_spec))
+    except Exception:  # noqa: BLE001 - model resolution is best effort.
+        return None
+
+
 def _opencode_native_profile_from_spec(agent_spec: Any | None) -> str | None:
     """
     Resolve the Databricks profile from a resolved agent spec, if any.
@@ -1614,7 +1634,12 @@ async def _auto_create_pi_terminal(
             resolve_pi_native_provider,
         )
 
-        provider = resolve_pi_native_provider()
+        # Thread the session's model (override, else the agent spec's model) so
+        # the env-var fallback — used in managed sandboxes that ship no
+        # config.yaml — can pin a model id (the environment names none).
+        provider = resolve_pi_native_provider(
+            model=launch_config.model_override or _pi_native_model_from_spec(agent_spec),
+        )
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)

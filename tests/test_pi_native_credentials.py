@@ -250,6 +250,38 @@ def test_openai_responses_wire_api_default() -> None:
     assert provider.model == "gpt-4o"
 
 
+def test_openai_no_wire_api_non_openai_url_defaults_to_completions() -> None:
+    """OpenAI family, no wire_api, non-OpenAI base URL → openai-completions.
+
+    Regression for the pi+Fireworks bug: a third-party OpenAI-compatible
+    provider configured without an explicit wire_api was resolving to
+    openai-responses, but Fireworks (and Groq/OpenRouter/…) only implement
+    Chat Completions and 404 on /responses. With no wire_api set, infer
+    Chat Completions for any non-OpenAI endpoint.
+    """
+    config = {
+        "providers": {
+            "fireworks": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "openai": {
+                    "base_url": "https://api.fireworks.ai/inference/v1",
+                    "api_key": "fw-test",
+                    "models": {"default": "accounts/fireworks/routers/glm-latest"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.api == "openai-completions", (
+        f"Expected openai-completions but got {provider.api} "
+        f"(non-OpenAI gateway with no wire_api should use chat completions)"
+    )
+    assert provider.base_url == "https://api.fireworks.ai/inference/v1"
+    assert provider.model == "accounts/fireworks/routers/glm-latest"
+
+
 def test_openai_responses_wire_api_explicit() -> None:
     """An OpenAI family with wire_api: responses → openai-responses API.
 
@@ -276,6 +308,131 @@ def test_openai_responses_wire_api_explicit() -> None:
     assert provider.api == "openai-responses"
     assert provider.base_url == "https://api.openai.com/v1"
     assert provider.model == "gpt-4o"
+
+
+def test_env_fallback_openai_base_url_resolves_to_completions() -> None:
+    """No config provider + injected OPENAI_BASE_URL/KEY → openai-completions.
+
+    Managed sandboxes (Daytona/Modal) ship no config.yaml and inject creds as
+    env vars. The fallback must build a Fireworks provider from
+    OPENAI_BASE_URL + OPENAI_API_KEY (the documented contract), using chat
+    completions for the non-OpenAI endpoint.
+    """
+    env = {
+        "OPENAI_BASE_URL": "https://api.fireworks.ai/inference/v1",
+        "OPENAI_API_KEY": "fw-test",
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="accounts/fireworks/routers/glm-latest",
+        config_loader=dict,
+        env=env,
+    )
+    assert provider is not None
+    assert provider.api == "openai-completions"
+    assert provider.base_url == "https://api.fireworks.ai/inference/v1"
+    assert provider.api_key == "fw-test"
+    assert provider.model == "accounts/fireworks/routers/glm-latest"
+    assert provider.auth_header is False
+
+
+def test_env_fallback_claude_model_uses_anthropic_when_both_keys() -> None:
+    """A Claude model id selects the Anthropic surface even with both keys."""
+    env = {
+        "ANTHROPIC_API_KEY": "sk-ant-test",
+        "OPENAI_API_KEY": "sk-openai-test",
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="claude-opus-4-8", config_loader=dict, env=env
+    )
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://api.anthropic.com"
+    assert provider.api_key == "sk-ant-test"
+    assert provider.auth_header is False
+
+
+def test_env_fallback_fireworks_model_uses_openai_when_both_keys() -> None:
+    """A non-Claude (Fireworks) model id selects the OpenAI surface.
+
+    Managed sandboxes inject both ANTHROPIC_API_KEY and OPENAI_API_KEY, so a
+    pi+Fireworks agent must NOT be hijacked onto the Anthropic endpoint — the
+    model id drives the surface.
+    """
+    env = {
+        "ANTHROPIC_API_KEY": "sk-ant-test",
+        "OPENAI_API_KEY": "fw-test",
+        "OPENAI_BASE_URL": "https://api.fireworks.ai/inference/v1",
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="accounts/fireworks/routers/glm-latest", config_loader=dict, env=env
+    )
+    assert provider is not None
+    assert provider.api == "openai-completions"
+    assert provider.base_url == "https://api.fireworks.ai/inference/v1"
+    assert provider.api_key == "fw-test"
+    assert provider.auth_header is False
+
+
+def test_env_fallback_falls_to_other_family_when_preferred_key_absent() -> None:
+    """A Claude model with only an OpenAI key still resolves (best effort)."""
+    env = {"OPENAI_API_KEY": "sk-openai-test"}
+    provider = creds.resolve_pi_native_provider(
+        model="claude-opus-4-8", config_loader=dict, env=env
+    )
+    assert provider is not None
+    assert provider.api == "openai-responses"  # default OpenAI endpoint
+    assert provider.api_key == "sk-openai-test"
+
+
+def test_env_fallback_anthropic_auth_token_uses_auth_header() -> None:
+    """A bare ANTHROPIC_AUTH_TOKEN (gateway) → bearer Authorization header."""
+    env = {
+        "ANTHROPIC_AUTH_TOKEN": "gw-bearer-token",
+        "ANTHROPIC_BASE_URL": "https://gw.example.com/anthropic",
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="claude-opus-4-8", config_loader=dict, env=env
+    )
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://gw.example.com/anthropic"
+    assert provider.api_key == "gw-bearer-token"
+    assert provider.auth_header is True
+
+
+def test_env_fallback_requires_model() -> None:
+    """Without a model, the env fallback returns None (no model to pin)."""
+    env = {"OPENAI_API_KEY": "sk-test"}
+    assert creds.resolve_pi_native_provider(config_loader=dict, env=env) is None
+
+
+def test_env_fallback_no_keys_returns_none() -> None:
+    """No config provider and no injected keys → None (Pi's own login)."""
+    assert creds.resolve_pi_native_provider(model="gpt-4o", config_loader=dict, env={}) is None
+
+
+def test_config_provider_wins_over_env_fallback() -> None:
+    """A usable config provider takes precedence over injected env vars."""
+    config = {
+        "providers": {
+            "fireworks": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "openai": {
+                    "base_url": "https://api.fireworks.ai/inference/v1",
+                    "api_key": "fw-config",
+                    "models": {"default": "accounts/fireworks/routers/glm-latest"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        config_loader=lambda: config,
+        env={"OPENAI_API_KEY": "sk-env", "OPENAI_BASE_URL": "https://api.openai.com/v1"},
+    )
+    assert provider is not None
+    assert provider.api_key == "fw-config"
+    assert provider.base_url == "https://api.fireworks.ai/inference/v1"
 
 
 def test_anthropic_family_ignores_wire_api() -> None:
