@@ -24,13 +24,41 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 
 
 @pytest.mark.asyncio
-async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
-    """GET /health returns HTTP 200 and ``{"status": "ok"}``."""
+async def test_health_returns_ok(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /health returns HTTP 200 with status ok + a build version.
+
+    With ``OMNIGENT_BUILD_SHA`` unset (the local/dev default), ``version``
+    degrades to ``"unknown"`` rather than crashing or omitting the field.
+    """
+    monkeypatch.delenv("OMNIGENT_BUILD_SHA", raising=False)
     resp = await client.get("/health")
     assert resp.status_code == 200
-    # Exact shape — a regression that changes the key name or value
+    # Exact shape — a regression that changes the key names or values
     # would break health-check integrations that parse this response.
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "version": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_health_reports_build_sha_version(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /health surfaces the baked-in build sha as ``version``.
+
+    The publish workflow bakes the git-sha image tag into the image as
+    ``OMNIGENT_BUILD_SHA``; ``/health`` echoes it so an operator can tell
+    which build is live. Read at request time, so setting the env var is
+    enough — no app rebuild.
+    """
+    monkeypatch.setenv("OMNIGENT_BUILD_SHA", "sha-6d4847d")
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["version"] == "sha-6d4847d"
 
 
 @pytest.mark.asyncio
@@ -383,19 +411,23 @@ async def test_info_includes_server_version(
 
 
 @pytest.mark.asyncio
-async def test_health_bare_returns_status_ok(db_uri: str, tmp_path: Path) -> None:
+async def test_health_bare_returns_status_ok(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    ``GET /health`` with no session params still returns the bare
-    ``{"status": "ok"}`` — the liveness rearchitecture must not break the
-    plain health-check integrations that parse this exact shape.
+    ``GET /health`` with no session params returns only status + version
+    (``{"status": "ok", "version": "unknown"}`` with no build sha set) —
+    the liveness rearchitecture must not leak session keys into the bare
+    shape that plain health-check integrations parse.
     """
+    monkeypatch.delenv("OMNIGENT_BUILD_SHA", raising=False)
     app = _build_liveness_app(db_uri, tmp_path).app
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get("/health")
     assert resp.status_code == 200
     # Exact shape — no session/sessions keys leak in when none were asked for.
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "version": "unknown"}
 
 
 @pytest.mark.asyncio

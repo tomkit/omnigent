@@ -312,6 +312,17 @@ export function AppShell() {
   // it lists the root's children plus a "main" entry, so the user
   // can move between siblings and back to the parent from one place.
   const isChildSession = activeSession?.parentSessionId != null;
+  // Where the session runs (managed sandbox vs local host), for the header
+  // env badge. Derived from the bound host on the snapshot; null when the
+  // session has no host binding (host_type absent) so the badge hides.
+  const hostEnv =
+    activeSession?.hostType != null
+      ? {
+          type: activeSession.hostType,
+          name: activeSession.hostName ?? null,
+          provider: activeSession.sandboxProvider ?? null,
+        }
+      : null;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
   // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
@@ -1089,6 +1100,7 @@ export function AppShell() {
                   parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
                   boundAgent={boundAgent}
+                  hostEnv={hostEnv}
                   canShare={canShare}
                   shareDisabled={shareDisabled}
                   shareDisabledReason={shareDisabledReason}
