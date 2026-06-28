@@ -1649,3 +1649,40 @@ async def test_session_snapshot_host_environment_absent_without_binding() -> Non
     assert snapshot.sandbox_provider is None
     # No host binding → the host store is never consulted.
     assert host_store.get_host_calls == []
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_host_environment_absent_when_host_row_missing() -> None:
+    """A host_id pointing at a missing host row degrades the env fields to null.
+
+    The session references a host that the store can no longer resolve (the
+    row was deleted / never registered on this replica). The snapshot must
+    still consult the store, then degrade gracefully — host_name/host_type
+    null, sandbox_provider null, and not resumable — instead of crashing.
+    """
+    conv = Conversation(
+        id="conv_dead_host",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_dead_host",
+        agent_id="ag_test",
+        host_id="host_vanished",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_dead_host": conv},
+    )
+    host_store = _HostStore(None)
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_dead_host",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.host_name is None
+    assert snapshot.host_type is None
+    assert snapshot.sandbox_provider is None
+    assert snapshot.host_resumable is False
+    # The host_id is set, so the store IS consulted — it just returns None.
+    assert host_store.get_host_calls == ["host_vanished"]

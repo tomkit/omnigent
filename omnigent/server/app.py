@@ -1607,8 +1607,9 @@ def create_app(
         """
         Liveness check with optional session-scoped runner status.
 
-        Without session params, returns ``{"status": "ok"}`` (bare
-        liveness). With ``session_id``, adds a single ``session``
+        Always returns ``status`` plus a ``version`` build identifier
+        (detailed below). Without session params that bare object is the
+        whole response. With ``session_id``, adds a single ``session``
         object. With ``session_ids`` (comma-separated), adds a
         ``sessions`` dict keyed by id — used by the sidebar to
         batch-check all visible sessions in one request. The batch
