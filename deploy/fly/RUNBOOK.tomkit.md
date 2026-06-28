@@ -97,6 +97,51 @@ carry over. If `OMNIGENT_CONFIG` ever needs re-setting it is
 `fly secrets set OMNIGENT_CONFIG="$(cat config.json)" -a omnigent-tomkit` — but
 that is NOT part of a normal image swap.
 
+## Managed-sandbox config (`/data/artifacts/config.yaml`)
+
+The server reads its app config from the file the `OMNIGENT_CONFIG` env var
+points at — `/data/artifacts/config.yaml`, **on the persistent volume** (not in
+git, not the secret store). It carries the `sandbox:` block that drives managed
+Daytona hosts. The live shape:
+
+```yaml
+sandbox:
+  provider: daytona
+  server_url: https://omnigent-daytona-relay.zz957kkf2k.workers.dev
+  daytona:
+    env: [OPENAI_API_KEY, OPENAI_BASE_URL, GIT_TOKEN, ANTHROPIC_API_KEY]
+    image: ghcr.io/tomkit/omnigent-host@sha256:<digest>   # the fork host image
+    idle_minutes: 30        # REQUIRED on free tier — see below
+```
+
+> [!IMPORTANT]
+> **`idle_minutes: 30` is not optional on the Daytona free tier.** Without it,
+> every managed host is created always-on (`auto_stop_interval=0`) and never
+> releases its slice of the **10 GiB org memory cap** — a few live sessions
+> exhaust the quota and *new* sandbox launches fail with
+> `Total memory limit exceeded. Maximum allowed: 10GiB`. With it, Daytona stops
+> an idle host after 30 min (freeing the memory) and the server's wake path
+> resumes it in place on the next message, reattaching the same workspace disk
+> (`auto_delete_interval` is pinned to disabled so the disk survives the stop).
+
+Editing it (the change is **not** picked up until the machine restarts):
+
+```bash
+# Back up, then edit in place over SSH (or fly ssh sftp get/put):
+fly ssh console -a omnigent-tomkit -C \
+  "/bin/sh -c 'cp /data/artifacts/config.yaml /data/artifacts/config.yaml.bak.$(date +%s)'"
+# …write the new file… then restart to load it:
+fly machine restart $(fly machines list -a omnigent-tomkit --json | jq -r '.[0].id') -a omnigent-tomkit
+```
+
+Verify it took effect by creating a managed session and inspecting the new
+sandbox: `auto_stop_interval` should read `30` (was `0`) and
+`auto_delete_interval` `-1` (disabled) via the Daytona SDK / dashboard.
+
+The host `image:` digest is bumped here whenever a new `omnigent-host` image is
+published (see the host-image half of `fork-publish-server.yml`); pin the
+immutable `@sha256:` digest, not `:latest`.
+
 ## Optional: enable auto-deploy on every fork `main` build
 
 The workflow has a `deploy-fly` job that is **inert unless a `FLY_API_TOKEN`
