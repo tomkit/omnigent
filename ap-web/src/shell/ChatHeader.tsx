@@ -1,11 +1,13 @@
 import {
   BotIcon,
   ChevronLeftIcon,
+  CloudIcon,
   EllipsisVerticalIcon,
   FileIcon,
   InfoIcon,
   ListIcon,
   ListTodoIcon,
+  MonitorIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
@@ -13,6 +15,7 @@ import {
   TerminalIcon,
 } from "lucide-react";
 import { Link } from "@/lib/routing";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -82,6 +85,64 @@ interface MobileSessionMenuProps {
 }
 
 /**
+ * The session's runtime environment, derived from the bound host on the
+ * session snapshot. `null` when the session has no host binding (a
+ * CLI/local session with no registered host) — the badge then renders
+ * nothing, so a host-less session looks exactly as it did before.
+ */
+interface HostEnv {
+  /** `"managed"` (server sandbox) or `"local"` (external host). */
+  type: "managed" | "local";
+  /** Host display name, e.g. ``"corey-laptop"`` / ``"managed-a1b2c3d4"``. */
+  name: string | null;
+  /** Sandbox provider for managed hosts, e.g. ``"daytona"``; `null` for local. */
+  provider: string | null;
+}
+
+/**
+ * A minimal pill telling the user where the session runs: the sandbox
+ * provider name (e.g. "Daytona") for managed sessions, or the machine
+ * hostname for a local / remote host. Mirrors the header's muted, glassy
+ * styling — `outline` for local, `secondary` for managed — so it reads as
+ * metadata, not a primary action. Renders nothing when `env` is absent.
+ */
+function HostEnvBadge({ env }: { env: HostEnv | null | undefined }) {
+  if (!env) return null;
+  const isManaged = env.type === "managed";
+  // Managed: prefer the provider name (capitalized) the user recognizes
+  // ("Daytona"), falling back to a neutral "Managed" when it's absent.
+  // Local/remote: the machine hostname, falling back to "Local".
+  const label = isManaged
+    ? env.provider
+      ? env.provider.charAt(0).toUpperCase() + env.provider.slice(1)
+      : "Managed"
+    : (env.name ?? "Local");
+  const Icon = isManaged ? CloudIcon : MonitorIcon;
+  // Tooltip carries the fuller story (host name on managed sessions, the
+  // raw type on local ones) without crowding the pill itself.
+  const tooltip = isManaged
+    ? env.name
+      ? `Managed sandbox · ${env.name}`
+      : "Managed sandbox"
+    : `Local host${env.name ? ` · ${env.name}` : ""}`;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant={isManaged ? "secondary" : "outline"}
+          className="max-w-40 gap-1 font-normal text-muted-foreground"
+          data-testid="session-host-env-badge"
+        >
+          <Icon className="size-3 shrink-0" />
+          <span className="truncate">{label}</span>
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
  * Props for {@link ChatHeader}. All state lives in AppShell; action
  * callbacks wrap the shell's dialog/panel setters so state ownership
  * stays in one place.
@@ -99,6 +160,12 @@ interface ChatHeaderProps {
   conversationId: string | undefined;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
+  /**
+   * The session's runtime environment (managed sandbox vs local host),
+   * derived from the bound host on the snapshot. `null`/undefined when the
+   * session has no host binding — the env badge then renders nothing.
+   */
+  hostEnv?: HostEnv | null;
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
   /** Open the share dialog. */
@@ -151,6 +218,7 @@ export function ChatHeader({
   parentSessionId,
   conversationId,
   boundAgent,
+  hostEnv,
   canShare,
   onShare,
   hasAgentInfo,
@@ -246,6 +314,12 @@ export function ChatHeader({
             </div>
           </>
         )}
+        {/* Where the session runs: the provider name for a managed sandbox
+            ("Daytona") or the machine hostname for a local/remote host. Sits
+            beside the agent identity on sub-agent sessions and after the
+            sidebar toggle on top-level ones; renders nothing without a host
+            binding. */}
+        {conversationId && <HostEnvBadge env={hostEnv} />}
       </div>
 
       <div className="flex items-center gap-1">
