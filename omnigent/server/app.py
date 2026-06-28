@@ -1617,8 +1617,9 @@ def create_app(
         """
         Liveness check with optional session-scoped runner status.
 
-        Without session params, returns ``{"status": "ok"}`` (bare
-        liveness). With ``session_id``, adds a single ``session``
+        Always returns ``status`` plus a ``version`` build identifier
+        (detailed below). Without session params that bare object is the
+        whole response. With ``session_id``, adds a single ``session``
         object. With ``session_ids`` (comma-separated), adds a
         ``sessions`` dict keyed by id — used by the sidebar to
         batch-check all visible sessions in one request. The batch
@@ -1634,15 +1635,25 @@ def create_app(
         :param session_ids: Optional comma-separated session ids
             for batch lookup, e.g.
             ``"conv_abc,conv_def,conv_ghi"``.
-        :returns: ``{"status": "ok"}`` with optional ``session``
-            and/or ``sessions`` fields. Each session object has shape
-            ``{"runner_online": bool, "host_online": bool | None,
-            "host_version": str | None}`` (the single ``session``
+        :returns: ``{"status": "ok", "version": "<sha>"}`` with optional
+            ``session`` and/or ``sessions`` fields. ``version`` is the
+            git-sha build identifier baked into the image at build time
+            (the ``OMNIGENT_BUILD_SHA`` env var, e.g. ``"sha-6d4847d"``),
+            or ``"unknown"`` when unset (local/dev). Each session object
+            has shape ``{"runner_online": bool, "host_online": bool |
+            None, "host_version": str | None}`` (the single ``session``
             object also includes its ``id``). ``host_version`` is the
             bound host's reported version, or ``None`` when there's no
             host binding / the version isn't resolvable on this replica.
         """
-        result: dict[str, Any] = {"status": "ok"}
+        # Build-sha image tag baked in by the publish workflow (see
+        # deploy/docker/Dockerfile + fork-publish-server.yml). Degrades to
+        # "unknown" for local/dev runs where the env var is unset — never
+        # raises, so the liveness probe always answers.
+        result: dict[str, Any] = {
+            "status": "ok",
+            "version": os.environ.get("OMNIGENT_BUILD_SHA") or "unknown",
+        }
         batch_ids = [s.strip() for s in session_ids.split(",") if s.strip()] if session_ids else []
         # Resolve every requested id (single + batch) in ONE lookup. The
         # online-dot lookups hit the database (conversations + hosts
