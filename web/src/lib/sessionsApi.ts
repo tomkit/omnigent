@@ -117,6 +117,23 @@ interface SessionResponseWire {
    * Absent/`false` for non-managed/non-resumable hosts.
    */
   host_resumable?: boolean;
+  /**
+   * Display name of the bound host (the host row's `name`), e.g.
+   * ``"corey-laptop"`` or ``"managed-a1b2c3d4"``. ``null``/absent when
+   * the session has no host binding or the host row is missing.
+   */
+  host_name?: string | null;
+  /**
+   * Coarse session environment derived from the host's sandbox provider:
+   * ``"managed"`` for a server-managed sandbox, ``"local"`` for an
+   * external host. ``null``/absent when there's no host binding.
+   */
+  host_type?: "managed" | "local" | null;
+  /**
+   * Raw sandbox provider of the bound host, e.g. ``"daytona"``. ``null``/
+   * absent for external hosts and host-less sessions.
+   */
+  sandbox_provider?: string | null;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -283,6 +300,9 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
     hostResumable: wire.host_resumable ?? false,
+    hostName: wire.host_name ?? null,
+    hostType: wire.host_type ?? null,
+    sandboxProvider: wire.sandbox_provider ?? null,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     createdAt: wire.created_at,
