@@ -53,6 +53,7 @@ from omnigent.onboarding.provider_config import (
     ProviderEntry,
     default_provider_for_harness,
     first_available_provider,
+    get_default_provider,
     harness_family,
     load_config,
     load_providers,
@@ -860,10 +861,15 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
             "'openai' family in your shell, then retry.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # pi carries a single credential: anthropic's when present, else openai's.
-    # The model fallback must match the family that supplied that credential.
+    # pi carries a single credential. When both families resolve (a sandbox
+    # commonly injects ANTHROPIC_API_KEY *and* OPENAI_API_KEY), the model picks
+    # the family: a Claude model id uses Anthropic, anything else uses OpenAI —
+    # so a pi+Fireworks agent (e.g. ``accounts/fireworks/...``) isn't hijacked
+    # onto the Anthropic endpoint. With only one family present, use it.
     auth_source: FamilyConfig | None
-    if anthropic is not None:
+    pinned_model = env.get("HARNESS_PI_MODEL")
+    prefer_anthropic = pinned_model is not None and "claude" in pinned_model.lower()
+    if anthropic is not None and (prefer_anthropic or openai is None):
         auth_source = anthropic
         auth_family = ANTHROPIC_FAMILY
     else:
@@ -1087,6 +1093,16 @@ def _resolve_provider_for_build(
         # The model name itself signals Databricks intent (no pinned profile).
         return _legacy_databricks_provider(None, harness_type=harness_type, for_launch=for_launch)
     effective = effective_config_with_detected(explicit_config)
+    # pi consumes both families. When a sandbox injects BOTH an anthropic and an
+    # openai key (ambient detection finds two providers), the model picks which
+    # family to route — a Claude id → anthropic, anything else → openai — so a
+    # pi+Fireworks model isn't hijacked onto an ambient Anthropic key by the
+    # anthropic-first fallback in :func:`default_provider_for_harness`.
+    if harness_type == "pi" and model is not None:
+        preferred = ANTHROPIC_FAMILY if "claude" in model.lower() else OPENAI_FAMILY
+        by_model = get_default_provider(effective, preferred)
+        if by_model is not None:
+            return by_model
     ambient_default = default_provider_for_harness(effective, harness)
     if ambient_default is not None:
         return ambient_default
