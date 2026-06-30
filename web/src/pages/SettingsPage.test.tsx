@@ -974,6 +974,10 @@ describe("SettingsPage", () => {
     expect(link).toHaveTextContent("sha-ff243ad");
     expect(link).toHaveAttribute("href", "https://github.com/tomkit/omnigent/commit/ff243ad");
 
+    // The git ref/branch the image was built from renders its own row.
+    expect(screen.getByText("Ref")).toBeInTheDocument();
+    expect(screen.getByText("main")).toBeInTheDocument();
+
     // "Last deployed" (process start) shows the 3-minutes-ago relative hint.
     expect(screen.getByText("(3m ago)")).toBeInTheDocument();
   });
@@ -985,7 +989,7 @@ describe("SettingsPage", () => {
     expect(screen.getByRole("heading", { name: "Build & deployment" })).toBeInTheDocument();
     // No commit link when sha is absent.
     expect(screen.queryByTestId("build-commit-link")).toBeNull();
-    // Every field degrades to the muted "Unknown" placeholder.
-    expect(screen.getAllByText("Unknown").length).toBeGreaterThanOrEqual(4);
+    // Every field degrades to the muted "Unknown" placeholder (incl. Ref).
+    expect(screen.getAllByText("Unknown").length).toBeGreaterThanOrEqual(5);
   });
 });
