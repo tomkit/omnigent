@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response
@@ -92,7 +93,42 @@ _logger = logging.getLogger(__name__)
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 
-def _build_provenance() -> dict[str, str | None]:
+class BuildProvenance(BaseModel):
+    """Build & deploy provenance for the running server.
+
+    Backs the web UI's "Build & Deployment" panel. Every field except
+    ``started_at`` degrades to ``None`` on an unstamped local/dev build;
+    ``started_at`` (this process's boot time) is always set. See
+    :func:`_build_provenance`.
+    """
+
+    version: str | None
+    sha: str | None
+    build_time: str | None
+    ref: str | None
+    started_at: str
+
+
+class InfoResponse(BaseModel):
+    """Runtime capabilities probe payload returned by ``GET /v1/info``.
+
+    Drives conditional route registration and chrome on the SPA side and
+    carries build & deploy provenance for the "Build & Deployment" panel.
+    See the ``/v1/info`` handler for the meaning of each field.
+    """
+
+    accounts_enabled: bool
+    login_url: str | None
+    needs_setup: bool
+    databricks_features: bool
+    managed_sandboxes_enabled: bool
+    sandbox_provider: str | None
+    server_version: str
+    smart_routing_enabled: bool
+    build: BuildProvenance
+
+
+def _build_provenance() -> BuildProvenance:
     """Collect build & deploy provenance for the running server.
 
     Backs the web UI's "Build & Deployment" panel and lets an operator verify
@@ -110,7 +146,7 @@ def _build_provenance() -> dict[str, str | None]:
       (``OMNIGENT_BUILD_REF`` env).
     * ``started_at`` — ISO-8601 UTC instant THIS process booted; always set.
 
-    :returns: A flat ``str | None`` dict with the keys above.
+    :returns: A :class:`BuildProvenance` with the fields above.
     """
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
@@ -119,13 +155,13 @@ def _build_provenance() -> dict[str, str | None]:
         version: str | None = _pkg_version("omnigent")
     except PackageNotFoundError:  # pragma: no cover - package always installed in CI
         version = None
-    return {
-        "version": version,
-        "sha": os.environ.get("OMNIGENT_BUILD_SHA") or None,
-        "build_time": os.environ.get("OMNIGENT_BUILD_TIME") or None,
-        "ref": os.environ.get("OMNIGENT_BUILD_REF") or None,
-        "started_at": _PROCESS_STARTED_AT.isoformat(),
-    }
+    return BuildProvenance(
+        version=version,
+        sha=os.environ.get("OMNIGENT_BUILD_SHA") or None,
+        build_time=os.environ.get("OMNIGENT_BUILD_TIME") or None,
+        ref=os.environ.get("OMNIGENT_BUILD_REF") or None,
+        started_at=_PROCESS_STARTED_AT.isoformat(),
+    )
 
 
 def _server_version() -> str:
@@ -1744,7 +1780,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, Any]:
+    async def info() -> InfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1830,22 +1866,22 @@ def create_app(
             )
         except ImportError:
             smart_routing_enabled = False
-        return {
-            "accounts_enabled": accounts_enabled,
-            "login_url": login_url,
-            "needs_setup": needs_setup,
-            "databricks_features": databricks_features,
-            "managed_sandboxes_enabled": managed_sandboxes_enabled,
-            "sandbox_provider": sandbox_provider,
-            "server_version": _server_version(),
-            "smart_routing_enabled": smart_routing_enabled,
+        return InfoResponse(
+            accounts_enabled=accounts_enabled,
+            login_url=login_url,
+            needs_setup=needs_setup,
+            databricks_features=databricks_features,
+            managed_sandboxes_enabled=managed_sandboxes_enabled,
+            sandbox_provider=sandbox_provider,
+            server_version=_server_version(),
+            smart_routing_enabled=smart_routing_enabled,
             # Build & deploy provenance for the web UI's "Build & Deployment"
             # panel: {version, sha, build_time, started_at, ref}. started_at is
             # the per-process boot time (changes on every redeploy/restart);
             # the rest come from the image's stamped build metadata. All fields
             # degrade to null when unstamped (local/dev). See _build_provenance.
-            "build": _build_provenance(),
-        }
+            build=_build_provenance(),
+        )
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
     async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
