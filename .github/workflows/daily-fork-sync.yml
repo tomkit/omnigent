@@ -32,11 +32,12 @@
 #                                               force_deploy (see below).
 #
 # Required secrets (repo Settings -> Secrets and variables -> Actions):
-#   * ANTHROPIC_API_KEY — the API key the conflict-resolver step reads to
-#     authenticate the headless `claude` CLI. (CLAUDE_CODE_OAUTH_TOKEN is a
-#     supported alternative for Claude subscribers, but this workflow is wired
-#     to ANTHROPIC_API_KEY — see the resolver step below.) Deploy secrets like
-#     FLY_API_TOKEN live with fork-publish-server.yml, NOT here.
+#   * FIREWORKS_API_KEY — the conflict-resolver step reads this to authenticate
+#     the headless `claude` CLI against Fireworks' Anthropic-compatible endpoint
+#     (it is passed as ANTHROPIC_AUTH_TOKEN). We resolve on Fireworks/GLM rather
+#     than Anthropic because the Anthropic key is quota-capped; this is scoped to
+#     the resolver only — the deployed managed/Daytona agents stay on Claude.
+#     Deploy secrets like FLY_API_TOKEN live with fork-publish-server.yml, NOT here.
 name: daily-fork-sync
 
 on:
@@ -161,13 +162,23 @@ jobs:
       - name: Resolve rebase conflicts (shell-driven loop, Claude edits files)
         if: steps.rebase.outputs.outcome == 'conflict'
         env:
-          # This workflow authenticates with a pay-as-you-go API key. We map ONLY
-          # ANTHROPIC_API_KEY (not CLAUDE_CODE_OAUTH_TOKEN): an unset OAuth-token
-          # secret would map to an EMPTY env var, and an empty OAuth token could
-          # take precedence over / conflict with the API key in the CLI's auth
-          # resolution. resolve-rebase.sh accepts either var, so the API key alone
-          # is sufficient. (Subscribers can swap to CLAUDE_CODE_OAUTH_TOKEN.)
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Resolve conflicts on FIREWORKS (serving GLM), NOT Anthropic. The
+          # headless `claude` CLI speaks the Anthropic Messages API and Fireworks
+          # exposes an Anthropic-compatible endpoint at
+          # ${ANTHROPIC_BASE_URL}/v1/messages, so we point Claude Code straight at
+          # it — no translation proxy. We switched off Anthropic because its key
+          # is quota-capped; Fireworks has more headroom. This is scoped to THIS
+          # step only — the deployed managed/Daytona agents stay on Claude.
+          #
+          # Auth is the Fireworks key sent as a bearer token via
+          # ANTHROPIC_AUTH_TOKEN (passed by env only, never logged). The model is
+          # Fireworks' latest GLM ("glm-latest" -> glm-5p2, fully-qualified);
+          # ANTHROPIC_SMALL_FAST_MODEL is pinned to the same id so the CLI's
+          # background/"haiku" calls don't try to reach a non-existent model.
+          ANTHROPIC_BASE_URL: https://api.fireworks.ai/inference
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.FIREWORKS_API_KEY }}
+          ANTHROPIC_MODEL: accounts/fireworks/models/glm-5p2
+          ANTHROPIC_SMALL_FAST_MODEL: accounts/fireworks/models/glm-5p2
           MAX_ITERS: "20"
         run: bash "${RUNNER_TEMP}/forkscripts/resolve-rebase.sh"
 
