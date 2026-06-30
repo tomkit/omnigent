@@ -168,6 +168,25 @@ jobs:
           echo "outcome=$outcome" >>"$GITHUB_OUTPUT"
           echo "Final sync outcome: $outcome"
 
+      # ---- Orphan guard (fork-only defense-in-depth) ----
+      # git's rename detection relocates our MODIFIED files when upstream renames
+      # or deletes a directory, and surfaces normal content conflicts the resolver
+      # handles. The one SILENT failure mode is a fork-ADDED file in a brand-new
+      # subdirectory under a renamed-away/deleted tree: it replays with no
+      # conflict, so neither resolve-rebase.sh (which only sees git-unmerged "U"
+      # files) nor the verify step catches it, and it lands tracked under a path
+      # that no longer exists upstream. This step fails the job BEFORE any push if
+      # such an orphan exists. It runs on BOTH the clean and conflict-resolved
+      # outcomes — critically the CLEAN path, which has no verify step and
+      # force-pushes main (auto-deploying via fork-publish-server.yml). noop moves
+      # nothing, so it is skipped.
+      - name: Check for orphaned files under upstream-removed directories
+        if: steps.decide.outputs.outcome == 'clean' || steps.decide.outputs.outcome == 'conflict-resolved'
+        env:
+          UPSTREAM_REF: ${{ env.UPSTREAM_REMOTE }}/${{ env.UPSTREAM_BRANCH }}
+          HEAD_BEFORE: ${{ steps.rebase.outputs.head_before }}
+        run: bash .github/scripts/check-no-orphans.sh
+
       # ---- Publish ----
       # We never deploy here. Pushing `main` is the deploy trigger: any push to
       # `main` is built + deployed by fork-publish-server.yml. So:
