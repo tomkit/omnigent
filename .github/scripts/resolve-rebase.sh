@@ -41,9 +41,28 @@ progress_sig() {
   echo "$(git rev-parse HEAD 2>/dev/null || echo none)-${msgnum}"
 }
 
-# Advance a paused rebase by one step, tolerating the "became empty" case.
+# Advance a paused rebase by one step.
+#
+# CRITICAL: `git rebase --continue` exits NON-ZERO in the normal multi-commit
+# case. After it commits the step we just resolved, it keeps replaying and, if
+# the NEXT commit also conflicts, it stops there and returns non-zero. That is
+# not a failure — it is progress, and our rebases ALWAYS have several conflicting
+# commits. So a non-zero exit is only fatal when the rebase did NOT advance.
+# We distinguish three outcomes:
+#   * exit 0                          -> this step (and any trailing clean ones)
+#                                        applied; may or may not still be rebasing.
+#   * non-zero, "became empty"        -> the resolved commit is now empty; skip it.
+#   * non-zero, but the rebase moved  -> it paused at the NEXT conflicting commit;
+#     (HEAD/step advanced, fresh U's)    let the outer loop resolve that batch.
+#   * non-zero, no progress           -> a genuine error (e.g. still-unmerged
+#                                        paths); fail loudly.
+#
+# GIT_EDITOR / GIT_SEQUENCE_EDITOR are forced to `true` so --continue never hangs
+# waiting on the commit-message editor (or, defensively, any todo-list editor).
 continue_rebase() {
-  if GIT_EDITOR=true git rebase --continue >"$CONT_LOG" 2>&1; then
+  local before after
+  before="$(progress_sig)"
+  if GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true git rebase --continue >"$CONT_LOG" 2>&1; then
     return 0
   fi
   # Match git's specific "this commit became empty" phrasings only, so an
@@ -52,11 +71,22 @@ continue_rebase() {
   # commit", or "... is now empty" / "would make it empty" / "becomes empty".
   if grep -qiE 'no changes|nothing to commit|(is now|becomes|make it) empty' "$CONT_LOG"; then
     echo "resolve-rebase: step became empty; skipping."
-    git rebase --skip >"$CONT_LOG" 2>&1 || {
+    GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true git rebase --skip >"$CONT_LOG" 2>&1 || {
       echo "::error::git rebase --skip failed"; cat "$CONT_LOG"; return 1; }
     return 0
   fi
-  echo "::error::git rebase --continue failed unexpectedly"; cat "$CONT_LOG"
+  # The resolved step committed and the rebase advanced, then paused at the NEXT
+  # conflicting commit. Require real forward motion (the progress signature moved)
+  # AND a still-active rebase with a fresh batch of unmerged files, so a genuine
+  # "cannot continue" error (no movement) still falls through to the fatal path.
+  after="$(progress_sig)"
+  if in_rebase && [ "$after" != "$before" ] \
+     && [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+    echo "resolve-rebase: advanced; paused at the next conflicting commit."
+    cat "$CONT_LOG"
+    return 0
+  fi
+  echo "::error::git rebase --continue failed unexpectedly (no progress)"; cat "$CONT_LOG"
   return 1
 }
 
