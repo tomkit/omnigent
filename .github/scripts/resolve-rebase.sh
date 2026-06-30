@@ -111,6 +111,7 @@ Requirements:
 - Fork custom work to preserve: daytona managed-sandbox idle-suspend/resume +
   bidirectional context sync, the Fly server image / deploy config, and the
   polly worker-routing policy.
+- If upstream renamed a directory, place resolved files at the NEW path, not the old one.
 - Edit files ONLY. Do NOT run git or any shell command. Do NOT add, commit,
   continue, abort, or push — the surrounding script does all git operations.
 When done, every listed file must contain zero conflict markers."
