@@ -20,7 +20,7 @@ import {
   resetLandingDraft,
 } from "./NewChatDialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import type { ServerInfo } from "@/lib/capabilities";
+import { BUILD_OFF, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   useHostModelOptions,
@@ -694,6 +694,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    build: BUILD_OFF,
     ...infoOverrides,
   };
   return render(
