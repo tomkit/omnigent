@@ -1,6 +1,7 @@
-# Daily fork sync — keep this fork (tomkit/omnigent) rebased on upstream
-# (omnigent-ai/omnigent) WITHOUT losing the fork's custom commits, with Claude
-# Code in the loop to resolve any rebase conflicts.
+# Daily fork sync — keep this fork (tomkit/omnigent) rebased on upstream's
+# (omnigent-ai/omnigent) LATEST STABLE RELEASE TAG (not the moving tip of
+# upstream/main) WITHOUT losing the fork's custom commits, with Claude Code in
+# the loop to resolve any rebase conflicts.
 #
 # This workflow does NOT deploy. Deploy is owned entirely by
 # .github/workflows/fork-publish-server.yml, which on every push to `main`
@@ -11,9 +12,13 @@
 #
 # Remote naming INSIDE the runner (note: different from a local dev clone):
 #   origin   = THIS fork (tomkit/omnigent)        <- we push here
-#   upstream = omnigent-ai/omnigent (added below) <- we rebase onto here
+#   upstream = omnigent-ai/omnigent (added below) <- we rebase onto its latest
+#                                                    stable release tag
 #
 # Outcome policy (SAFE by default):
+#   * No stable release published upstream   -> do nothing (short-circuits before
+#                                               any rebase / Claude work).
+#   * Latest release already in our history  -> do nothing (noop).
 #   * Nothing new upstream (noop)            -> do nothing.
 #   * Clean rebase (no conflicts)            -> force-push main. That push alone
 #                                               triggers fork-publish-server.yml
@@ -27,11 +32,12 @@
 #                                               force_deploy (see below).
 #
 # Required secrets (repo Settings -> Secrets and variables -> Actions):
-#   * ANTHROPIC_API_KEY — the API key the conflict-resolver step reads to
-#     authenticate the headless `claude` CLI. (CLAUDE_CODE_OAUTH_TOKEN is a
-#     supported alternative for Claude subscribers, but this workflow is wired
-#     to ANTHROPIC_API_KEY — see the resolver step below.) Deploy secrets like
-#     FLY_API_TOKEN live with fork-publish-server.yml, NOT here.
+#   * FIREWORKS_API_KEY — the conflict-resolver step reads this to authenticate
+#     the headless `claude` CLI against Fireworks' Anthropic-compatible endpoint
+#     (it is passed as ANTHROPIC_AUTH_TOKEN). We resolve on Fireworks/GLM rather
+#     than Anthropic because the Anthropic key is quota-capped; this is scoped to
+#     the resolver only — the deployed managed/Daytona agents stay on Claude.
+#     Deploy secrets like FLY_API_TOKEN live with fork-publish-server.yml, NOT here.
 name: daily-fork-sync
 
 on:
@@ -107,21 +113,35 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/forkscripts"
-          cp -p .github/scripts/rebase-fork.sh \
+          cp -p .github/scripts/resolve-release-tag.sh \
+                .github/scripts/rebase-fork.sh \
                 .github/scripts/resolve-rebase.sh \
                 .github/scripts/check-no-orphans.sh \
                 "${RUNNER_TEMP}/forkscripts/"
           chmod +x "${RUNNER_TEMP}/forkscripts/"*.sh
           ls -l "${RUNNER_TEMP}/forkscripts/"
 
-      - name: Add upstream remote and fetch
+      # Resolve upstream's latest STABLE release tag and fetch ONLY that tag.
+      # If upstream has no published stable release, the script emits an empty
+      # `tag` output and the rest of the job is skipped (a clean no-op) — we do
+      # NOT fall back to rebasing onto main. This runs BEFORE the Claude CLI
+      # install / any heavy work, so a no-release (and, via the rebase step's
+      # ancestor check, a no-new-release) run exits fast and spends no Claude
+      # API quota.
+      - name: Add upstream remote and resolve latest stable release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git remote add "${UPSTREAM_REMOTE}" "${UPSTREAM_URL}" 2>/dev/null \
             || git remote set-url "${UPSTREAM_REMOTE}" "${UPSTREAM_URL}"
-          git fetch --no-tags "${UPSTREAM_REMOTE}" "${UPSTREAM_BRANCH}"
+          bash "${RUNNER_TEMP}/forkscripts/resolve-release-tag.sh"
 
-      - name: Attempt rebase
+      - name: Attempt rebase onto release tag
         id: rebase
+        if: steps.release.outputs.tag != ''
+        env:
+          UPSTREAM_RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: bash "${RUNNER_TEMP}/forkscripts/rebase-fork.sh"
 
       # ---- Claude in the loop: only when the rebase paused on conflicts ----
@@ -142,18 +162,31 @@ jobs:
       - name: Resolve rebase conflicts (shell-driven loop, Claude edits files)
         if: steps.rebase.outputs.outcome == 'conflict'
         env:
-          # This workflow authenticates with a pay-as-you-go API key. We map ONLY
-          # ANTHROPIC_API_KEY (not CLAUDE_CODE_OAUTH_TOKEN): an unset OAuth-token
-          # secret would map to an EMPTY env var, and an empty OAuth token could
-          # take precedence over / conflict with the API key in the CLI's auth
-          # resolution. resolve-rebase.sh accepts either var, so the API key alone
-          # is sufficient. (Subscribers can swap to CLAUDE_CODE_OAUTH_TOKEN.)
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Resolve conflicts on FIREWORKS (serving GLM), NOT Anthropic. The
+          # headless `claude` CLI speaks the Anthropic Messages API and Fireworks
+          # exposes an Anthropic-compatible endpoint at
+          # ${ANTHROPIC_BASE_URL}/v1/messages, so we point Claude Code straight at
+          # it — no translation proxy. We switched off Anthropic because its key
+          # is quota-capped; Fireworks has more headroom. This is scoped to THIS
+          # step only — the deployed managed/Daytona agents stay on Claude.
+          #
+          # Auth is the Fireworks key sent as a bearer token via
+          # ANTHROPIC_AUTH_TOKEN (passed by env only, never logged). The model is
+          # Fireworks' latest GLM ("glm-latest" -> glm-5p2, fully-qualified);
+          # ANTHROPIC_SMALL_FAST_MODEL is pinned to the same id so the CLI's
+          # background/"haiku" calls don't try to reach a non-existent model.
+          ANTHROPIC_BASE_URL: https://api.fireworks.ai/inference
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.FIREWORKS_API_KEY }}
+          ANTHROPIC_MODEL: accounts/fireworks/models/glm-5p2
+          ANTHROPIC_SMALL_FAST_MODEL: accounts/fireworks/models/glm-5p2
           MAX_ITERS: "20"
         run: bash "${RUNNER_TEMP}/forkscripts/resolve-rebase.sh"
 
       - name: Verify rebase completed and landed on upstream
         if: steps.rebase.outputs.outcome == 'conflict'
+        env:
+          UPSTREAM_REF: refs/tags/${{ steps.release.outputs.tag }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           if [ -d "$(git rev-parse --git-path rebase-merge)" ] || \
              [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
@@ -169,8 +202,8 @@ jobs:
           # Prove the rebase actually landed on upstream: upstream must be an
           # ancestor of HEAD AND HEAD must have moved from where we started. This
           # stops an aborted/empty resolution from masquerading as success.
-          if ! git merge-base --is-ancestor "${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}" HEAD; then
-            echo "::error::HEAD is not a descendant of ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH} — rebase did not land on upstream."
+          if ! git merge-base --is-ancestor "${UPSTREAM_REF}" HEAD; then
+            echo "::error::HEAD is not a descendant of release ${RELEASE_TAG} — rebase did not land on the release tag."
             exit 1
           fi
           if [ "$(git rev-parse HEAD)" = "${{ steps.rebase.outputs.head_before }}" ]; then
@@ -181,6 +214,7 @@ jobs:
 
       - name: Decide outcome
         id: decide
+        if: steps.release.outputs.tag != ''
         run: |
           raw="${{ steps.rebase.outputs.outcome }}"
           case "$raw" in
@@ -207,7 +241,7 @@ jobs:
       - name: Check for orphaned files under upstream-removed directories
         if: steps.decide.outputs.outcome == 'clean' || steps.decide.outputs.outcome == 'conflict-resolved'
         env:
-          UPSTREAM_REF: ${{ env.UPSTREAM_REMOTE }}/${{ env.UPSTREAM_BRANCH }}
+          UPSTREAM_REF: refs/tags/${{ steps.release.outputs.tag }}
           HEAD_BEFORE: ${{ steps.rebase.outputs.head_before }}
         run: bash "${RUNNER_TEMP}/forkscripts/check-no-orphans.sh"
 
@@ -222,17 +256,19 @@ jobs:
       #                         (triggering build + deploy) and skip the PR.
       - name: Publish result
         id: publish
+        if: steps.release.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           outcome="${{ steps.decide.outputs.outcome }}"
           sha="$(git rev-parse HEAD)"
 
           if [ "$outcome" = "noop" ]; then
-            echo "Nothing new from upstream — no push."
-            echo "### Daily fork sync: up to date :white_check_mark:" >>"$GITHUB_STEP_SUMMARY"
+            echo "Already on latest upstream release ${RELEASE_TAG} — no push."
+            echo "### Daily fork sync: up to date on release \`${RELEASE_TAG}\` :white_check_mark:" >>"$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -269,7 +305,7 @@ jobs:
           # only way to deploy it is to merge this PR, which triggers the publish
           # workflow). The ONLY tolerated failure is "a PR already exists for this
           # branch" (e.g. a re-run): we detect that specifically and reuse the URL.
-          body="Automated daily rebase of \`${FORK_BRANCH}\` onto \`${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}\`. Conflicts were resolved by Claude Code in CI. **Review the resolution before merging** — merging this PR pushes \`${FORK_BRANCH}\`, which triggers build + deploy via fork-publish-server.yml. (To bypass this gate, re-run the workflow with force_deploy=true.)"
+          body="Automated daily rebase of \`${FORK_BRANCH}\` onto upstream release \`${RELEASE_TAG}\`. Conflicts were resolved by Claude Code in CI. **Review the resolution before merging** — merging this PR pushes \`${FORK_BRANCH}\`, which triggers build + deploy via fork-publish-server.yml. (To bypass this gate, re-run the workflow with force_deploy=true.)"
           if pr_url="$(gh pr create \
                 --base "${FORK_BRANCH}" \
                 --head "${branch}" \

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# rebase-fork.sh — attempt to rebase the fork's custom commits onto the
-# upstream default branch, and report the outcome to the caller.
+# rebase-fork.sh — attempt to rebase the fork's custom commits onto upstream's
+# latest STABLE release tag (resolved by resolve-release-tag.sh and passed in via
+# UPSTREAM_RELEASE_TAG), and report the outcome to the caller.
 #
 # This is the deterministic, non-AI part of the daily fork sync (see
 # .github/workflows/daily-fork-sync.yml). It runs `git rebase` once; if that
@@ -15,13 +16,25 @@
 #   head_before=<sha> / head_after=<sha>
 #
 # Env in:
-#   UPSTREAM_REMOTE   (default: upstream)
-#   UPSTREAM_BRANCH   (default: main)
+#   UPSTREAM_RELEASE_TAG  — the upstream stable release tag to rebase onto (e.g.
+#                           "v1.2.3"). When set, the rebase target is
+#                           refs/tags/<tag>. This is the normal path.
+#   UPSTREAM_REMOTE       (default: upstream) — fallback only.
+#   UPSTREAM_BRANCH       (default: main)     — fallback only: if no release tag
+#                           is supplied, target ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}.
 set -uo pipefail
 
 UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
-UPSTREAM_REF="${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}"
+UPSTREAM_RELEASE_TAG="${UPSTREAM_RELEASE_TAG:-}"
+
+# Rebase target is the release tag when one was resolved; otherwise fall back to
+# the upstream branch tip (kept for non-release code paths / local testing).
+if [ -n "$UPSTREAM_RELEASE_TAG" ]; then
+  UPSTREAM_REF="refs/tags/${UPSTREAM_RELEASE_TAG}"
+else
+  UPSTREAM_REF="${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}"
+fi
 
 emit() {
   echo "rebase-fork: $1"
@@ -53,7 +66,11 @@ emit "head_before=${HEAD_BEFORE}"
 if git merge-base --is-ancestor "$UPSTREAM_REF" HEAD; then
   emit "head_after=${HEAD_BEFORE}"
   emit "outcome=noop"
-  echo "rebase-fork: fork already up to date with ${UPSTREAM_REF}; nothing to do."
+  if [ -n "$UPSTREAM_RELEASE_TAG" ]; then
+    echo "rebase-fork: already on latest release ${UPSTREAM_RELEASE_TAG}; nothing to do."
+  else
+    echo "rebase-fork: fork already up to date with ${UPSTREAM_REF}; nothing to do."
+  fi
   exit 0
 fi
 
