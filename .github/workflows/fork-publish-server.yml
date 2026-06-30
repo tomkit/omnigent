@@ -207,7 +207,12 @@ jobs:
     timeout-minutes: 20
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: omnigent-tomkit
+      # Immutable per-commit SERVER image rolled out to the Fly machine.
       IMAGE_REF: ghcr.io/tomkit/omnigent-server:sha-${{ needs.build-and-push.outputs.short-sha }}
+      # The /health version string the freshly-deployed server must report.
+      EXPECTED_VERSION: sha-${{ needs.build-and-push.outputs.short-sha }}
+      HEALTH_URL: https://omnigent-tomkit.fly.dev/health
     steps:
       - name: Decide whether to deploy
         id: gate
@@ -229,16 +234,177 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be  # v1.5
 
-      # Deploys the immutable per-commit image. Preserves the live machine's
-      # volume mount, internal port, and health checks because fly.tomkit.toml
-      # mirrors them exactly and `fly deploy` only swaps the image. Requires the
-      # GHCR package to be PUBLIC (or Fly registry creds configured) so the
-      # remote builder can pull it.
+      # ROLLBACK CAPTURE — snapshot the CURRENTLY-LIVE state BEFORE mutating
+      # anything, so a failed health check can restore it. Two things change in
+      # this job: (a) the SERVER image on the Fly machine, and (b) the
+      # OMNIGENT_DAYTONA_HOST_IMAGE Fly secret that managed Daytona sandboxes
+      # read. We record the prior value of BOTH here.
+      #
+      # SECRET-READBACK LIMITATION: `flyctl secrets list` shows only secret
+      # NAMES + value digests, never the plaintext — so the prior host image
+      # CANNOT be recovered from the secrets API at rollback time. It CAN be
+      # read from the running machine's process env via `printenv` over
+      # `flyctl ssh console` (the secret is injected into the process env),
+      # which we attempt best-effort here. If the ssh probe fails (no wireguard
+      # / ssh not provisioned on the CI runner), prev_host_image is left empty
+      # and rollback will NOT restore the host secret — see the rollback step.
+      - name: Capture pre-deploy state for rollback
+        id: prev
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          # Prior SERVER image — reliably readable from the Fly API. Pin by
+          # digest when available (immutable), else fall back to the tag.
+          # `flyctl image show --json` returns an ARRAY of image objects (one
+          # per machine; this app is single-machine, so take the first). The
+          # `if type=="array"` guard keeps it working if flyctl ever returns a
+          # bare object instead. Keys are lower-cased before extraction to
+          # tolerate flyctl JSON key-case drift. An empty array or a missing
+          # field yields "" (never an error) under `set -euo pipefail`.
+          PREV_SERVER=""
+          if SHOW=$(flyctl image show --app "$FLY_APP" --json 2>/dev/null); then
+            OBJ=$(echo "$SHOW" | jq -c '(if type=="array" then (.[0] // {}) else . end) | with_entries(.key |= ascii_downcase)' 2>/dev/null || echo '{}')
+            REG=$(echo "$OBJ"  | jq -r '.registry   // empty')
+            REPO=$(echo "$OBJ" | jq -r '.repository // empty')
+            DIG=$(echo "$OBJ"  | jq -r '.digest     // empty')
+            TAG=$(echo "$OBJ"  | jq -r '.tag        // empty')
+            if [ -n "$REG" ] && [ -n "$REPO" ]; then
+              if [ -n "$DIG" ]; then
+                PREV_SERVER="${REG}/${REPO}@${DIG}"
+              elif [ -n "$TAG" ]; then
+                PREV_SERVER="${REG}/${REPO}:${TAG}"
+              fi
+            fi
+          fi
+          echo "prev_server_image=${PREV_SERVER}" >> "$GITHUB_OUTPUT"
+          echo "Prior server image: ${PREV_SERVER:-<unresolved>}"
+
+          # Prior HOST image secret — best-effort read from the live machine's
+          # process env (the only place the plaintext is observable).
+          PREV_HOST=""
+          if VAL=$(flyctl ssh console --app "$FLY_APP" \
+                     -C 'printenv OMNIGENT_DAYTONA_HOST_IMAGE' 2>/dev/null); then
+            PREV_HOST=$(echo "$VAL" | tr -d '\r' | tail -n 1)
+          fi
+          echo "prev_host_image=${PREV_HOST}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PREV_HOST" ]; then
+            echo "Prior host image secret captured (restorable on rollback)."
+          else
+            echo "Prior host image secret NOT capturable — rollback will not restore it."
+          fi
+
+      # STEP 1 — PIN THE DAYTONA HOST IMAGE BY DIGEST.
+      # Managed Daytona sandboxes boot from OMNIGENT_DAYTONA_HOST_IMAGE. Pinning
+      # by DIGEST (not a :latest / :sha tag) dodges Daytona's tag cache, which
+      # can keep serving a stale/poisoned image after a tag is moved.
+      # `flyctl secrets set` WITHOUT --stage triggers its OWN deployment, which
+      # would roll out the new host secret on the OLD server image before the
+      # intended server deploy (the sequencing race the contract forbids). So we
+      # use `--stage` to set the secret WITHOUT deploying; the server
+      # `flyctl deploy` in the next step is then the SINGLE rollout that applies
+      # the new server image AND this staged host secret together.
+      - name: Pin Daytona host image by digest
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          # docker/build-push-action emits the digest already prefixed with
+          # `sha256:`; guard against double-prefixing either way.
+          HOST_DIGEST="${{ needs.build-and-push.outputs.host-digest }}"
+          case "$HOST_DIGEST" in
+            sha256:*) HOST_REF="ghcr.io/tomkit/omnigent-host@${HOST_DIGEST}" ;;
+            *)        HOST_REF="ghcr.io/tomkit/omnigent-host@sha256:${HOST_DIGEST}" ;;
+          esac
+          echo "Staging OMNIGENT_DAYTONA_HOST_IMAGE=${HOST_REF} (applied by the deploy below)"
+          flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${HOST_REF}" \
+            --stage \
+            --app "$FLY_APP"
+
+      # STEP 2 — DEPLOY THE SERVER IMAGE (the original behaviour). This is the
+      # final rolling restart and also picks up the host-image secret set above.
+      # Preserves the live machine's volume mount, internal port, and health
+      # checks because fly.tomkit.toml mirrors them exactly and `fly deploy`
+      # only swaps the image. Requires the GHCR package to be PUBLIC (or Fly
+      # registry creds configured) so the remote builder can pull it.
       - name: Deploy to Fly
         if: steps.gate.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           flyctl deploy \
             --config deploy/fly/fly.tomkit.toml \
-            --app omnigent-tomkit \
+            --app "$FLY_APP" \
             --image "${IMAGE_REF}"
+
+      # STEP 3 — HEALTH VERIFY. Poll /health until it returns HTTP 200 AND
+      # reports the version we just shipped (sha-<short>). ~90s budget. Fail
+      # LOUDLY if it never converges: a red job is the signal to intervene, and
+      # it triggers the rollback step below.
+      - name: Verify deploy health
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          echo "Expecting ${HEALTH_URL} -> HTTP 200 with version=${EXPECTED_VERSION}"
+          for i in $(seq 1 9); do
+            CODE=$(curl -s -o /tmp/health.json -w '%{http_code}' --max-time 10 "$HEALTH_URL" || echo "000")
+            VER=$(jq -r '.version // empty' /tmp/health.json 2>/dev/null || echo "")
+            echo "attempt ${i}/9: http=${CODE} version=${VER:-<none>}"
+            if [ "$CODE" = "200" ] && [ "$VER" = "$EXPECTED_VERSION" ]; then
+              echo "Health OK: live version matches ${EXPECTED_VERSION}."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Health check did NOT converge to version=${EXPECTED_VERSION} within ~90s."
+          exit 1
+
+      # STEP 4 — ROLLBACK on health failure. Runs ONLY when an earlier step in
+      # this job failed (primarily the health check) and the gate was enabled.
+      #
+      # SERVER: redeploy the prior image captured at job start. Reliable.
+      # HOST SECRET: restore the prior OMNIGENT_DAYTONA_HOST_IMAGE ONLY if we
+      #   read it back from the live machine env at the start (see the
+      #   SECRET-READBACK LIMITATION note above). If we could NOT capture it, we
+      #   leave the freshly-pinned host digest in place — it is internally
+      #   consistent (built from the same commit), just newer than the
+      #   rolled-back server — and rely on the loud red job for manual
+      #   intervention. Fly's own machine-level health-check auto-rollback
+      #   covers the SERVER machine but NOT this secret, so we never depend on
+      #   it for the host image.
+      - name: Rollback on health failure
+        if: failure() && steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          PREV_SERVER="${{ steps.prev.outputs.prev_server_image }}"
+          PREV_HOST="${{ steps.prev.outputs.prev_host_image }}"
+
+          # Restore the prior host secret. Mirror the forward path's
+          # single-rollout discipline: if we are about to redeploy the prior
+          # server image (PREV_SERVER set), --stage the secret so that deploy
+          # applies it in ONE rollout. If there is NO server deploy to follow
+          # (PREV_SERVER empty), set it WITHOUT --stage so it actually applies
+          # on its own.
+          if [ -n "$PREV_HOST" ]; then
+            if [ -n "$PREV_SERVER" ]; then
+              echo "Staging prior host image secret (applied by the rollback deploy below)."
+              flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${PREV_HOST}" \
+                --stage --app "$FLY_APP" || echo "WARNING: failed to stage host secret."
+            else
+              echo "Restoring prior host image secret (no server deploy to follow — applying directly)."
+              flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${PREV_HOST}" \
+                --app "$FLY_APP" || echo "WARNING: failed to restore host secret."
+            fi
+          else
+            echo "WARNING: prior host image secret was not capturable — leaving the new digest pinned (manual intervention may be required)."
+          fi
+
+          if [ -n "$PREV_SERVER" ]; then
+            echo "Rolling server back to ${PREV_SERVER}"
+            flyctl deploy \
+              --config deploy/fly/fly.tomkit.toml \
+              --app "$FLY_APP" \
+              --image "${PREV_SERVER}"
+          else
+            echo "::error::No prior server image captured — cannot auto-roll-back. Intervene manually."
+          fi
+          # Keep the job RED even though rollback ran — the failed deploy still
+          # needs a human to look at it.
+          exit 1
