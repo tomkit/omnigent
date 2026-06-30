@@ -65,7 +65,14 @@ git --no-pager log --oneline "${UPSTREAM_REF}..HEAD" | sed 's/^/  /' || true
 # own commits are replayed on top. Merge commits are flattened — that is fine,
 # they are the user's own PR-merge bubbles. `--no-rerere-autoupdate` is implied;
 # we just run it once and inspect the exit code.
-if git rebase "$UPSTREAM_REF"; then
+#
+# merge.directoryRenames=true + a very high merge.renameLimit make git's
+# auto-relocation as aggressive as possible across large upstream directory
+# renames (e.g. ap-web/ -> web/), so our modified files follow the move instead
+# of being left behind. The post-rebase orphan guard (check-no-orphans.sh) is
+# the backstop for the one case this can't cover: a fork-ADDED file in a
+# brand-new subdir under a vanished tree.
+if git -c merge.directoryRenames=true -c merge.renameLimit=999999 rebase "$UPSTREAM_REF"; then
   HEAD_AFTER="$(git rev-parse HEAD)"
   emit "head_after=${HEAD_AFTER}"
   if [ "$HEAD_AFTER" = "$HEAD_BEFORE" ]; then
