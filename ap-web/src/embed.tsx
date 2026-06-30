@@ -30,7 +30,7 @@ import App from "./App";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { BUILD_OFF, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
 import { type OmnigentHostConfig, setEmbedRoot, setOmnigentHostConfig } from "./lib/host";
 import { resolveIdentity } from "./lib/identity";
@@ -107,6 +107,7 @@ const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   sandbox_provider: null,
   server_version: null,
   smart_routing_enabled: false,
+  build: BUILD_OFF,
 };
 
 /**
