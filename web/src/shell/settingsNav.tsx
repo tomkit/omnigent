@@ -11,6 +11,7 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   GitBranchIcon,
+  InfoIcon,
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
@@ -37,7 +38,8 @@ export type SettingsSectionId =
   | "policies"
   | "sharing"
   | "archived"
-  | "cli";
+  | "cli"
+  | "about";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
@@ -49,6 +51,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "sharing",
   "archived",
   "cli",
+  "about",
 ];
 
 interface SettingsNavItem {
@@ -115,10 +118,17 @@ export function settingsNavGroups(
       ],
     });
   }
-  groups.push({
-    title: "Archived",
-    items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
-  });
+  groups.push(
+    {
+      title: "Archived",
+      items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
+    },
+    // About (Build & deployment) closes the nav — deploy provenance, always present.
+    {
+      title: "About",
+      items: [{ id: "about", label: "Build & deployment", icon: InfoIcon }],
+    },
+  );
   return groups;
 }
 

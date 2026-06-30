@@ -10,7 +10,7 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { BUILD_OFF, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
@@ -86,6 +86,7 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          build: BUILD_OFF,
         }),
       1500,
     ),
