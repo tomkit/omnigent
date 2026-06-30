@@ -189,6 +189,17 @@ FROM python:${PYTHON_VERSION}-slim AS host
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
+# Build & deploy provenance, same proven build-arg+ENV pattern as the server
+# `runtime` stage above. The publish workflow stamps both images from the same
+# commit so the host half of a managed session self-reports the identical build
+# metadata. Empty by default for local `docker build` runs.
+ARG OMNIGENT_BUILD_SHA=
+ARG OMNIGENT_BUILD_TIME=
+ARG OMNIGENT_BUILD_REF=
+ENV OMNIGENT_BUILD_SHA=${OMNIGENT_BUILD_SHA} \
+    OMNIGENT_BUILD_TIME=${OMNIGENT_BUILD_TIME} \
+    OMNIGENT_BUILD_REF=${OMNIGENT_BUILD_REF}
+
 # IS_SANDBOX: devcontainer-convention flag consulted by Claude Code —
 # it refuses --dangerously-skip-permissions under root without it, and
 # sandbox containers run as root. The host forwards it to runners (see
@@ -352,12 +363,20 @@ CMD ["sleep", "infinity"]
 # ── Server runtime (default target) ─────────────────────
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
-# Git-sha build identifier, passed by the publish workflow as the same short
-# sha that names the image tag (sha-<short>). Baked into the image as an env
-# var so GET /health can report which build is live. Empty by default for
-# local `docker build` runs — /health then degrades to "unknown".
+# Build & deploy provenance, all passed by the publish workflow and baked in as
+# env vars so the server can self-report which build is live (GET /health for
+# the sha; GET /v1/info -> build for the full set the web UI's "Build &
+# Deployment" panel renders). Empty by default for local `docker build` runs —
+# the server then degrades each to "unknown"/null.
+#   OMNIGENT_BUILD_SHA  — short git sha that also names the image tag (sha-<short>)
+#   OMNIGENT_BUILD_TIME — ISO-8601 UTC instant the image was built
+#   OMNIGENT_BUILD_REF  — git ref/branch the image was built from
 ARG OMNIGENT_BUILD_SHA=
-ENV OMNIGENT_BUILD_SHA=${OMNIGENT_BUILD_SHA}
+ARG OMNIGENT_BUILD_TIME=
+ARG OMNIGENT_BUILD_REF=
+ENV OMNIGENT_BUILD_SHA=${OMNIGENT_BUILD_SHA} \
+    OMNIGENT_BUILD_TIME=${OMNIGENT_BUILD_TIME} \
+    OMNIGENT_BUILD_REF=${OMNIGENT_BUILD_REF}
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

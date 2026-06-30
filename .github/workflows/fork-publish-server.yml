@@ -120,19 +120,31 @@ jobs:
         id: tags
         env:
           GH_OWNER: ${{ github.repository_owner }}
+          # Git ref the build runs against (branch name on push, e.g. "main").
+          # Read via env, not inlined into the script, to avoid expression
+          # injection.
+          GH_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           OWNER_LC=$(echo "${GH_OWNER}" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${OWNER_LC}/omnigent-server"
           HOST_IMAGE="ghcr.io/${OWNER_LC}/omnigent-host"
           SHORT_SHA=$(git rev-parse --short HEAD)
+          # Build-time provenance: ISO-8601 UTC instant of this build, and the
+          # git ref it was built from. Baked into both images (server + host) as
+          # OMNIGENT_BUILD_TIME / OMNIGENT_BUILD_REF so the running server can
+          # report them in /v1/info -> build.
+          BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           {
             echo "short_sha=${SHORT_SHA}"
+            echo "build_time=${BUILD_TIME}"
+            echo "build_ref=${GH_REF_NAME}"
             echo "tags=${IMAGE}:sha-${SHORT_SHA},${IMAGE}:latest"
             echo "host_tags=${HOST_IMAGE}:sha-${SHORT_SHA},${HOST_IMAGE}:latest"
           } >> "$GITHUB_OUTPUT"
           echo "Publishing server: ${IMAGE}:sha-${SHORT_SHA} + ${IMAGE}:latest"
           echo "Publishing host:   ${HOST_IMAGE}:sha-${SHORT_SHA} + ${HOST_IMAGE}:latest"
+          echo "Build time: ${BUILD_TIME}  ref: ${GH_REF_NAME}"
 
       # Build-args: the registry ARGs default to public registries (matches the
       # upstream server build), but OMNIGENT_EXTRAS defaults to EMPTY in the
@@ -161,22 +173,25 @@ jobs:
           build-args: |
             OMNIGENT_EXTRAS=daytona
             OMNIGENT_BUILD_SHA=sha-${{ steps.tags.outputs.short_sha }}
+            OMNIGENT_BUILD_TIME=${{ steps.tags.outputs.build_time }}
+            OMNIGENT_BUILD_REF=${{ steps.tags.outputs.build_ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
           sbom: true
 
       # Host image: same Dockerfile, `host` target, also multi-arch (amd64 +
-      # arm64). Mirrors the UPSTREAM host build (oss-publish-images.yml) exactly:
-      # NO build-args. The `host` stage does NOT consume OMNIGENT_EXTRAS (that
-      # arg lives only in the server-builder stage) — it installs the full
-      # omnigent package via the shared `builder` stage's editable
-      # `uv pip install -e .`, so the fork's patched omnigent/runner/_entry.py
-      # (PR #14's runner-side token-attach) is baked in with no extras needed.
-      # The managed-host runtime deps (git/tmux/harness CLIs/agy) are baked by
-      # the Dockerfile's host stage itself, not via extras. Runs after the
-      # server build so it reuses the shared builder-stage layers from the gha
-      # cache (cached per platform).
+      # arm64). The `host` stage does NOT consume OMNIGENT_EXTRAS (that arg
+      # lives only in the server-builder stage) — it installs the full omnigent
+      # package via the shared `builder` stage's editable `uv pip install -e .`,
+      # so the fork's patched omnigent/runner/_entry.py (PR #14's runner-side
+      # token-attach) is baked in with no extras needed. The managed-host
+      # runtime deps (git/tmux/harness CLIs/agy) are baked by the Dockerfile's
+      # host stage itself, not via extras. The only build-args it takes are the
+      # provenance trio (sha/time/ref), stamped here so the host half of a
+      # managed session self-reports the SAME build metadata as the server half
+      # (both built from this one commit). Runs after the server build so it
+      # reuses the shared builder-stage layers from the gha cache.
       - name: Build and push host image
         id: build-host
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -187,6 +202,10 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.host_tags }}
+          build-args: |
+            OMNIGENT_BUILD_SHA=sha-${{ steps.tags.outputs.short_sha }}
+            OMNIGENT_BUILD_TIME=${{ steps.tags.outputs.build_time }}
+            OMNIGENT_BUILD_REF=${{ steps.tags.outputs.build_ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false

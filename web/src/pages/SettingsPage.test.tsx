@@ -9,6 +9,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
+interface BuildInfoMock {
+  version: string | null;
+  sha: string | null;
+  build_time: string | null;
+  started_at: string | null;
+  ref: string | null;
+}
+
+const NULL_BUILD: BuildInfoMock = {
+  version: null,
+  sha: null,
+  build_time: null,
+  started_at: null,
+  ref: null,
+};
+
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
@@ -22,6 +38,13 @@ const mocks = vi.hoisted(() => ({
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
+  build: {
+    version: null,
+    sha: null,
+    build_time: null,
+    started_at: null,
+    ref: null,
+  } as BuildInfoMock,
 }));
 
 vi.mock("next-themes", () => ({
@@ -32,6 +55,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
+    build: mocks.build,
   }),
 }));
 vi.mock("@/lib/accountsApi", () => ({
@@ -94,8 +118,12 @@ beforeEach(() => {
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
+  mocks.build = { ...NULL_BUILD };
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
@@ -204,5 +232,41 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("delete-archived"));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.deleteMutate).toHaveBeenCalledWith({ id: "conv_archived" });
+  });
+
+  it("renders Build & deployment provenance with a commit link and relative time", () => {
+    // Freeze now 3 minutes after this instance started.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-30T12:00:00Z"));
+    mocks.build = {
+      version: "0.3.0.dev0",
+      sha: "sha-ff243ad",
+      build_time: "2026-06-30T11:30:00Z",
+      started_at: "2026-06-30T11:57:00Z",
+      ref: "main",
+    };
+    renderPage("/settings/about");
+
+    expect(screen.getByRole("heading", { name: "Build & deployment" })).toBeInTheDocument();
+    expect(screen.getByText("0.3.0.dev0")).toBeInTheDocument();
+
+    // Commit renders as a link to the fork's commit page, sha- prefix stripped.
+    const link = screen.getByTestId("build-commit-link");
+    expect(link).toHaveTextContent("sha-ff243ad");
+    expect(link).toHaveAttribute("href", "https://github.com/tomkit/omnigent/commit/ff243ad");
+
+    // "Last deployed" (process start) shows the 3-minutes-ago relative hint.
+    expect(screen.getByText("(3m ago)")).toBeInTheDocument();
+  });
+
+  it("shows Unknown placeholders for an unstamped local/dev build", () => {
+    mocks.build = { ...NULL_BUILD };
+    renderPage("/settings/about");
+
+    expect(screen.getByRole("heading", { name: "Build & deployment" })).toBeInTheDocument();
+    // No commit link when sha is absent.
+    expect(screen.queryByTestId("build-commit-link")).toBeNull();
+    // Every field degrades to the muted "Unknown" placeholder.
+    expect(screen.getAllByText("Unknown").length).toBeGreaterThanOrEqual(4);
   });
 });

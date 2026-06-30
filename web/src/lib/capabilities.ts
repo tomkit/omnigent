@@ -20,6 +20,38 @@
 
 import { hostFetch } from "./host";
 
+/**
+ * Build & deploy provenance the server reports under ``/v1/info``'s ``build``
+ * key. Lets an operator confirm the live instance actually updated after a
+ * deploy. Every field except ``started_at`` is ``null`` on unstamped local/dev
+ * builds; ``started_at`` is always set (this process's boot time).
+ */
+export interface BuildInfo {
+  /** Installed omnigent package version, e.g. ``"0.3.0.dev0"``. */
+  version: string | null;
+  /** Git sha baked into the image, e.g. ``"sha-ff243ad"`` (same as /health). */
+  sha: string | null;
+  /** ISO-8601 UTC instant the image was built. */
+  build_time: string | null;
+  /** ISO-8601 UTC instant THIS server process booted. Always set. */
+  started_at: string | null;
+  /** Git ref/branch the image was built from, e.g. ``"main"``. */
+  ref: string | null;
+}
+
+/**
+ * ``build`` value when the probe failed or the server omitted it — every field
+ * null. Exported so the boot-time offline fallbacks (``main.tsx`` /
+ * ``embed.tsx``) can fill the required ``build`` field without duplicating it.
+ */
+export const BUILD_OFF: BuildInfo = {
+  version: null,
+  sha: null,
+  build_time: null,
+  started_at: null,
+  ref: null,
+};
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
@@ -68,6 +100,12 @@ export interface ServerInfo {
    * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
    */
   smart_routing_enabled: boolean;
+  /**
+   * Build & deploy provenance for the settings "Build & Deployment" panel.
+   * Always an object (never null) — individual fields are ``null`` when the
+   * build wasn't stamped (local/dev). See :class:`BuildInfo`.
+   */
+  build: BuildInfo;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
@@ -80,7 +118,26 @@ const _OFF: ServerInfo = {
   sandbox_provider: null,
   server_version: null,
   smart_routing_enabled: false,
+  build: BUILD_OFF,
 };
+
+/**
+ * Coerce the server's ``build`` blob into a {@link BuildInfo}, tolerating a
+ * missing field, a missing object, or a non-string value (each becomes
+ * ``null``). Never throws — an older server that predates the ``build`` key
+ * yields an all-null object, so the panel degrades to placeholders.
+ */
+function parseBuildInfo(raw: unknown): BuildInfo {
+  const obj = (raw ?? {}) as Record<string, unknown>;
+  const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  return {
+    version: str(obj.version),
+    sha: str(obj.sha),
+    build_time: str(obj.build_time),
+    started_at: str(obj.started_at),
+    ref: str(obj.ref),
+  };
+}
 
 let _cached: ServerInfo | null = null;
 let _pending: Promise<ServerInfo> | null = null;
@@ -114,6 +171,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: data.smart_routing_enabled === true,
+          build: parseBuildInfo(data.build),
         };
         return _cached;
       }
