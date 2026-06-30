@@ -20,7 +20,7 @@ import {
   NewChatLandingScreen,
 } from "./NewChatDialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import type { ServerInfo } from "@/lib/capabilities";
+import { BUILD_OFF, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -587,6 +587,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     sandbox_provider: null,
     server_version: null,
     smart_routing_enabled: false,
+    build: BUILD_OFF,
     ...infoOverrides,
   };
   return render(

@@ -9,6 +9,7 @@
 import {
   ArchiveIcon,
   ArrowLeftIcon,
+  InfoIcon,
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
@@ -22,7 +23,13 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
-export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived" | "cli";
+export type SettingsSectionId =
+  | "appearance"
+  | "shortcuts"
+  | "account"
+  | "archived"
+  | "cli"
+  | "about";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
@@ -30,6 +37,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "account",
   "archived",
   "cli",
+  "about",
 ];
 
 interface SettingsNavItem {
@@ -76,6 +84,10 @@ export function settingsNavGroups(
     {
       title: "Archived",
       items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
+    },
+    {
+      title: "About",
+      items: [{ id: "about", label: "Build & deployment", icon: InfoIcon }],
     },
   );
   return groups;

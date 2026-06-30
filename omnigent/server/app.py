@@ -7,6 +7,7 @@ import os
 import tarfile
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
@@ -78,6 +79,48 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+
+# Wall-clock instant this server process started, captured once at module
+# import. This is the strongest "the live instance actually updated" signal: it
+# moves on every deploy/restart regardless of whether the image's build
+# metadata was stamped. Exposed (ISO-8601 UTC) via /v1/info -> build.started_at.
+_PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
+
+def _build_provenance() -> dict[str, str | None]:
+    """Collect build & deploy provenance for the running server.
+
+    Backs the web UI's "Build & Deployment" panel and lets an operator verify
+    that a redeploy actually swapped the live instance. Every field degrades to
+    ``None`` when its source is unavailable (unstamped local/dev build), so the
+    UI renders a placeholder instead of a misleading value:
+
+    * ``version`` — installed ``omnigent`` package version (e.g.
+      ``"0.3.0.dev0"``); ``None`` if the package metadata is unresolvable.
+    * ``sha`` — git sha baked into the image (``OMNIGENT_BUILD_SHA`` env, e.g.
+      ``"sha-ff243ad"``); the same value ``/health`` reports.
+    * ``build_time`` — ISO-8601 UTC instant the image was built
+      (``OMNIGENT_BUILD_TIME`` env).
+    * ``ref`` — git ref/branch the image was built from
+      (``OMNIGENT_BUILD_REF`` env).
+    * ``started_at`` — ISO-8601 UTC instant THIS process booted; always set.
+
+    :returns: A flat ``str | None`` dict with the keys above.
+    """
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        version: str | None = _pkg_version("omnigent")
+    except PackageNotFoundError:  # pragma: no cover - package always installed in CI
+        version = None
+    return {
+        "version": version,
+        "sha": os.environ.get("OMNIGENT_BUILD_SHA") or None,
+        "build_time": os.environ.get("OMNIGENT_BUILD_TIME") or None,
+        "ref": os.environ.get("OMNIGENT_BUILD_REF") or None,
+        "started_at": _PROCESS_STARTED_AT.isoformat(),
+    }
 
 
 def _register_web_mimetypes() -> None:
@@ -1693,7 +1736,7 @@ def create_app(
         return {"version": _pkg_version("omnigent")}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | None]:
+    async def info() -> dict[str, Any]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1714,8 +1757,14 @@ def create_app(
         booleans (``databricks_features``,
         ``managed_sandboxes_enabled``), the short sandbox
         provider name (``sandbox_provider``) the web UI labels the
-        new-session sandbox option with, and the installed
-        ``server_version`` (already public via ``/api/version``).
+        new-session sandbox option with, the installed
+        ``server_version`` (already public via ``/api/version``),
+        and a ``build`` object carrying build & deploy provenance
+        (``version``, ``sha``, ``build_time``, ``started_at``,
+        ``ref``) for the web UI's "Build & Deployment" panel — see
+        :func:`_build_provenance`. None of this is sensitive: it is
+        the same build identifiers ``/health`` already exposes plus
+        this process's boot time.
         """
         from omnigent.server.auth import UnifiedAuthProvider
 
@@ -1784,6 +1833,12 @@ def create_app(
             "sandbox_provider": sandbox_provider,
             "server_version": _pkg_version("omnigent"),
             "smart_routing_enabled": smart_routing_enabled,
+            # Build & deploy provenance for the web UI's "Build & Deployment"
+            # panel: {version, sha, build_time, started_at, ref}. started_at is
+            # the per-process boot time (changes on every redeploy/restart);
+            # the rest come from the image's stamped build metadata. All fields
+            # degrade to null when unstamped (local/dev). See _build_provenance.
+            "build": _build_provenance(),
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)

@@ -89,6 +89,61 @@ async def test_version_returns_installed_package_version(
     )
 
 
+@pytest.mark.asyncio
+async def test_info_build_provenance_unstamped(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /v1/info exposes a ``build`` object that degrades gracefully.
+
+    With the build env vars unset (the local/dev default), ``sha``,
+    ``build_time`` and ``ref`` are ``None`` rather than missing or crashing,
+    but ``started_at`` (this process's boot time) and ``version`` (the
+    installed package) are always populated — that's the "the instance is
+    alive and on this code" signal the web UI's Build & Deployment panel needs.
+    """
+    for var in ("OMNIGENT_BUILD_SHA", "OMNIGENT_BUILD_TIME", "OMNIGENT_BUILD_REF"):
+        monkeypatch.delenv(var, raising=False)
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    build = resp.json()["build"]
+    # All five keys present so the UI can rely on the shape.
+    assert set(build) == {"version", "sha", "build_time", "started_at", "ref"}
+    assert build["sha"] is None
+    assert build["build_time"] is None
+    assert build["ref"] is None
+    assert build["version"] == _pkg_version("omnigent")
+    # started_at is captured once at import, so it's always set and parseable.
+    assert isinstance(build["started_at"], str) and build["started_at"]
+    from datetime import datetime
+
+    parsed = datetime.fromisoformat(build["started_at"])
+    assert parsed.tzinfo is not None, "started_at must be timezone-aware UTC"
+
+
+@pytest.mark.asyncio
+async def test_info_build_provenance_stamped(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /v1/info echoes the baked-in build metadata when stamped.
+
+    The publish workflow bakes sha/time/ref into the image as env vars; the
+    endpoint reads them at request time, so setting the env is enough — no app
+    rebuild. This is how an operator confirms a redeploy actually shipped.
+    """
+    monkeypatch.setenv("OMNIGENT_BUILD_SHA", "sha-ff243ad")
+    monkeypatch.setenv("OMNIGENT_BUILD_TIME", "2026-06-30T12:00:00Z")
+    monkeypatch.setenv("OMNIGENT_BUILD_REF", "main")
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    build = resp.json()["build"]
+    assert build["sha"] == "sha-ff243ad"
+    assert build["build_time"] == "2026-06-30T12:00:00Z"
+    assert build["ref"] == "main"
+    assert build["started_at"]
+
+
 class _StubWebSocket:
     """
     Minimal real ``WebSocketLike`` for registering a runner tunnel.
