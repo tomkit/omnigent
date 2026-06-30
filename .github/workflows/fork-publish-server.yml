@@ -254,14 +254,20 @@ jobs:
         run: |
           set -euo pipefail
           # Prior SERVER image — reliably readable from the Fly API. Pin by
-          # digest when available (immutable), else fall back to the tag. Field
-          # names are matched case-insensitively to tolerate flyctl JSON drift.
+          # digest when available (immutable), else fall back to the tag.
+          # `flyctl image show --json` returns an ARRAY of image objects (one
+          # per machine; this app is single-machine, so take the first). The
+          # `if type=="array"` guard keeps it working if flyctl ever returns a
+          # bare object instead. Keys are lower-cased before extraction to
+          # tolerate flyctl JSON key-case drift. An empty array or a missing
+          # field yields "" (never an error) under `set -euo pipefail`.
           PREV_SERVER=""
           if SHOW=$(flyctl image show --app "$FLY_APP" --json 2>/dev/null); then
-            REG=$(echo "$SHOW"  | jq -r '.Registry   // .registry   // empty')
-            REPO=$(echo "$SHOW" | jq -r '.Repository // .repository // empty')
-            DIG=$(echo "$SHOW"  | jq -r '.Digest     // .digest     // empty')
-            TAG=$(echo "$SHOW"  | jq -r '.Tag        // .tag        // empty')
+            OBJ=$(echo "$SHOW" | jq -c '(if type=="array" then (.[0] // {}) else . end) | with_entries(.key |= ascii_downcase)' 2>/dev/null || echo '{}')
+            REG=$(echo "$OBJ"  | jq -r '.registry   // empty')
+            REPO=$(echo "$OBJ" | jq -r '.repository // empty')
+            DIG=$(echo "$OBJ"  | jq -r '.digest     // empty')
+            TAG=$(echo "$OBJ"  | jq -r '.tag        // empty')
             if [ -n "$REG" ] && [ -n "$REPO" ]; then
               if [ -n "$DIG" ]; then
                 PREV_SERVER="${REG}/${REPO}@${DIG}"
@@ -290,11 +296,13 @@ jobs:
       # STEP 1 — PIN THE DAYTONA HOST IMAGE BY DIGEST.
       # Managed Daytona sandboxes boot from OMNIGENT_DAYTONA_HOST_IMAGE. Pinning
       # by DIGEST (not a :latest / :sha tag) dodges Daytona's tag cache, which
-      # can keep serving a stale/poisoned image after a tag is moved. Note
-      # `flyctl secrets set` itself stages a machine restart; we set it FIRST,
-      # then let the server `flyctl deploy` below perform the single final
-      # rolling restart, so the two CONVERGE rather than racing two back-to-back
-      # restarts.
+      # can keep serving a stale/poisoned image after a tag is moved.
+      # `flyctl secrets set` WITHOUT --stage triggers its OWN deployment, which
+      # would roll out the new host secret on the OLD server image before the
+      # intended server deploy (the sequencing race the contract forbids). So we
+      # use `--stage` to set the secret WITHOUT deploying; the server
+      # `flyctl deploy` in the next step is then the SINGLE rollout that applies
+      # the new server image AND this staged host secret together.
       - name: Pin Daytona host image by digest
         if: steps.gate.outputs.enabled == 'true'
         run: |
@@ -306,8 +314,9 @@ jobs:
             sha256:*) HOST_REF="ghcr.io/tomkit/omnigent-host@${HOST_DIGEST}" ;;
             *)        HOST_REF="ghcr.io/tomkit/omnigent-host@sha256:${HOST_DIGEST}" ;;
           esac
-          echo "Pinning OMNIGENT_DAYTONA_HOST_IMAGE=${HOST_REF}"
+          echo "Staging OMNIGENT_DAYTONA_HOST_IMAGE=${HOST_REF} (applied by the deploy below)"
           flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${HOST_REF}" \
+            --stage \
             --app "$FLY_APP"
 
       # STEP 2 — DEPLOY THE SERVER IMAGE (the original behaviour). This is the
@@ -367,10 +376,22 @@ jobs:
           PREV_SERVER="${{ steps.prev.outputs.prev_server_image }}"
           PREV_HOST="${{ steps.prev.outputs.prev_host_image }}"
 
+          # Restore the prior host secret. Mirror the forward path's
+          # single-rollout discipline: if we are about to redeploy the prior
+          # server image (PREV_SERVER set), --stage the secret so that deploy
+          # applies it in ONE rollout. If there is NO server deploy to follow
+          # (PREV_SERVER empty), set it WITHOUT --stage so it actually applies
+          # on its own.
           if [ -n "$PREV_HOST" ]; then
-            echo "Restoring prior host image secret."
-            flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${PREV_HOST}" \
-              --app "$FLY_APP" || echo "WARNING: failed to restore host secret."
+            if [ -n "$PREV_SERVER" ]; then
+              echo "Staging prior host image secret (applied by the rollback deploy below)."
+              flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${PREV_HOST}" \
+                --stage --app "$FLY_APP" || echo "WARNING: failed to stage host secret."
+            else
+              echo "Restoring prior host image secret (no server deploy to follow — applying directly)."
+              flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${PREV_HOST}" \
+                --app "$FLY_APP" || echo "WARNING: failed to restore host secret."
+            fi
           else
             echo "WARNING: prior host image secret was not capturable — leaving the new digest pinned (manual intervention may be required)."
           fi
