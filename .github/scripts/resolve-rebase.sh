@@ -15,8 +15,15 @@
 # then let the shell advance the rebase, until it completes or we stall / hit
 # MAX_ITERS (fail loudly either way).
 #
-# Auth: `claude` reads ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN from the
-# environment; the caller must export one.
+# Model/auth: the headless `claude` CLI speaks the Anthropic Messages API, and
+# Fireworks serves an Anthropic-compatible endpoint at
+# ${ANTHROPIC_BASE_URL}/v1/messages — so we point Claude Code straight at
+# Fireworks (no translation proxy) and resolve conflicts on GLM, not Anthropic.
+# The caller (daily-fork-sync.yml) normally sets ANTHROPIC_BASE_URL /
+# ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL explicitly;
+# the defaults below are an overridable backstop targeting Fireworks' latest GLM.
+# This wiring is scoped to THIS resolver only — it does NOT affect the deployed
+# managed/Daytona agents, which stay on Claude.
 set -uo pipefail
 
 MAX_ITERS="${MAX_ITERS:-20}"
@@ -95,10 +102,26 @@ if ! in_rebase; then
   exit 0
 fi
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-  echo "::error::resolve-rebase: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set." >&2
+# ---- Resolver model wiring (Fireworks / Anthropic-compatible) ----
+# Overridable defaults target Fireworks' latest GLM. A bare FIREWORKS_API_KEY is
+# mapped to ANTHROPIC_AUTH_TOKEN (the bearer-token Fireworks expects) as a
+# convenience for callers that only export the raw key.
+export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://api.fireworks.ai/inference}"
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-accounts/fireworks/models/glm-5p2}"
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-$ANTHROPIC_MODEL}"
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -n "${FIREWORKS_API_KEY:-}" ]; then
+  export ANTHROPIC_AUTH_TOKEN="${FIREWORKS_API_KEY}"
+fi
+
+# Require some auth source. ANTHROPIC_AUTH_TOKEN (bearer) is the Fireworks path;
+# ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN stay accepted as a fallback if the
+# caller ever rewires the resolver back to Anthropic. The key is never echoed.
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] \
+   && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  echo "::error::resolve-rebase: no resolver auth set (need ANTHROPIC_AUTH_TOKEN or FIREWORKS_API_KEY)." >&2
   exit 1
 fi
+echo "resolve-rebase: resolver model=${ANTHROPIC_MODEL} via ${ANTHROPIC_BASE_URL}"
 
 iter=0
 while in_rebase; do
@@ -148,6 +171,7 @@ When done, every listed file must contain zero conflict markers."
 
     # File-editing tools ONLY — no Bash — so Claude cannot touch git.
     if ! claude -p "$prompt" \
+      --model "$ANTHROPIC_MODEL" \
       --permission-mode acceptEdits \
       --allowedTools "Read,Edit,MultiEdit,Write,Grep,Glob" \
       --max-turns 40; then
