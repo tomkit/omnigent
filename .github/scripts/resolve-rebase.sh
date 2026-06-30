@@ -27,6 +27,13 @@
 set -uo pipefail
 
 MAX_ITERS="${MAX_ITERS:-20}"
+# Per-file headless turn budget. We resolve one conflicted file per `claude -p`
+# call (see the inner loop below), which keeps each invocation's scope small —
+# but a single large file can still need plenty of agent turns, so give it real
+# headroom. This is deliberately well above the old hardcoded 40: a weaker model
+# (e.g. Fireworks GLM) burns turns faster, and per-file isolation only helps if
+# each file actually has the budget to finish. Overridable via CLAUDE_MAX_TURNS.
+CLAUDE_MAX_TURNS="${CLAUDE_MAX_TURNS:-80}"
 CONT_LOG="$(mktemp)"
 trap 'rm -f "$CONT_LOG"' EXIT
 
@@ -141,21 +148,27 @@ while in_rebase; do
     echo "resolve-rebase: [iter ${iter}] no conflicted files; advancing rebase."
     continue_rebase || exit 1
   else
-    echo "resolve-rebase: [iter ${iter}] resolving ${#conflicts[@]} conflicted file(s):"
+    echo "resolve-rebase: [iter ${iter}] resolving ${#conflicts[@]} conflicted file(s), one per claude call:"
     printf '  %s\n' "${conflicts[@]}"
 
-    file_list=""
+    # PER-FILE resolution: invoke `claude -p` separately for EACH conflicted
+    # file rather than once for the whole batch. One file per prompt bounds the
+    # scope each invocation has to reason about, so the turn budget is enough to
+    # actually finish (the old single-call-for-all-files shape made a weaker
+    # model burn through every turn without converging on a 5-file batch). It
+    # also pins any genuinely-unresolvable file to a single, named failure
+    # instead of an opaque whole-iteration one.
     for f in "${conflicts[@]}"; do
-      file_list+="  - ${f}"$'\n'
-    done
+      echo "resolve-rebase: [iter ${iter}] resolving ${f}"
 
-    prompt="You are resolving git rebase conflicts inside a CI runner. A rebase of
+      prompt="You are resolving git rebase conflicts inside a CI runner. A rebase of
 the fork tomkit/omnigent onto upstream omnigent-ai/omnigent is paused. Resolve
-ONLY these conflicted files by editing their contents in place:
+ONLY this one conflicted file by editing its contents in place:
 
-${file_list}
+  - ${f}
+
 Requirements:
-- Open each file, remove EVERY conflict marker (lines starting with <<<<<<<,
+- Open the file, remove EVERY conflict marker (lines starting with <<<<<<<,
   =======, or >>>>>>>), and produce a correct merged result.
 - Preserve the fork's commit INTENT (the feature/behavior the fork added) while
   taking upstream's changes wherever they do not conflict with that intent. If
@@ -164,29 +177,30 @@ Requirements:
 - Fork custom work to preserve: daytona managed-sandbox idle-suspend/resume +
   bidirectional context sync, the Fly server image / deploy config, and the
   polly worker-routing policy.
-- If upstream renamed a directory, place resolved files at the NEW path, not the old one.
-- Edit files ONLY. Do NOT run git or any shell command. Do NOT add, commit,
+- If upstream renamed a directory, this file is already at the NEW path; resolve
+  it here and do not recreate the old path.
+- Edit this file ONLY. Do NOT run git or any shell command. Do NOT add, commit,
   continue, abort, or push — the surrounding script does all git operations.
-When done, every listed file must contain zero conflict markers."
+When done, this file must contain zero conflict markers."
 
-    # File-editing tools ONLY — no Bash — so Claude cannot touch git.
-    if ! claude -p "$prompt" \
-      --model "$ANTHROPIC_MODEL" \
-      --permission-mode acceptEdits \
-      --allowedTools "Read,Edit,MultiEdit,Write,Grep,Glob" \
-      --max-turns 40; then
-      echo "::error::resolve-rebase: headless claude invocation failed at iter ${iter}."
-      exit 1
-    fi
+      # File-editing tools ONLY — no Bash — so Claude cannot touch git.
+      if ! claude -p "$prompt" \
+        --model "$ANTHROPIC_MODEL" \
+        --permission-mode acceptEdits \
+        --allowedTools "Read,Edit,MultiEdit,Write,Grep,Glob" \
+        --max-turns "$CLAUDE_MAX_TURNS"; then
+        echo "::error::resolve-rebase: headless claude invocation failed for ${f} at iter ${iter}."
+        exit 1
+      fi
 
-    # Trust nothing: the SHELL verifies the markers are gone before staging.
-    bad=0
-    for f in "${conflicts[@]}"; do
+      # Trust nothing: the SHELL verifies the markers are gone for THIS file
+      # before moving on — a per-file failure names the offending file and
+      # aborts loudly rather than silently leaving it for the batch check.
       if [ -f "$f" ] && grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f"; then
-        echo "::error::conflict markers remain in ${f} after resolution"; bad=1
+        echo "::error::resolve-rebase: conflict markers remain in ${f} after resolution; aborting."
+        exit 1
       fi
     done
-    [ "$bad" -eq 0 ] || { echo "::error::resolve-rebase: unresolved markers; aborting."; exit 1; }
 
     git add -A
     continue_rebase || exit 1
