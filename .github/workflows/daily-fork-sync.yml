@@ -90,6 +90,30 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # ---- Stage the fork-rebase scripts OUTSIDE the working tree ----
+      # SELF-REFERENCE FIX: the rebase below replays the fork's own commits onto
+      # upstream and PAUSES at the first conflicting one. At that moment the
+      # working tree reflects an EARLIER point in the fork's history — i.e. BEFORE
+      # the commits that fixed these very scripts are replayed. If the later steps
+      # ran `bash .github/scripts/<name>.sh` they would execute the STALE in-tree
+      # copy from that mid-rebase snapshot, never the fixed main-HEAD version
+      # (a chicken-and-egg: the fix can't take effect because the rebase fails
+      # before replaying it). We copy the scripts from the freshly-checked-out
+      # main HEAD to $RUNNER_TEMP (untouched by the rebase) and run those stable
+      # copies in every step below. The scripts operate on the repo via the
+      # current working directory (git commands against cwd) and never reference
+      # each other by path, so running them from $RUNNER_TEMP is equivalent.
+      - name: Stage fork-rebase scripts (immune to the rebase rewriting them)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/forkscripts"
+          cp -p .github/scripts/rebase-fork.sh \
+                .github/scripts/resolve-rebase.sh \
+                .github/scripts/check-no-orphans.sh \
+                "${RUNNER_TEMP}/forkscripts/"
+          chmod +x "${RUNNER_TEMP}/forkscripts/"*.sh
+          ls -l "${RUNNER_TEMP}/forkscripts/"
+
       - name: Add upstream remote and fetch
         run: |
           git remote add "${UPSTREAM_REMOTE}" "${UPSTREAM_URL}" 2>/dev/null \
@@ -98,7 +122,7 @@ jobs:
 
       - name: Attempt rebase
         id: rebase
-        run: bash .github/scripts/rebase-fork.sh
+        run: bash "${RUNNER_TEMP}/forkscripts/rebase-fork.sh"
 
       # ---- Claude in the loop: only when the rebase paused on conflicts ----
       # IMPORTANT: the `anthropics/claude-code-action` REFUSES destructive git
@@ -126,7 +150,7 @@ jobs:
           # is sufficient. (Subscribers can swap to CLAUDE_CODE_OAUTH_TOKEN.)
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MAX_ITERS: "20"
-        run: bash .github/scripts/resolve-rebase.sh
+        run: bash "${RUNNER_TEMP}/forkscripts/resolve-rebase.sh"
 
       - name: Verify rebase completed and landed on upstream
         if: steps.rebase.outputs.outcome == 'conflict'
@@ -185,7 +209,7 @@ jobs:
         env:
           UPSTREAM_REF: ${{ env.UPSTREAM_REMOTE }}/${{ env.UPSTREAM_BRANCH }}
           HEAD_BEFORE: ${{ steps.rebase.outputs.head_before }}
-        run: bash .github/scripts/check-no-orphans.sh
+        run: bash "${RUNNER_TEMP}/forkscripts/check-no-orphans.sh"
 
       # ---- Publish ----
       # We never deploy here. Pushing `main` is the deploy trigger: any push to
