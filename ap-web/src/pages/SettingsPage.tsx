@@ -549,6 +549,7 @@ function BuildDetails({ build }: { build: BuildInfo }) {
           UNKNOWN
         )}
       </InfoRow>
+      <InfoRow label="Ref">{build.ref ?? UNKNOWN}</InfoRow>
       <InfoRow label="Build time">
         <TimestampValue iso={build.build_time} />
       </InfoRow>

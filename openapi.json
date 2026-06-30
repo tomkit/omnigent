@@ -193,6 +193,68 @@
         "title": "Body_upload_session_file_v1_sessions__session_id__resources_files_post",
         "type": "object"
       },
+      "BuildProvenance": {
+        "description": "Build & deploy provenance for the running server.\n\nBacks the web UI's \"Build & Deployment\" panel. Every field except\n`started_at` degrades to `None` on an unstamped local/dev build;\n`started_at` (this process's boot time) is always set. See\n`_build_provenance`.",
+        "properties": {
+          "build_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Build Time"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "version",
+          "sha",
+          "build_time",
+          "ref",
+          "started_at"
+        ],
+        "title": "BuildProvenance",
+        "type": "object"
+      },
       "CancelledEvent": {
         "description": "Terminal event for a turn cancelled before completion.",
         "properties": {
@@ -1647,6 +1709,73 @@
           "response"
         ],
         "title": "IncompleteEvent",
+        "type": "object"
+      },
+      "InfoResponse": {
+        "description": "Runtime capabilities probe payload returned by `GET /v1/info`.\n\nDrives conditional route registration and chrome on the SPA side and\ncarries build & deploy provenance for the \"Build & Deployment\" panel.\nSee the `/v1/info` handler for the meaning of each field.",
+        "properties": {
+          "accounts_enabled": {
+            "title": "Accounts Enabled",
+            "type": "boolean"
+          },
+          "build": {
+            "$ref": "#/components/schemas/BuildProvenance"
+          },
+          "databricks_features": {
+            "title": "Databricks Features",
+            "type": "boolean"
+          },
+          "login_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login Url"
+          },
+          "managed_sandboxes_enabled": {
+            "title": "Managed Sandboxes Enabled",
+            "type": "boolean"
+          },
+          "needs_setup": {
+            "title": "Needs Setup",
+            "type": "boolean"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Provider"
+          },
+          "server_version": {
+            "title": "Server Version",
+            "type": "string"
+          },
+          "smart_routing_enabled": {
+            "title": "Smart Routing Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "accounts_enabled",
+          "login_url",
+          "needs_setup",
+          "databricks_features",
+          "managed_sandboxes_enabled",
+          "sandbox_provider",
+          "server_version",
+          "smart_routing_enabled",
+          "build"
+        ],
+        "title": "InfoResponse",
         "type": "object"
       },
       "LaunchRunnerRequest": {
@@ -6462,9 +6591,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Info V1 Info Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/InfoResponse"
                 }
               }
             },
