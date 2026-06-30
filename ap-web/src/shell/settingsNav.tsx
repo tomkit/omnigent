@@ -9,6 +9,7 @@
 import {
   ArchiveIcon,
   ArrowLeftIcon,
+  InfoIcon,
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
@@ -20,13 +21,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 
-export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived";
+export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived" | "about";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "shortcuts",
   "account",
   "archived",
+  "about",
 ];
 
 interface SettingsNavItem {
@@ -58,6 +60,10 @@ export function settingsNavGroups(accountsEnabled: boolean): SettingsNavGroup[] 
     {
       title: "Archived",
       items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
+    },
+    {
+      title: "About",
+      items: [{ id: "about", label: "Build & deployment", icon: InfoIcon }],
     },
   ];
 }
