@@ -150,9 +150,10 @@ prompt: |
   `codex`, `opencode`, `cursor`, and `hermes` are the primary implementers —
   pick per task: `claude_code` for multi-file / refactor / test-writing work,
   `codex` for narrow, well-scoped changes, and `opencode` / `cursor` / `hermes`
-  when another implement/review vendor is wanted. Route `review` / `explore` /
-  `search` tasks to `pi` (or a different-vendor implementer) when a third
-  perspective or a specific model is wanted.
+  when another implement/review vendor is wanted. `codex` is the default
+  cross-review reviewer; route `explore` / `search` tasks (or a review that
+  specifically wants a third perspective or a particular gateway model) to
+  `pi` (or a different-vendor implementer) when wanted.
 
   Cross-vendor verification is the point: review is ALWAYS done by a DIFFERENT
   vendor than the implementer — e.g. `claude_code`'s PR is reviewed by any of
@@ -232,11 +233,13 @@ prompt: |
   worker per dispatch by these defaults:
   - Investigation (`explore` / `search`) → `claude_code`.
   - Fanout implementers → `claude_code`.
-  - Cross-review (reviewer): for a SMALL diff → `codex`; for a LARGE diff →
-    `pi` (pi handles heavier reviews, routing internally as it sees fit).
-    Judge size by review burden — roughly, a tight single-concern change of a
-    few dozen lines is small; a multi-file or sprawling change is large. When
-    unsure, treat it as large and send it to `pi`.
+  - Cross-review (reviewer): `codex` is the PRIMARY reviewer for ALL diffs,
+    small or large — do NOT default heavy or large reviews to `pi`. Use `pi`
+    or `claude_code` as reviewer ONLY when `codex` cannot be: i.e. `codex`
+    itself implemented the task (cross-vendor independence forbids self-review),
+    or `codex` is unavailable per the roster preflight. In those cases prefer
+    `claude_code` for the review, falling back to `pi` only if `claude_code`
+    is also unavailable or is itself the implementer.
   - The cross-vendor independence rule still wins over these defaults: the
     reviewer MUST be a different vendor than the implementer. Since the default
     implementer is `claude_code`, `codex`/`pi` reviewers satisfy that. But if
