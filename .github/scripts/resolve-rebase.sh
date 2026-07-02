@@ -34,6 +34,13 @@ MAX_ITERS="${MAX_ITERS:-20}"
 # (e.g. Fireworks GLM) burns turns faster, and per-file isolation only helps if
 # each file actually has the budget to finish. Overridable via CLAUDE_MAX_TURNS.
 CLAUDE_MAX_TURNS="${CLAUDE_MAX_TURNS:-80}"
+# Bounded per-file retry budget. The resolver model (Fireworks GLM) is weaker and
+# flakier than Claude and OCCASIONALLY leaves conflict markers after a single pass
+# on a file that is perfectly resolvable (and that it resolved cleanly on other
+# iterations). Rather than abort the whole sync on the first such flake, re-invoke
+# `claude -p` on the SAME still-conflicted file up to this many ADDITIONAL times.
+# Total attempts per file = CLAUDE_FILE_RETRIES + 1 (default 3). Overridable.
+CLAUDE_FILE_RETRIES="${CLAUDE_FILE_RETRIES:-2}"
 CONT_LOG="$(mktemp)"
 trap 'rm -f "$CONT_LOG"' EXIT
 
@@ -183,20 +190,46 @@ Requirements:
   continue, abort, or push — the surrounding script does all git operations.
 When done, this file must contain zero conflict markers."
 
-      # File-editing tools ONLY — no Bash — so Claude cannot touch git.
-      if ! claude -p "$prompt" \
-        --model "$ANTHROPIC_MODEL" \
-        --permission-mode acceptEdits \
-        --allowedTools "Read,Edit,MultiEdit,Write,Grep,Glob" \
-        --max-turns "$CLAUDE_MAX_TURNS"; then
-        echo "::error::resolve-rebase: headless claude invocation failed for ${f} at iter ${iter}."
-        exit 1
-      fi
+      # BOUNDED per-file retry: an occasional flaky GLM pass can leave conflict
+      # markers on an otherwise-resolvable file, so give the SAME still-conflicted
+      # working-tree file up to CLAUDE_FILE_RETRIES additional `claude -p` passes
+      # before failing loud. Total attempts = CLAUDE_FILE_RETRIES + 1. The file
+      # CONTENTS (marker check) are the source of truth: a transient CLI/API error
+      # is only a warning and feeds a retry, but if the file nonetheless ends up
+      # marker-free we accept it. We only reach the fatal marker-remain path once
+      # every attempt is spent on a genuinely stuck file.
+      max_attempts=$((CLAUDE_FILE_RETRIES + 1))
+      resolved=0
+      for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        if [ "$attempt" -gt 1 ]; then
+          echo "resolve-rebase: [iter ${iter}] retry ${attempt}/${max_attempts} for ${f} (markers remained)."
+        fi
 
-      # Trust nothing: the SHELL verifies the markers are gone for THIS file
-      # before moving on — a per-file failure names the offending file and
-      # aborts loudly rather than silently leaving it for the batch check.
-      if [ -f "$f" ] && grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f"; then
+        # File-editing tools ONLY — no Bash — so Claude cannot touch git.
+        if ! claude -p "$prompt" \
+          --model "$ANTHROPIC_MODEL" \
+          --permission-mode acceptEdits \
+          --allowedTools "Read,Edit,MultiEdit,Write,Grep,Glob" \
+          --max-turns "$CLAUDE_MAX_TURNS"; then
+          echo "::warning::resolve-rebase: headless claude invocation failed for ${f} at iter ${iter} (attempt ${attempt}/${max_attempts})."
+          # Fall through to the marker check — the file contents decide, not the
+          # exit code. If markers remain, the loop retries; if not, we accept it.
+        fi
+
+        # Trust nothing: the SHELL verifies the markers are gone for THIS file.
+        if [ -f "$f" ] && grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f"; then
+          echo "resolve-rebase: [iter ${iter}] conflict markers still present in ${f} after attempt ${attempt}/${max_attempts}."
+          continue
+        fi
+
+        resolved=1
+        break
+      done
+
+      # Fail loud only after every attempt is exhausted on a stuck file — a
+      # per-file failure names the offending file rather than leaving it for the
+      # batch check.
+      if [ "$resolved" -ne 1 ]; then
         echo "::error::resolve-rebase: conflict markers remain in ${f} after resolution; aborting."
         exit 1
       fi
