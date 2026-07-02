@@ -41,10 +41,9 @@
 name: daily-fork-sync
 
 on:
-  schedule:
-    # 20:00 UTC daily == 04:00 the next day in the user's local time (UTC+8),
-    # a low-traffic hour. Adjust the cron if your quiet window moves.
-    - cron: "0 20 * * *"
+  # Autonomous cron removed — this fork sync is now run by hand (we upgrade
+  # onto upstream release tags in-session rather than on a schedule). The
+  # manual trigger below stays so the workflow remains available ad hoc.
   workflow_dispatch:
     inputs:
       force_deploy:
