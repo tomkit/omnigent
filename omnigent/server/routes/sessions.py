@@ -937,6 +937,12 @@ _RUNNER_OWNED_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_SESSION_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
         _EXTERNAL_COMPACTION_STATUS_TYPE,
+        # Harness MCP-server startup progress (codex-native forwarder): its
+        # ``post_event`` branch only validates the server map and republishes it
+        # as a ``session.mcp_startup`` SSE for the UI's startup band — no
+        # approval gate, no policy write, no verdict — so it is runner-owned
+        # reporting, exactly like the compaction/session status edges above.
+        _EXTERNAL_MCP_STARTUP_TYPE,
         _EXTERNAL_MODEL_CHANGE_TYPE,
         _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
         _EXTERNAL_SESSION_TODOS_TYPE,
