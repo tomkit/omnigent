@@ -10,7 +10,7 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { ServerInfo } from "@/lib/capabilities";
+import { BUILD_OFF, type ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
@@ -323,6 +323,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    build: BUILD_OFF,
     ...overrides,
   };
 }

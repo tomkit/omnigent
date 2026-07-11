@@ -1154,7 +1154,13 @@ async def test_api_only_root_does_not_shadow_real_routes(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get("/health", headers={"accept": "text/html"})
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    # The real /health JSON is served (not shadowed by the HTML landing). It
+    # also carries the build version (fork provenance); that value is
+    # env-dependent (OMNIGENT_BUILD_SHA or "unknown"), so this test pins only
+    # the status — the point here is that the route isn't shadowed.
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "version" in body
 
 
 @pytest.mark.asyncio
