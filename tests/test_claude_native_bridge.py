@@ -5882,6 +5882,7 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
 
 def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     A timeout where every capture came back empty says so in the error.
@@ -5893,6 +5894,8 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     the two failure modes tell themselves apart.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Empty bridge dir (no recorded session id), so the gate
+        times out on the empty captures rather than seeing SessionStart.
     :returns: None.
     """
     monkeypatch.setattr(
@@ -5901,6 +5904,7 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
+            tmp_path,
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
@@ -5915,6 +5919,7 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
 
 def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     The attached tail is a capture the loop saw, not a post-timeout one.
@@ -5928,6 +5933,8 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     proves the point: the box-present frame must NOT leak into the error.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Empty bridge dir (no recorded session id), so the gate
+        times out rather than seeing SessionStart.
     :returns: None.
     """
     observed = "  ✱ Working…\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
@@ -5946,6 +5953,7 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     monkeypatch.setattr("omnigent.claude_native_bridge._capture_pane", fake_capture)
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
+            tmp_path,
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
