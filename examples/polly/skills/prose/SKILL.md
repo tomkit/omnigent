@@ -20,9 +20,12 @@ different worktree and can't load polly's skills, so when you delegate you must
 - **Don't drown the reader in references.** Cite or link only what a reader
   actually needs — no exhaustive footnotes, no dumping every related file, ticket,
   or line number. Point to the one thing that matters.
-- **Lead with the high-level concept.** Explain the shape and the *why* first, at a
-  level a newcomer follows, before any mechanics. The reader should grok what and
-  why without chasing details.
+- **Open with an ELI5, then build down.** For any summary (PR description, doc,
+  design note), lead with a plain-language take a non-expert gets — what changed and
+  why it matters, no jargon. Then step down one level at a time, each building on the
+  last, connecting the dots from concept to mechanics. A layman should get the gist
+  from the first lines; an engineer should reach the specifics by the end. Never open
+  at the low level.
 - **Comments make code legible, not redundant.** A comment explains the scenario
   or intent the code can't — why this exists, what edge case it guards — never
   restates what the line already says. One or two lines; let clear names and
