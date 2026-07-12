@@ -29,7 +29,8 @@ anyone needs to read through.
    args={purpose: "review", input: "<the diff> + <the acceptance contract> +
    polly's `prose` standard (inline it). Review against the contract, AND
    re-check the diff's prose against the standard in case something slipped —
-   flag AI-writing tells, verbosity, over-referencing, or comments that just
+   flag AI-writing tells, verbosity, over-referencing, a summary that dives into
+   low-level detail instead of opening with an ELI5, or comments that just
    restate the code (usually suggestions; blocking only when the prose is
    misleading or unreadable). Report blocking / non-blocking / suggestions.
    Do not edit code."})`. Give it the diff as text — do NOT point
