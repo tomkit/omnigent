@@ -62,6 +62,11 @@ on:
       - 'deploy/docker/Dockerfile'
       - 'deploy/docker/entrypoint.py'
       - 'omnigent/**'
+      # polly and debby are baked into the server image via omnigent's
+      # _examples_resources (server/app.py _ensure_default_{polly,debby}_agent),
+      # so a bundle edit must rebuild — otherwise the template agent stays stale.
+      - 'examples/polly/**'
+      - 'examples/debby/**'
       - 'ap-web/**'
       - 'sdks/**'
       - 'pyproject.toml'
