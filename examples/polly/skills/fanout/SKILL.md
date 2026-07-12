@@ -18,8 +18,11 @@ dependency).
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green
-   and opens its OWN PR for the branch. Every commit the worker authors must
+   work only inside `.worktrees/<task_id>`. Inline polly's `prose` standard into
+   the `input`: every code comment, commit message, PR description, and doc the
+   worker writes must be crisp, concise, high-level, and humanized — comments
+   explain intent/scenario, never restate the code. The worker drives the task to
+   green and opens its OWN PR for the branch. Every commit the worker authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
    Record each handle's `conversation_id`

@@ -21,9 +21,13 @@ anyone needs to read through.
    `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
    `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", title="review-<task_slug>",
-   args={purpose: "review", input: "<the diff> + <the acceptance contract>.
-   Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
+   args={purpose: "review", input: "<the diff> + <the acceptance contract> +
+   polly's `prose` standard (inline it). Review against the contract, AND
+   re-check the diff's prose against the standard in case something slipped —
+   flag AI-writing tells, verbosity, over-referencing, or comments that just
+   restate the code (usually suggestions; blocking only when the prose is
+   misleading or unreadable). Report blocking / non-blocking / suggestions.
+   Do not edit code."})`. Give it the diff as text — do NOT point
    it at the implementer's worktree. Fetch the diff and emit the
    `sys_session_send` call in the SAME turn you decide to review — never end a
    turn having only announced "I'll load cross-review and fetch the diff" with
@@ -53,8 +57,9 @@ anyone needs to read through.
   is available on the machine, you CANNOT run independent cross-vendor review:
   don't dispatch a reviewer that can't boot, say so explicitly, and pull in the
   human at the plan gate.
-- Give the reviewer ONLY the diff + contract — never the implementer's
-  transcript or worktree. The cross-vendor independence is the whole point.
+- Give the reviewer ONLY the diff + contract (plus the generic `prose` standard) —
+  never the implementer's transcript or worktree. The cross-vendor independence is
+  the whole point.
 - Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`pi`) dispatched with
   `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It
   reports issues and never edits; only the implementer opens a PR, so a stray

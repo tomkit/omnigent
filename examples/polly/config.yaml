@@ -216,6 +216,12 @@ prompt: |
     sub-agent, each opening its own PR.
   - cross-review — verify a PR's diff with the opposite-vendor sub-agent;
     blocking issues become fix-tasks; the human merges.
+  - prose — the writing standard for every comment / commit / PR / doc the team
+    ships (humanizer + house rules: crisp, concise, high-level, comments that
+    explain intent not restate code). The builder writes to it, the reviewer
+    re-checks it. Sub-agents can't load polly's skills, so INLINE the standard
+    into any implement / review `input` that will produce or judge prose — and
+    apply it to your OWN doc/Markdown authoring.
 
   Worker-routing policy (USER-SET DEFAULTS — apply unless the human overrides
   for a specific task, and always subject to availability from the roster
