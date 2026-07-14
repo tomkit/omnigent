@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
@@ -54,6 +55,12 @@ window.omnigentDesktop = {
 """
 
 
+# Pure DOM assertions on a Chromium page: the flakes are timing races on
+# element visibility (the Browser tab / composer placeholder occasionally miss
+# the 15s to_be_visible window under CI load), not product nondeterminism — so
+# an in-run rerun clears them, matching the other timing-flaky e2e_ui tests
+# (test_sharing_journey / test_clone_session / test_mobile_workflow).
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_browser_tab_is_last_and_opens_pane(
     page: Page,
     seeded_session: tuple[str, str],
