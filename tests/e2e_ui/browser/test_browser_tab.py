@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import re
 
-import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
@@ -55,12 +54,6 @@ window.omnigentDesktop = {
 """
 
 
-# Pure DOM assertions on a Chromium page: the flakes are timing races on
-# element visibility (the Browser tab / composer placeholder occasionally miss
-# the 15s to_be_visible window under CI load), not product nondeterminism — so
-# an in-run rerun clears them, matching the other timing-flaky e2e_ui tests
-# (test_sharing_journey / test_clone_session / test_mobile_workflow).
-@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_browser_tab_is_last_and_opens_pane(
     page: Page,
     seeded_session: tuple[str, str],
@@ -82,28 +75,34 @@ def test_browser_tab_is_last_and_opens_pane(
 
     page.add_init_script(_ELECTRON_SHELL_INIT_SCRIPT)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+    # The initial SPA cold-load (bundle parse + hydrate + first session fetch)
+    # can run past the 15s default expect timeout when the e2e_ui shard is under
+    # xdist load, which is what made this test flaky. Gate on the composer with
+    # the same generous budget open_right_rail already uses for the rail toggle;
+    # to_be_visible auto-waits, so it returns the instant the composer renders —
+    # the larger timeout only raises the ceiling, it doesn't slow the happy path.
+    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible(timeout=60_000)
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
 
-    # (1) The Browser tab is present under the Electron stub.
+    # (1) The Browser tab is present under the Electron stub. The rail's tabs can
+    # mount a beat after the rail container, so give the assertion headroom.
     browser_tab = rail.get_by_role("tab", name=re.compile("Browser"))
-    expect(browser_tab).to_be_visible()
+    expect(browser_tab).to_be_visible(timeout=30_000)
 
-    # (2) It is the LAST tab. Read every rail tab's accessible name in DOM
-    # order and confirm "Browser" is the final entry.
-    tab_names = rail.get_by_role("tab").all_inner_texts()
-    assert tab_names, "expected at least one Workspace rail tab"
-    assert re.search("Browser", tab_names[-1]), (
-        f"Browser tab must be last; rail tab order was {tab_names!r}"
-    )
+    # (2) It is the LAST tab. Assert directly on the last tab's text (web-first,
+    # auto-waiting so it retries while the rail finishes rendering) rather than
+    # snapshotting all_inner_texts() — a raw snapshot can read a half-rendered
+    # rail and race, e.g. before the trailing tabs mount. Matches the original
+    # inner-text check (all_inner_texts()[-1] contained "Browser").
+    expect(rail.get_by_role("tab").last).to_contain_text(re.compile("Browser"), timeout=30_000)
 
     # (3) Selecting it mounts the pane. The tab becomes the selected one
     # (aria-selected), which is what drives WorkspacePanel to render the
     # browser content region.
     browser_tab.click()
-    expect(browser_tab).to_have_attribute("aria-selected", "true")
+    expect(browser_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
 
 
 def test_no_browser_tab_in_plain_browser(
