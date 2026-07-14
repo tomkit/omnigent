@@ -3,7 +3,7 @@
 When a session is bound to a managed host whose sandbox idle-stopped, the
 open-session view must NOT dead-end on the ``host_offline`` reconnect banner:
 the host is resumable, so the composer stays ENABLED and its placeholder tells
-the user the next message will resume the sandbox host. This drives the
+the user the next message will bring the sandbox back online. This drives the
 ``host_asleep`` liveness variant (see ``web/src/hooks/useSessionLiveness.ts``
 row 3) end to end — host-bound + ``host_online=false`` + ``host_resumable=true``
 + the runner offline, and outside the startup grace.
@@ -33,8 +33,8 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, Route, expect
 
 _ASLEEP_PLACEHOLDER = (
-    "Current session's host is offline. "
-    "Next message will resume the sandbox host which can take minutes"
+    "Session host is offline — your next message brings its sandbox "
+    "back online (can take a minute or two)"
 )
 _FAKE_HOST_ID = "host_test_managed"
 # Unix seconds well before now so the session is outside the startup grace
