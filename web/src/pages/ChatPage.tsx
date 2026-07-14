@@ -954,6 +954,11 @@ export function ChatPage() {
         ...activeConv,
         permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
         host_resumable: activeSession?.hostResumable ?? false,
+        host_resumable: activeSession?.hostResumable ?? false,
+        // Managed sandbox hosts (non-null provider) are relaunchable-on-message
+        // even when not resume-in-place, so they must not dead-end to
+        // host_offline. Sourced from the snapshot like host_resumable.
+        host_managed: activeSession?.sandboxProvider != null,
       }
     : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
@@ -3399,10 +3404,12 @@ interface ComposerProps {
    */
   reconnectHint?: boolean;
   /**
-   * The session is host-bound to a dormant resumable managed host that is
+   * The session is host-bound to a dormant managed sandbox host that is
    * offline (`host_asleep`): the composer stays enabled, and the placeholder
-   * tells the user their next message will resume the sandbox host (which can
-   * take a few minutes) so the wake latency is expected, not surprising.
+   * tells the user their next message will bring the sandbox back (which can
+   * take a few minutes) so the latency is expected, not surprising. Covers
+   * both resume-in-place (same workspace) and relaunch-fresh (a new sandbox
+   * seeded from prior context, e.g. E2B after its lifetime cap).
    * Ignored once a turn is streaming.
    */
   sandboxAsleepHint?: boolean;
@@ -4829,7 +4836,7 @@ export function Composer({
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
                           : sandboxAsleepHint
-                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            ? "Session host is offline — your next message brings its sandbox back online (can take a minute or two)"
                             : reconnectHint
                               ? "Send a message to reconnect this session"
                               : "Ask the agent anything…"

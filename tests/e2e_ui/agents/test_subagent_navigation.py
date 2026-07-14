@@ -48,9 +48,18 @@ _RELAY_TIMEOUT_MS = 240_000
 def _send(page: Page, text: str) -> None:
     """Type *text* into the composer and click Send."""
     composer = page.get_by_placeholder(_COMPOSER)
-    expect(composer).to_be_visible(timeout=30_000)
+    # Initial SPA cold-load gate (bundle parse + hydrate + first session fetch)
+    # can run past the 15s/30s ceiling when the e2e_ui shard is under xdist load,
+    # which is what made this test flaky. Give it the same 60s budget the
+    # browser-tab de-flake uses; to_be_visible auto-waits, so it returns the
+    # instant the composer renders and the larger timeout only raises the ceiling.
+    expect(composer).to_be_visible(timeout=60_000)
     composer.fill(text)
-    page.get_by_role("button", name="Send", exact=True).click()
+    # Web-first gate before the click so it doesn't race a not-yet-mounted /
+    # not-yet-enabled Send control (the button enables once the composer has text).
+    send_button = page.get_by_role("button", name="Send", exact=True)
+    expect(send_button).to_be_visible(timeout=30_000)
+    send_button.click()
 
 
 # Nightly: this exercises the full dispatch + two-child + auto-wake UI
@@ -91,18 +100,33 @@ def test_two_joke_subagents_appear_and_navigate(
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     agents_tab = rail.get_by_role("tab", name=re.compile("^Agents"))
+    # The rail's tabs can mount a beat after the rail container, so wait for the
+    # Agents tab (web-first, auto-waits) before clicking — otherwise the click
+    # races a not-yet-rendered tab under xdist load.
+    expect(agents_tab).to_be_visible(timeout=30_000)
     agents_tab.click()
     rows = rail.locator(_SUBAGENT_ROW)
     expect(rows).to_have_count(2, timeout=30_000)
-    expect(rail).to_contain_text("comic_one")
-    expect(rail).to_contain_text("comic_two")
+    # Row text / status dot / count badge fill in as the two sub-agents register;
+    # bump these off the 15s default to 30s so a slow relay render under xdist
+    # load can't trip them (all auto-wait, so the happy path is unaffected).
+    expect(rail).to_contain_text("comic_one", timeout=30_000)
+    expect(rail).to_contain_text("comic_two", timeout=30_000)
     # Each row carries a status dot and its own child session id.
-    expect(rows.first.locator(_SUBAGENT_STATUS_DOT)).to_be_visible()
+    expect(rows.first.locator(_SUBAGENT_STATUS_DOT)).to_be_visible(timeout=30_000)
     # The count badge grew past the lone-agent baseline of 1 (main + 2).
-    expect(agents_tab).to_contain_text("3")
+    expect(agents_tab).to_contain_text("3", timeout=30_000)
 
     # (2) Clicking a sub-agent row swaps the chat to that child's session.
     target_row = rows.first
+    # Web-first gate before the raw get_attribute snapshot and the click: wait
+    # for the row to be visible AND to carry a populated data-child-session-id,
+    # so neither the (non-waiting) snapshot reads a half-mounted row (returning
+    # None) nor the click races a not-yet-rendered row.
+    expect(target_row).to_be_visible(timeout=30_000)
+    expect(target_row).to_have_attribute(
+        "data-child-session-id", re.compile(r".+"), timeout=30_000
+    )
     child_session_id = target_row.get_attribute("data-child-session-id")
     assert child_session_id, "subagent row is missing data-child-session-id"
     target_row.click()
@@ -113,8 +137,12 @@ def test_two_joke_subagents_appear_and_navigate(
     # "Sub-agent" identity caption.
     back_link = page.get_by_role("link", name="Back to parent session")
     expect(back_link).to_be_visible(timeout=30_000)
-    expect(back_link).to_have_attribute("href", re.compile(re.escape(f"/c/{chat.session_id}")))
-    expect(page.get_by_text("Sub-agent", exact=True)).to_be_visible()
+    # Header just mounted after the client-side nav; keep the href / identity
+    # caption assertions off the 15s default (30s) so they can settle under load.
+    expect(back_link).to_have_attribute(
+        "href", re.compile(re.escape(f"/c/{chat.session_id}")), timeout=30_000
+    )
+    expect(page.get_by_text("Sub-agent", exact=True)).to_be_visible(timeout=30_000)
 
     # Following it returns to the parent session.
     back_link.click()
