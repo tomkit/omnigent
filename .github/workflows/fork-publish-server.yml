@@ -68,6 +68,13 @@ on:
       - 'examples/polly/**'
       - 'examples/debby/**'
       - 'ap-web/**'
+      # The server image bakes the SPA built from web/ (deploy/docker/Dockerfile
+      # web-builder: WORKDIR /web/web, COPY web/ -> vite build ->
+      # omnigent/server/static/web-ui). Without this, a web/**-only change (e.g.
+      # a UI-only fix like #43) never rebuilds the image, so it silently ships
+      # nowhere. `web/**` also covers web/package-lock.json. (ap-web is a
+      # separate app dir.)
+      - 'web/**'
       - 'sdks/**'
       - 'pyproject.toml'
       - 'setup.py'
