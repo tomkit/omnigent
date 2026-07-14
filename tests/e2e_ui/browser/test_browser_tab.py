@@ -29,15 +29,24 @@ from tests.e2e_ui.conftest import open_right_rail
 # Minimal stand-in for the Electron preload bridge. Runs before any app script
 # on every navigation (add_init_script), so the SPA's feature detection
 # (``electronApi()`` in nativeBridge.ts, which checks
-# ``window.omnigentDesktop?.kind === "electron"``) sees a native shell. Every
-# method the web layer may call is a guarded no-op: ``kind`` is what gates the
-# Browser tab, and the rest keep unrelated native calls (badge, notify, the
-# title-bar server picker, and the browser-pane bridge probes) from throwing
-# under the stub. ``browserHasView`` resolves "no view yet" so the pane shows
-# its empty state instead of trying to attach a native WebContentsView.
+# ``window.omnigentDesktop?.kind === "electron"``) sees a native shell.
+#
+# ``browserOpenOrNavigate`` is LOAD-BEARING and must be a function: AppShell
+# gates the Browser rail tab on ``supportsBrowser()`` (nativeBridge.ts), which
+# probes exactly this method — NOT ``kind`` (an older desktop build exposes
+# ``kind`` but predates the ``browser*`` bridge, and must NOT surface a dead
+# tab). Omitting it makes ``supportsBrowser()`` false, so the tab never mounts
+# and this test's tab assertion times out — the root cause of its flakiness
+# after supportsBrowser() switched from an isElectronShell() check to probing
+# this method. Every other method is a guarded no-op so unrelated native calls
+# (badge, notify, the title-bar server picker, and the browser-pane bridge
+# probes) don't throw under the stub; ``browserHasView`` resolves "no view yet"
+# so the pane shows its empty state instead of attaching a native
+# WebContentsView.
 _ELECTRON_SHELL_INIT_SCRIPT = """
 window.omnigentDesktop = {
   kind: "electron",
+  browserOpenOrNavigate: function () { return Promise.resolve(); },
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function () { return function () {}; },
