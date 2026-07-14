@@ -3425,8 +3425,7 @@ def _wait_for_claude_prompt_ready(
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         f"({reason} in {polls} polls, {empty_polls} empty captures). "
-        f"The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        f"The message was not delivered." + _format_terminal_failure_tail(last_nonempty)
     )
 
 
