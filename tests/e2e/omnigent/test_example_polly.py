@@ -132,6 +132,7 @@ def test_spine_skills_present(polly_spec: AgentSpec) -> None:
         "cross-review",
         "fanout",
         "investigate",
+        "prose",
     ]
 
 
