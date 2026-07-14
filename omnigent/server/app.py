@@ -795,13 +795,23 @@ def _build_pi_native_bundle() -> bytes:
 
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
+    import os
     import tempfile
 
     from omnigent.pi_native import _materialize_pi_agent_spec
     from omnigent.spec import materialize_bundle
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_pi_agent_spec(Path(tmpdir))
+        # Pin the deployment's default model (OMNIGENT_MODEL) into the pi-native
+        # agent spec. A managed sandbox ships no ~/.omnigent/config.yaml, so Pi's
+        # env-var credential fallback needs a model to resolve the injected
+        # OpenAI-compatible provider (e.g. Fireworks); without one Pi defaults to
+        # its own api.openai.com login and rejects a non-OpenAI key. Unset leaves
+        # the model unpinned (prior behaviour). A changed spec refreshes the row
+        # in place via _ensure_builtin_agent.
+        spec_path = _materialize_pi_agent_spec(
+            Path(tmpdir), model=os.environ.get("OMNIGENT_MODEL") or None
+        )
         bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
         return _tar_gz_dir(bundle_dir)
 
