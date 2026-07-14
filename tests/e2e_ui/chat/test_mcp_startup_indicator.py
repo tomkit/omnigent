@@ -68,7 +68,14 @@ def test_mcp_startup_band_lifecycle(
         },
     )
     page.goto(f"{base_url}/c/{session_id}")
-    expect(band).to_contain_text("Starting MCP servers (0/3): glean, jira, safe", timeout=15_000)
+    # Initial appearance: the SPA cold-load (bundle parse + hydrate + first
+    # session fetch) plus the snapshot-cache seeding of the band can run past the
+    # 15s default expect timeout when the e2e_ui shard is under xdist load. Gate
+    # the first band assertion with the generous initial-load budget
+    # (open_right_rail uses 60s for its rail toggle); to_contain_text auto-waits,
+    # so it returns the instant the band renders — the larger timeout only raises
+    # the ceiling, it doesn't slow the happy path.
+    expect(band).to_contain_text("Starting MCP servers (0/3): glean, jira, safe", timeout=60_000)
 
     # 2. Live progress: one server settles, the count advances and the
     #    settled name drops out of the pending list.
@@ -81,7 +88,12 @@ def test_mcp_startup_band_lifecycle(
             "safe": {"status": "starting", "error": None},
         },
     )
-    expect(band).to_contain_text("Starting MCP servers (1/3): jira, safe", timeout=15_000)
+    # Live progress update after an async MCP publish + re-render. This is the
+    # assertion that flaked on sharded CI ("expected to contain 'Starting MCP
+    # servers (1/3): jira, safe'") — the band update lands after the async round,
+    # so give it the 30s render budget the codebase uses for post-async DOM
+    # updates instead of the tight 15s default. Auto-waiting, so no happy-path cost.
+    expect(band).to_contain_text("Starting MCP servers (1/3): jira, safe", timeout=30_000)
 
     # 3. The round settles with a failure: the spinner flips to the
     #    warning naming the server that never came up.
@@ -94,12 +106,17 @@ def test_mcp_startup_band_lifecycle(
             "safe": {"status": "failed", "error": "handshaking with MCP server failed"},
         },
     )
-    expect(band).to_contain_text("MCP startup incomplete (failed: safe)", timeout=15_000)
+    # Settle-with-failure re-render after the async publish: same 30s render
+    # budget so the spinner->warning flip has room under xdist load.
+    expect(band).to_contain_text("MCP startup incomplete (failed: safe)", timeout=30_000)
 
     # 4. A settled-empty map clears the band entirely (and evicts the
     #    snapshot cache): the session reads as a normal idle chat again.
     _publish_mcp_startup(base_url, session_id, {})
-    expect(band).to_have_count(0, timeout=15_000)
+    # Band clears (and snapshot cache evicts) after the settled-empty publish;
+    # to_have_count auto-waits, so raise the ceiling to the 30s render budget to
+    # absorb the async settle latency under load.
+    expect(band).to_have_count(0, timeout=30_000)
 
 
 def test_mcp_startup_band_shows_cancelled_after_stop(

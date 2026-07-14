@@ -54,7 +54,13 @@ _REPARK_CYCLES = 3
 _WS_RESCAN_S = 4.0
 # Inbox-surface and clear assertions ride the WS count patch (≤4s rescan) plus
 # a snapshot refetch, so allow well past that without masking a real hang.
-_REPARK_TIMEOUT_MS = 30_000
+# Bumped 30_000 -> 60_000: under xdist/CI load the session-list rescan loop
+# itself lags past its nominal 4s cadence, so a re-parked card can resurface a
+# few rescan windows late. Every consumer of this budget is an auto-waiting
+# expect() (to_have_count / to_have_attribute / to_be_visible), so the larger
+# ceiling only absorbs that lag — it returns the instant the state lands and
+# never slows the happy path — while staying well under the 600s test timeout.
+_REPARK_TIMEOUT_MS = 60_000
 
 
 def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:

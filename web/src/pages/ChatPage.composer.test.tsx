@@ -526,6 +526,11 @@ describe("AgentPicker trigger label", () => {
       conversationId: "conv_test",
       skills: [],
       selectedModel: null,
+      // Reset the session override too: a test that sets it (e.g. the
+      // sessionModelOverride-priority case) must not leak "sonnet" into a
+      // later test whose trigger would then resolve to it instead of its own
+      // expected label (regression after #1513 made the override win).
+      sessionModelOverride: null,
       selectedEffort: null,
       llmModel: null,
       codexModelOptions: [],
@@ -560,7 +565,7 @@ describe("AgentPicker trigger label", () => {
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
-  it("prefers a claude session override over the cross-session sticky model", () => {
+  it("prefers a claude session override over the cross-session sticky model", async () => {
     useChatStore.setState({
       selectedModel: "opus",
       sessionModelOverride: "sonnet",
@@ -582,7 +587,11 @@ describe("AgentPicker trigger label", () => {
     const trigger = screen.getByTestId("agent-picker-trigger");
     expect(trigger).toHaveTextContent("Sonnet 4.6");
     expect(trigger).not.toHaveTextContent("Opus");
-    trigger.click();
+    // Open the Radix model dropdown: jsdom needs a pointerdown, not a plain
+    // click (see NewTerminalButton.test.tsx), and the menu items mount
+    // asynchronously, so wait for them before querying the active row.
+    fireEvent.pointerDown(trigger, { button: 0 });
+    await screen.findAllByTestId("model-picker-item");
 
     const sonnetRow = document.querySelector<HTMLElement>(
       '[data-testid="model-picker-item"][data-model-id="sonnet"]',
