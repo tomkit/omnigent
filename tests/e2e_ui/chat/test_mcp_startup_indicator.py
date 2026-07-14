@@ -75,9 +75,7 @@ def test_mcp_startup_band_lifecycle(
     # (open_right_rail uses 60s for its rail toggle); to_contain_text auto-waits,
     # so it returns the instant the band renders — the larger timeout only raises
     # the ceiling, it doesn't slow the happy path.
-    expect(band).to_contain_text(
-        "Starting MCP servers (0/3): glean, jira, safe", timeout=60_000
-    )
+    expect(band).to_contain_text("Starting MCP servers (0/3): glean, jira, safe", timeout=60_000)
 
     # 2. Live progress: one server settles, the count advances and the
     #    settled name drops out of the pending list.
