@@ -568,6 +568,29 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
     )
 
 
+def _drop_gated_routers(listing: ModelListing) -> ModelListing:
+    """Drop Fireworks router models (``accounts/fireworks/routers/*``).
+
+    FireRouter is a gated Fireworks feature: most accounts get a
+    ``403 ... not allowed to use FireRouter`` when they invoke a router id,
+    even though Fireworks' ``/v1/models`` lists the routers. Surfacing them in
+    the catalog leads the model advisor / smart router to pick an unusable
+    model and fail the turn. Filter them out by default; set
+    ``OMNIGENT_ALLOW_FIREWORKS_ROUTERS=1`` to keep them for an account that has
+    FireRouter enabled.
+
+    :param listing: The provider's raw model listing.
+    :returns: The listing with router ids removed (or unchanged when the
+        escape hatch is set or nothing matched).
+    """
+    if os.environ.get("OMNIGENT_ALLOW_FIREWORKS_ROUTERS"):
+        return listing
+    kept = tuple(m for m in listing.models if "/routers/" not in m.id)
+    if len(kept) == len(listing.models):
+        return listing
+    return replace(listing, models=kept)
+
+
 def list_models_for_worker(
     spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
     harness: str | None,
@@ -577,7 +600,8 @@ def list_models_for_worker(
     """Enumerate the models one worker can run, family-filtered.
 
     Resolves the worker's provider, fetches (or replays from the TTL
-    cache) its unfiltered model listing, then applies the harness's
+    cache) its unfiltered model listing, drops gated Fireworks routers
+    (see :func:`_drop_gated_routers`), then applies the harness's
     family rule from :func:`~omnigent.model_override.model_family_mismatch`
     — claude harnesses keep Claude ids, codex harnesses keep GPT ids,
     pi keeps everything.
@@ -589,7 +613,7 @@ def list_models_for_worker(
     :returns: The worker's :class:`ModelListing`.
     """
     provider = resolve_model_provider(spec, harness)
-    listing = _listing_for_provider(provider, transport=transport)
+    listing = _drop_gated_routers(_listing_for_provider(provider, transport=transport))
     if harness is None:
         return listing
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
