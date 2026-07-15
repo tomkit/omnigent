@@ -59,7 +59,7 @@ dependency).
 - A sub-agent that returns a dark or failing result: don't re-prompt it in a
   loop — re-dispatch a fresh implementation sub-agent in a clean worktree, or
   escalate to the user.
-- polly merges each PR itself as its review clears, so cross-PR conflicts can
+- polly-fw merges each PR itself as its review clears, so cross-PR conflicts can
   surface at merge time. Keeping each parallel task's file scope disjoint is what
   keeps that rare — honor it. If a merge hits a conflict, re-dispatch that task's
   worker to rebase and resolve, then re-review; never resolve conflicts by
