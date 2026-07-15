@@ -737,6 +737,31 @@ def test_subscription_listing_is_static_and_unverified(
     assert "CLI login" in listing.note
 
 
+def test_codex_subscription_listing_includes_gpt_5_6_sol(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Codex subscription catalog advertises the current Power model.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  codex:\n    kind: subscription\n    cli: codex\n    default: true\n",
+    )
+    listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
+
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert [m.id for m in listing.models] == [
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+    ]
+
+
 def test_none_listing_explains_dead_worker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
