@@ -1590,6 +1590,24 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     return None
 
 
+def _coerce_optional_config_bool(value: Any) -> bool | None:
+    """Coerce an ``executor.config`` scalar to ``bool | None``.
+
+    The spec parser stringifies every ``executor.config`` value, so a YAML
+    ``use_responses: false`` reaches this code as the string ``"False"`` — which
+    is truthy, so a naive ``"true" if value else "false"`` would emit ``true``
+    and route the harness at the OpenAI ``/responses`` API (a 404 on
+    chat-completions-only gateways like Fireworks). Treat the usual falsy
+    spellings as ``False`` and leave ``None`` (unset) untouched so callers can
+    still fall back to a model-derived default.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("", "false", "0", "no", "off", "none")
+
+
 def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Build the env-var dict the openai-agents harness wrap reads.
@@ -1639,7 +1657,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     provider = _resolve_provider_for_build(spec, harness_type="openai-agents-sdk", for_launch=True)
     if provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="openai-agents-sdk")
-        use_responses = spec.executor.config.get("use_responses")
+        use_responses = _coerce_optional_config_bool(spec.executor.config.get("use_responses"))
         if use_responses is not None:
             env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = "true" if use_responses else "false"
         return env
@@ -1695,7 +1713,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     elif "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE" in env:
         ucode_profile = env["HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE"]
 
-    use_responses = spec.executor.config.get("use_responses")
+    use_responses = _coerce_optional_config_bool(spec.executor.config.get("use_responses"))
     if use_responses is not None:
         env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = "true" if use_responses else "false"
     configure_agent_harness_with_ucode(
