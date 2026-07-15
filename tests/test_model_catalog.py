@@ -22,6 +22,9 @@ from cachetools import TTLCache
 
 import omnigent.model_catalog as model_catalog
 from omnigent.model_catalog import (
+    ModelEntry,
+    ModelListing,
+    _drop_gated_routers,
     catalog_for_spec,
     list_models_for_worker,
     resolve_model_provider,
@@ -1214,3 +1217,53 @@ def test_keychain_credential_ref_degrades_not_crashes(
     assert listing.source == "none"
     assert not listing.models
     assert listing.note, "degraded keychain row must carry an explanatory note"
+
+
+def _fw_listing() -> ModelListing:
+    """A Fireworks-style listing mixing direct models and a gated router."""
+    return ModelListing(
+        source="openai-compatible",
+        verified=True,
+        models=(
+            ModelEntry(id="accounts/fireworks/models/glm-5p2", family="openai"),
+            ModelEntry(id="accounts/fireworks/routers/glm-latest", family="openai"),
+            ModelEntry(id="accounts/fireworks/models/deepseek-v4-pro", family="openai"),
+        ),
+        note="",
+    )
+
+
+def test_drop_gated_routers_removes_router_ids() -> None:
+    """FireRouter ids (accounts/fireworks/routers/*) are dropped by default.
+
+    Fireworks lists routers in /v1/models, but most accounts get a 403 when
+    invoking one; surfacing them lets the advisor pick an unusable model.
+    """
+    out = _drop_gated_routers(_fw_listing())
+    assert [m.id for m in out.models] == [
+        "accounts/fireworks/models/glm-5p2",
+        "accounts/fireworks/models/deepseek-v4-pro",
+    ]
+
+
+def test_drop_gated_routers_escape_hatch_keeps_routers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_ALLOW_FIREWORKS_ROUTERS=1 keeps routers for FireRouter-enabled accounts.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_ALLOW_FIREWORKS_ROUTERS", "1")
+    out = _drop_gated_routers(_fw_listing())
+    assert any("/routers/" in m.id for m in out.models)
+
+
+def test_drop_gated_routers_noop_when_no_routers() -> None:
+    """A listing with no routers is returned unchanged (same object)."""
+    listing = ModelListing(
+        source="static",
+        verified=False,
+        models=(ModelEntry(id="gpt-5.4", family="openai"),),
+        note="",
+    )
+    assert _drop_gated_routers(listing) is listing
