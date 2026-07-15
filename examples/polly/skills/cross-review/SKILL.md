@@ -51,8 +51,11 @@ anyone needs to read through.
    updates its existing PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the PR passes
-   review — mark it ready in the registry (with its PR URL) and leave it for
-   the human to merge. polly does NOT merge it.
+   review — mark it ready in the registry (with its PR URL) and merge it
+   yourself with `gh pr merge` (squash + delete-branch unless the repo prefers
+   otherwise). If the merge is refused — branch protection, a required human
+   approval, or conflicts — record that and escalate to the user rather than
+   forcing it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
 

@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. polly never merges; the human does.
+description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR and merge each one that passes.
 ---
 
 # fanout — safe parallel execution
@@ -37,9 +37,12 @@ dependency).
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
 4. Send each finished task's PR through `cross-review`.
-5. polly does NOT merge — the PR is the deliverable. When cross-review passes,
-   the task is done: mark it ready in the registry with its PR URL and leave it
-   for the human to review and merge. Never run `git merge` / `gh pr merge`.
+5. When cross-review passes with no blocking issues, the task is done: mark it
+   ready in the registry with its PR URL and merge it yourself with
+   `gh pr merge` (squash + delete-branch unless the repo prefers otherwise).
+   Merge each PR independently as its review clears — don't batch. If a merge is
+   refused (branch protection / required human approval / conflicts), record it
+   and escalate; never force-push or hard-reset to work around it.
 6. Remove a finished worktree (`git worktree remove`) only once its PR is open
    and review is clean — the branch lives on the remote, so the worktree is
    disposable. Don't remove a worktree that still has open fix-tasks.
@@ -56,6 +59,8 @@ dependency).
 - A sub-agent that returns a dark or failing result: don't re-prompt it in a
   loop — re-dispatch a fresh implementation sub-agent in a clean worktree, or
   escalate to the user.
-- Because polly never merges, cross-PR conflicts surface when the human merges,
-  not here. Keeping each parallel task's file scope disjoint is what keeps that
-  rare — honor it.
+- polly merges each PR itself as its review clears, so cross-PR conflicts can
+  surface at merge time. Keeping each parallel task's file scope disjoint is what
+  keeps that rare — honor it. If a merge hits a conflict, re-dispatch that task's
+  worker to rebase and resolve, then re-review; never resolve conflicts by
+  force-push or hard-reset.
