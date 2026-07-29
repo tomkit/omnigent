@@ -1,0 +1,56 @@
+# Fly.io config for a SECOND fork server: app `local-circuits`.
+#
+# Purpose: a LOCAL-ONLY, multi-tenant (accounts-mode) omnigent server for a
+# 3-person team working on github.com/Duber88/Local-Circuits. Each user attaches
+# their OWN local machine as a host and runs their OWN claude/codex CLIs — there
+# is NO Daytona / managed sandbox in this deployment, so:
+#   - NO `sandbox:` config.yaml on the volume (managed provider stays disabled)
+#   - NO Daytona secrets (DAYTONA_API_KEY, OMNIGENT_DAYTONA_HOST_IMAGE), NO relay
+#   - NO server-side model keys required (agents run on users' local CLIs)
+# The only required secret is OMNIGENT_ACCOUNTS_COOKIE_SECRET (set via `fly secrets`).
+#
+# Reuses the SAME fork server image as omnigent-tomkit, pinned to the v0.7.0
+# build. Deploy with:
+#   fly deploy -c deploy/fly/fly.local-circuits.toml -a local-circuits
+#
+# IMPORTANT: host connections live in an in-memory PER-REPLICA registry, so this
+# app MUST run a SINGLE machine (no horizontal autoscaling) or host launches will
+# miss the replica the host is connected to.
+
+app = "local-circuits"
+primary_region = "ord"
+
+[build]
+  # Pinned to the v0.7.0 fork build (same image family as omnigent-tomkit).
+  # See deploy/fly/RUNBOOK.tomkit.md for the offline-migrate cutover flow.
+  image = "ghcr.io/tomkit/omnigent-server:sha-fbf71ee"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8000"
+  ARTIFACT_DIR = "/data/artifacts"
+  OMNIGENT_ADMIN_CREDENTIALS_PATH = "/data/admin-credentials"
+  OMNIGENT_AUTH_PROVIDER = "accounts"
+  OMNIGENT_ACCOUNTS_BASE_URL = "https://local-circuits.fly.dev"
+  DATABASE_URL = "sqlite:////data/artifacts/chat.db"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+[mounts]
+  source = "artifact_data"
+  destination = "/data/artifacts"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
