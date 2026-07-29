@@ -158,7 +158,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -2409,6 +2409,34 @@ def _resolve_git_identity(
     )
 
 
+def _git_sync_kwargs(
+    git_user_name: str | None,
+    git_user_email: str | None,
+    context_repos: Sequence[ContextRepo],
+) -> dict[str, object]:
+    """
+    Build the bidirectional-git-sync kwargs for :meth:`SandboxLauncher.start_host`.
+
+    Returns an EMPTY dict when the deployment configured no git sync, so the
+    parameters are omitted from the call entirely rather than passed as
+    ``None``. A deployment-injected launcher whose ``start_host`` predates
+    these parameters then keeps working on the un-configured path — the same
+    contract ``host_config`` already has.
+
+    :param git_user_name: Commit identity name, or ``None`` when sync is off.
+    :param git_user_email: Commit identity email, or ``None`` when sync is off.
+    :param context_repos: Extra repos to clone; empty when none are configured.
+    :returns: The kwargs to splat into ``start_host``, possibly empty.
+    """
+    kwargs: dict[str, object] = {}
+    if git_user_name is not None or git_user_email is not None:
+        kwargs["git_user_name"] = git_user_name
+        kwargs["git_user_email"] = git_user_email
+    if context_repos:
+        kwargs["context_repos"] = tuple(context_repos)
+    return kwargs
+
+
 async def _arm_and_start_host(
     *,
     launcher: SandboxLauncher,
@@ -2484,13 +2512,12 @@ async def _arm_and_start_host(
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
-            git_user_name=git_user_name,
-            git_user_email=git_user_email,
-            context_repos=config.context_repos or None,
             on_stage=on_stage,
-            # Omitted entirely when unset: a deployment-injected launcher
-            # predating the host_config parameter must keep launching.
+            # Both blocks are omitted entirely when unset, so a
+            # deployment-injected launcher predating either parameter keeps
+            # launching on the un-configured path.
             **({"host_config": config.host_config} if config.host_config is not None else {}),
+            **_git_sync_kwargs(git_user_name, git_user_email, config.context_repos),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
@@ -2723,7 +2750,7 @@ async def resume_managed_host(
             # The identity, by contrast, IS re-applied: a `git config --global`
             # is cheap and idempotent (a no-op when unchanged), so a host whose
             # home volume predates git sync being enabled still gets one.
-            git_user_name, git_user_email = _resolve_git_identity(config, host.owner)
+            git_user_name, git_user_email = _resolve_git_identity(config, host.user_id)
             await asyncio.to_thread(
                 launcher.start_host,
                 sandbox_id,
@@ -2739,8 +2766,9 @@ async def resume_managed_host(
                 # (Base start_host still cleans up previously injected entries
                 # on resumable launchers when the block is removed.)
                 **({"host_config": config.host_config} if config.host_config is not None else {}),
-                git_user_name=git_user_name,
-                git_user_email=git_user_email,
+                # Context repos are deliberately not re-cloned on resume (see
+                # above), so only the identity half is re-applied here.
+                **_git_sync_kwargs(git_user_name, git_user_email, ()),
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:

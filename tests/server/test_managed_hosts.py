@@ -1909,7 +1909,7 @@ async def test_launch_git_sync_configures_identity_and_widens_refspec(db_uri: st
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1954,7 +1954,7 @@ async def test_launch_git_sync_defaults_commit_email_to_owner(db_uri: str) -> No
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1977,7 +1977,7 @@ async def test_launch_without_git_sync_leaves_git_unconfigured(db_uri: str) -> N
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -2003,7 +2003,7 @@ async def test_launch_clones_context_repos_beside_workspace(db_uri: str) -> None
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, owner=_OWNER
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
