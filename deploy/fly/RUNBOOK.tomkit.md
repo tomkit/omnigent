@@ -172,3 +172,43 @@ is non-destructive and reversible. To roll back to a *previous fork* build
 instead, deploy an earlier `ghcr.io/tomkit/omnigent-server:sha-<short>`. You can
 also use `fly releases -a omnigent-tomkit` to see the release history and
 `fly deploy ... --image <prev>` to pin any prior image.
+
+## Upgrading across a schema change (the v0.7.0 lesson)
+
+A release with table-rebuilding migrations must NOT be upgraded by letting the
+new image boot and run `alembic upgrade head`: `deploy/docker/entrypoint.py`
+migrates synchronously before binding `:8000`, so a long rebuild flaps the
+health check into a crash loop, and an interrupted `batch_alter_table` strands
+an `_alembic_tmp_<table>` that blocks every retry.
+
+**Migrate in-container on an IDLE machine booted from the TARGET image.**
+
+```bash
+APP=omnigent-tomkit; M=<machine-id>; IMG=ghcr.io/tomkit/omnigent-server:sha-<short>
+fly volume snapshots create <vol> -a $APP           # safety net
+fly machine update $M -a $APP --image "$IMG" \
+  --command "sleep infinity" --skip-health-checks --yes
+# ...upload a migrate script, then run it with SQLite temp pinned to the volume:
+#   SQLITE_TMPDIR=/data/artifacts TMPDIR=/data/artifacts python3 /data/artifacts/migrate.py
+fly deploy -c deploy/fly/fly.tomkit.toml -a $APP --image "$IMG"   # restores CMD
+```
+
+Why in-container is safe here, despite the old "never migrate on Fly" rule:
+that rule targets two specific causes, and both are removed. SQLite spills
+table-rebuild temp files into the container **overlay** (slow) unless
+`SQLITE_TMPDIR` points at the volume — pin it, and the rebuild runs on the same
+fast device as the DB. And an idle machine has no health check to trip.
+
+> [!IMPORTANT]
+> **Do not plan on `fly ssh sftp put` for a multi-hundred-MB DB.** Measured at
+> **~3.6 KB/s** against this app — ~26h for a 344 MB upload — while `sftp get`
+> managed ~2.4 MB/s. Pulling the DB down to migrate locally is fine; pushing it
+> back is not. Small files (a migrate script) upload fine.
+
+Always finish with `ANALYZE` (the migrate script above does): table rebuilds and
+`VACUUM` wipe `sqlite_stat1`, and without stats the planner picks catastrophic
+plans — the observed failure was a child-session query taking >2min and pegging
+every worker thread. Verify before restoring service: `PRAGMA integrity_check`
+== ok, `alembic_version` == head, row counts unchanged, no `_alembic_tmp_*`
+tables, and `sqlite_stat1` non-empty. Keep the pre-upgrade DB on the volume
+(`chat.db.pre-v070`) until the new version has run clean for a while.
