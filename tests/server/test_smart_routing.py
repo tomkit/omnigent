@@ -220,6 +220,68 @@ async def test_llm_routing_client_rejects_empty_model() -> None:
     assert result is None
 
 
+@dataclass
+class _FakeNativeToolOutput:
+    """A judge output item that carries no ``content`` at all.
+
+    Reasoning-style models behind an OpenAI-compatible gateway (observed with
+    GLM on Fireworks) emit a native-tool / reasoning item BEFORE the assistant
+    message, so the verdict is never at ``output[0]``.
+    """
+
+    type: str = "native_tool"
+
+
+class _ToolFirstLLMClient:
+    """Fake judge whose verdict follows a contentless native-tool item."""
+
+    def __init__(self, verdict: dict[str, Any]) -> None:
+        self._verdict = verdict
+
+    async def create(self, **kwargs: Any) -> _FakeResponse:
+        return _FakeResponse(
+            output=[
+                _FakeNativeToolOutput(),
+                _FakeMessageOutput(content=[_FakeOutputText(text=json.dumps(self._verdict))]),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_reads_verdict_after_a_tool_output() -> None:
+    """A verdict that is not the FIRST output item still routes.
+
+    Indexing ``output[0].content[0]`` raises AttributeError on these responses,
+    and ``route`` fails open — so the router silently never routes for an
+    entire class of judge models. Scan the outputs for the first text instead.
+    """
+    models = infer_models("claude-sdk")
+    assert models is not None
+    verdict = {"harness": "claude-sdk", "model": models[-1], "rationale": "hard task"}
+    client = LLMRoutingClient(_ToolFirstLLMClient(verdict))
+
+    result = await client.route("refactor everything", {"claude-sdk": models})
+
+    assert result is not None
+    assert result.model == models[-1]
+    assert result.rationale == "hard task"
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_returns_none_when_no_output_carries_text() -> None:
+    """A response with no text anywhere fails open rather than raising."""
+
+    class _TextlessLLM:
+        async def create(self, **kwargs: Any) -> _FakeResponse:
+            return _FakeResponse(output=[_FakeNativeToolOutput()])
+
+    models = infer_models("claude-sdk")
+    assert models is not None
+    client = LLMRoutingClient(_TextlessLLM())
+
+    assert await client.route("hello", {"claude-sdk": models}) is None
+
+
 @pytest.mark.asyncio
 async def test_llm_routing_client_returns_none_on_error() -> None:
     class _BrokenLLM:
