@@ -33,7 +33,7 @@ from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKE
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
@@ -319,41 +319,6 @@ class RemoteCommandResult:
     stderr: str
 
 
-@dataclass(frozen=True)
-class ContextRepo:
-    """
-    An ADDITIONAL git repository to clone into the sandbox alongside the
-    primary workspace repo — the transport for the bidirectional
-    skills / memory-files "git bus".
-
-    A managed session's primary workspace is one repo (the ``repo_*``
-    arguments to :meth:`SandboxLauncher.start_host`). Operators can sync
-    extra host-local content — a user's skills directory, agent memory
-    files — by pointing a context repo at a path the harness reads
-    (e.g. ``.claude/skills`` under the workspace, or an absolute
-    ``$HOME``-relative path). Each is cloned with the same machinery as
-    the primary repo (clone-at-branch, all-branches fetch refspec, the
-    image's GIT_TOKEN credential helper for private-repo auth) so edits
-    on either host round-trip via commit / push / pull.
-
-    Construct these in the server layer (validated) and pass them as
-    primitives so this onboarding-layer module carries no server
-    dependency — the mirror of how ``repo_*`` reach :meth:`start_host`.
-
-    :param url: Clone URL with any ``#branch`` fragment already stripped,
-        e.g. ``"https://github.com/me/skills.git"``.
-    :param branch: Branch to clone / track, or ``None`` for the default.
-    :param dest: Where the clone lands inside the sandbox. An absolute
-        path (``/...``) is used as-is; a relative path is resolved under
-        the session workspace, e.g. ``".claude/skills"`` →
-        ``<workspace>/.claude/skills``.
-    """
-
-    url: str
-    branch: str | None
-    dest: str
-
-
 class RemoteProcess(ABC):
     """
     A streaming remote process spawned by
@@ -525,9 +490,6 @@ class SandboxLauncher(ABC):
         repo_branch: str | None = None,
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
-        git_user_name: str | None = None,
-        git_user_email: str | None = None,
-        context_repos: Sequence[ContextRepo] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -551,18 +513,6 @@ class SandboxLauncher(ABC):
         as primitives (not the server's ``RepoWorkspace``) so this
         onboarding-layer method carries no server dependency.
 
-        **Bidirectional git sync.** When *git_user_name* / *git_user_email* are
-        set, this configures a global git identity in the sandbox (without it an
-        agent's ``git commit`` fails with "Author identity unknown") and sets an
-        all-branches fetch refspec on every clone, so an agent can commit on a
-        working branch and ``git push`` it back — and ``git fetch`` / ``git
-        pull`` a branch the other host pushed. Push / fetch AUTH is handled by
-        the host image's GIT_TOKEN credential helper (see
-        ``deploy/docker/Dockerfile``), so the token is supplied by-reference from
-        the sandbox env and never written to ``.git/config`` on disk.
-        *context_repos* are extra repositories (a user's skills / memory-files
-        repo) cloned into harness-read paths with the same machinery.
-
         :param sandbox_id: The sandbox from :meth:`provision`.
         :param token: The raw launch token the host authenticates with.
         :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
@@ -580,15 +530,6 @@ class SandboxLauncher(ABC):
             launchers ``None`` still runs the cleanup so entries injected by a
             since-removed block don't outlive it — see
             :func:`render_host_config_write_command`.
-        :param git_user_name: ``user.name`` for in-sandbox commits, or ``None``
-            to leave git identity unset (no commit/push-back configured). Must
-            be passed together with *git_user_email* — a commit needs both, so
-            supplying just one raises ``click.ClickException``.
-        :param git_user_email: ``user.email`` for in-sandbox commits, or
-            ``None`` to leave git identity unset. Both-or-neither with
-            *git_user_name* (see above).
-        :param context_repos: Extra repositories to clone into the sandbox (the
-            skills / memory-files git bus), or ``None`` for none.
         :param on_stage: Progress observer invoked with ``"cloning"`` before the
             clone (when *repo_url* is set) and ``"starting"`` before the host
             launches. Runs on this (worker) thread, so it must be thread-safe.
@@ -606,82 +547,17 @@ class SandboxLauncher(ABC):
                 f"could not resolve $HOME inside sandbox '{sandbox_id}' — "
                 "the configured image must provide a usable shell environment"
             )
-        workspace_base = f"{home}/workspace"
-        # Validate the WHOLE request before any sandbox-MUTATING command (the
-        # mkdir / clones below), so a rejected launch leaves the sandbox
-        # untouched. The only sandbox call these guards lean on is the $HOME
-        # probe above — a read-only query (collision detection resolves
-        # relative dests under <workspace_base>, which needs $HOME).
-        #
-        # Identity guard: a commit needs BOTH user.name and user.email, so the
-        # identity is a unit — armed together or not at all. The server's
-        # _resolve_git_identity always supplies both-or-neither; guard the
-        # invariant so a future caller passing just one fails loud here, rather
-        # than silently arming the sync path (refspec widening below) against a
-        # sandbox whose `git commit` would still abort with "Author identity
-        # unknown" — push-back broken with no error.
-        if (git_user_name is None) != (git_user_email is None):
-            raise click.ClickException(
-                "bidirectional git sync needs both user.name and user.email "
-                "(or neither) — got only "
-                f"{'user.name' if git_user_name is not None else 'user.email'}"
-            )
-        # Collision guard: resolve every clone destination. The primary repo
-        # (when the session has one) clones into <base>/<repo_name>; each
-        # context repo into its absolute dest as-is (e.g. a "$HOME"-relative
-        # skills path the operator pins), or under <base> for a relative one —
-        # beside the repo, NOT inside the primary clone dir. Two repos resolving
-        # to the same path is a config error: the second `git clone` would abort
-        # on a non-empty target and strand the sandbox half-cloned, so reject
-        # collisions here, before anything is created.
-        context_specs: list[tuple[str, str | None, str]] = []
-        for context in context_repos or ():
-            dest = (
-                context.dest
-                if context.dest.startswith("/")
-                else f"{workspace_base}/{context.dest}"
-            )
-            context_specs.append((context.url, context.branch, dest))
-        seen: set[str] = set()
-        primary_dest = f"{workspace_base}/{repo_name}" if repo_url is not None else None
-        for dest in ([primary_dest] if primary_dest is not None else []) + [
-            spec[2] for spec in context_specs
-        ]:
-            key = dest.rstrip("/")
-            if key in seen:
-                raise click.ClickException(
-                    f"two repositories resolve to the same clone destination "
-                    f"'{dest}' inside the sandbox — the primary workspace and "
-                    "every context repo must clone into a distinct path"
-                )
-            seen.add(key)
-        # Request validated — now mutate the sandbox.
-        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace_base)}")
-        # Identity is global (~/.gitconfig), so it applies to the primary clone,
-        # the context-repo clones, and every later agent commit in any of them.
-        self._configure_git_identity(sandbox_id, git_user_name, git_user_email)
-        bidirectional = git_user_name is not None
-        # The returned workspace is the primary clone dir (or the base when the
-        # session has no repo); context repos clone alongside it, never changing
-        # what the session binds. The primary repo goes through
-        # materialize_workspace so a provider that resolves a local checkout
-        # instead of cloning still gets the sync wiring.
-        workspace = workspace_base
+        workspace = f"{home}/workspace"
+        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
         if repo_url is not None:
             workspace = self.materialize_workspace(
                 sandbox_id,
-                workspace=workspace_base,
+                workspace=workspace,
                 repo_url=repo_url,
                 repo_branch=repo_branch,
                 repo_name=repo_name,
                 on_stage=on_stage,
             )
-            if bidirectional:
-                self._widen_fetch_refspec(sandbox_id, workspace, repo_url)
-        for url, branch, dest in context_specs:
-            if on_stage is not None:
-                on_stage("cloning")
-            self._clone_repo(sandbox_id, url, branch, dest, bidirectional=bidirectional)
         # "starting" covers from here through host registration — the caller's
         # online poll resolves it.
         if on_stage is not None:
@@ -757,78 +633,6 @@ class SandboxLauncher(ABC):
         if on_stage is not None:
             on_stage("cloning")
         clone_dir = f"{workspace}/{repo_name}"
-        # Bidirectional wiring is applied by start_host after materialization,
-        # so an override that resolves a local checkout gets it too.
-        self._clone_repo(sandbox_id, repo_url, repo_branch, clone_dir, bidirectional=False)
-        return clone_dir
-
-    def _configure_git_identity(
-        self,
-        sandbox_id: str,
-        git_user_name: str | None,
-        git_user_email: str | None,
-    ) -> None:
-        """
-        Set a global git ``user.name`` / ``user.email`` in the sandbox.
-
-        Without an identity an agent's ``git commit`` aborts with "Author
-        identity unknown", so this is the gating step that makes
-        bidirectional push-back possible at all. Set ``--global`` (writes
-        ``~/.gitconfig``) so it covers the primary clone, every context
-        repo, and any repo the agent later creates — and so it survives a
-        suspend/resume (the home volume persists).
-
-        No-op when neither value is configured, preserving the prior
-        behavior for sessions that don't opt into git sync.
-
-        :param sandbox_id: Target sandbox.
-        :param git_user_name: ``user.name`` to set, or ``None`` to skip.
-        :param git_user_email: ``user.email`` to set, or ``None`` to skip.
-        :raises click.ClickException: If a git config command fails.
-        """
-        if git_user_name is not None:
-            self.run(
-                sandbox_id,
-                f"git config --global user.name {shlex.quote(git_user_name)}",
-            )
-        if git_user_email is not None:
-            self.run(
-                sandbox_id,
-                f"git config --global user.email {shlex.quote(git_user_email)}",
-            )
-
-    def _clone_repo(
-        self,
-        sandbox_id: str,
-        repo_url: str,
-        repo_branch: str | None,
-        clone_dir: str,
-        *,
-        bidirectional: bool,
-    ) -> None:
-        """
-        Clone one repository into the sandbox, optionally wiring it for
-        bidirectional sync.
-
-        Clones at *repo_branch* (``--branch … --single-branch`` for a fast,
-        narrow clone). When *bidirectional* is set, the post-clone fetch
-        refspec is widened back to all branches
-        (``+refs/heads/*:refs/remotes/origin/*``) so the agent can ``git
-        fetch`` / ``git pull`` a branch the OTHER host pushed — the reverse
-        leg of the round-trip — while the clone itself stays single-branch
-        and cheap. Auth for both the clone and later push/fetch comes from
-        the host image's GIT_TOKEN credential helper, so nothing here writes
-        a token to disk.
-
-        :param sandbox_id: Target sandbox.
-        :param repo_url: Clone URL (fragment already stripped).
-        :param repo_branch: Branch to clone, or ``None`` for the default.
-        :param clone_dir: Absolute destination directory in the sandbox.
-        :param bidirectional: Widen the fetch refspec to all branches after
-            cloning, enabling pulls of branches pushed by the other host.
-        :raises click.ClickException: With the repository named, if the
-            clone fails.
-        """
         branch_args = (
             f"--branch {shlex.quote(repo_branch)} --single-branch "
             if repo_branch is not None
@@ -847,37 +651,7 @@ class SandboxLauncher(ABC):
                 f"failed to clone repository '{repo_url}'"
                 f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
             ) from exc
-        if bidirectional:
-            self._widen_fetch_refspec(sandbox_id, clone_dir, repo_url)
-
-    def _widen_fetch_refspec(self, sandbox_id: str, clone_dir: str, repo_url: str) -> None:
-        """
-        Reset a clone's fetch refspec to all branches.
-
-        A ``--single-branch`` clone pins ``remote.origin.fetch`` to just the
-        cloned branch, so ``git fetch`` would never see other branches. The
-        standard all-branches refspec lets the sandbox pull whatever branch
-        the other host pushed — the reverse leg of the round-trip. Failures
-        name the repo and the operation being wired, so a
-        configured-but-broken sync fails loud instead of surfacing as an
-        opaque "sandbox command exited non-zero".
-
-        :param sandbox_id: Target sandbox.
-        :param clone_dir: Absolute path of the clone to reconfigure.
-        :param repo_url: Repository the clone came from, for the error message.
-        :raises click.ClickException: If the git config command fails.
-        """
-        refspec = shlex.quote("+refs/heads/*:refs/remotes/origin/*")
-        try:
-            self.run(
-                sandbox_id,
-                f"git -C {shlex.quote(clone_dir)} config remote.origin.fetch {refspec}",
-            )
-        except click.ClickException as exc:
-            raise click.ClickException(
-                f"failed to widen the fetch refspec for bidirectional sync "
-                f"of '{repo_url}': {exc.message}"
-            ) from exc
+        return clone_dir
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -944,18 +718,6 @@ class SandboxLauncher(ABC):
         assignments before running the program. Providers where backgrounded
         processes are reaped on exec return (e.g. OpenShell) override this
         to hold the exec stream open instead.
-
-        *command* is run via ``sh -c`` rather than spliced directly after
-        ``setsid nohup``. This is required for commands that carry a leading
-        ``VAR=value …`` environment prefix (e.g. the ``omnigent host`` launch
-        from :meth:`start_host`): in POSIX shell, ``NAME=value`` tokens that
-        follow a command word are ARGUMENTS, not assignments, so
-        ``setsid nohup VAR=value omnigent host …`` makes ``nohup`` try to exec
-        a program literally named ``VAR=value`` (exit 127) and the env vars
-        never reach the host — a failure masked by the trailing ``echo
-        launched``. Wrapping in ``sh -c '<command>'`` hands the prefix to a
-        fresh shell that parses it as a normal simple-command assignment, so
-        the vars are exported into the host's environment.
 
         :param sandbox_id: Target sandbox.
         :param command: Shell command to background, e.g.

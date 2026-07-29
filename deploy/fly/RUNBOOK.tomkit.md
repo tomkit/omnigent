@@ -9,7 +9,7 @@ and the data volume survive, and how to roll back.
 
 The live `omnigent-tomkit` machine was running the **upstream** image
 `omnigent-ai/omnigent-server:latest`. That image does **not** contain our merged
-fork PRs (idle-suspend / reclaim-retention, bidirectional context sync), and any
+fork PRs (managed-runner REST auth, pi+Fireworks, claude-native startup), and any
 redeploy pulling upstream `:latest` overwrites them. So none of the fork code
 actually ran in production.
 
