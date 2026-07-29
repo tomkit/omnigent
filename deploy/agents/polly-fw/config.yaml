@@ -59,7 +59,7 @@ prompt: |
   What you MAY do directly, without spinning up a sub-agent, is NON-CODE
   authoring: writing or editing documentation and other prose/text files —
   Markdown, plain text, and the like — and authoring skills (always into
-  polly-fw's own `examples/polly-fw/skills/`; see below). The line is by KIND,
+  polly-fw's own `deploy/agents/polly-fw/skills/`; see below). The line is by KIND,
   not size: source code and tests always go to a sub-agent even for a one-line
   change, while a docs/text edit is yours to make even across several files. The
   moment a "docs" task starts requiring code changes or real code investigation,
@@ -244,7 +244,7 @@ prompt: |
 
   Authoring skills: skills are prose, not code, so you author them directly
   yourself — no sub-agent needed. A skill always belongs in polly-fw's OWN
-  skills directory — `examples/polly-fw/skills/<name>/SKILL.md` in this repo —
+  skills directory — `deploy/agents/polly-fw/skills/<name>/SKILL.md` in this repo —
   NEVER a host `~/.claude/skills/` (or any user-scope) directory.
 
   Pull the human in at the plan gate and on hard blocks. Sub-agents notify you

@@ -3,11 +3,10 @@
 polly is the standalone multi-agent coding orchestrator (successor to the
 deleted nessie example, whose deep structural pins were folded in here).
 Loads the bundle and asserts the distinctive wiring stays intact: the
-claude-sdk orchestrator brain, the three enabled cross-vendor coding sub-agents
-(claude_code / codex / pi, which implement, review, and explore),
-the three spine skills, and the bounds/blast-radius guardrails. The
-opencode / cursor / hermes specs still ship under agents/ and are still
-asserted here, but this fork does not register them. Pure spec-load
+claude-sdk orchestrator brain, the six cross-vendor coding sub-agents
+(claude_code / codex / opencode / cursor / hermes / pi, which implement, review,
+and explore),
+the three spine skills, and the bounds/blast-radius guardrails. Pure spec-load
 — no LLM, no credentials.
 
 What breaks if this fails:
@@ -70,22 +69,23 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    This fork enables exactly three coding sub-agents: ``claude_code``
-    (claude-native) and ``codex`` (codex-native) on the native terminal
+    The bundle has exactly six coding sub-agents: ``claude_code`` (claude-native),
+    ``codex`` (codex-native), ``opencode`` (opencode-native), ``cursor``
+    (cursor-native), and ``hermes`` (hermes-native) on the native terminal
     harnesses, plus ``pi`` (pi) as the headless multi-model worker. All
     implement, review, and explore. The native harnesses render terminal-first
     (Chat / Terminal pill) so the human can watch or take over.
 
-    Upstream also registers ``opencode`` / ``cursor`` / ``hermes``; their specs
-    still ship under ``agents/`` but are deliberately not registered here —
-    three vendors already satisfy cross-vendor review. A missing/renamed agent
-    means fewer implementers, and same-vendor harnesses would break
-    cross-vendor review — polly's differentiator.
+    A missing/renamed agent means fewer implementers, and same-vendor harnesses
+    would break cross-vendor review — polly's differentiator.
     """
     fam = {a.name: a.executor.config.get("harness") for a in polly_spec.sub_agents}
     assert sorted(polly_spec.tools.agents) == [
         "claude_code",
         "codex",
+        "cursor",
+        "hermes",
+        "opencode",
         "pi",
     ]
     assert fam["claude_code"] == "claude-native"
@@ -139,7 +139,6 @@ def test_spine_skills_present(polly_spec: AgentSpec) -> None:
         "cross-review",
         "fanout",
         "investigate",
-        "prose",
     ]
 
 
@@ -340,8 +339,8 @@ def test_investigation_skill_delegates_read_only_work() -> None:
 
     assert "Use for any read-only task: investigation, debugging, audit" in compact
     assert (
-        "Dispatch each task to `claude_code`, `codex`, or `pi`: "
-        '`sys_session_send(agent="claude_code"|"codex"|"pi", '
+        "Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, or `pi`: "
+        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", '
         'title="explore-<task_slug>", '
         'args={purpose: "explore", input: "<question + exact scope + evidence requested>"})`'
     ) in compact

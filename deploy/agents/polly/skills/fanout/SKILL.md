@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. polly never merges; the human does.
+description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR and merge each one that passes.
 ---
 
 # fanout — safe parallel execution
@@ -14,12 +14,16 @@ dependency).
    Record the worktree path + branch in the registry
    (`.polly/registry.json`).
 2. Dispatch one implementation sub-agent per task, scoped to its worktree:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes", title="<task_slug>",
+   `sys_session_send(agent="claude_code"|"codex"|"pi", title="<task_slug>",
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green
-   and opens its OWN PR for the branch. Every commit the worker authors must
+   work only inside `.worktrees/<task_id>`. Inline polly's `prose` standard into
+   the `input`: every code comment, commit message, PR description, and doc the
+   worker writes must be crisp, concise, and humanized; PR descriptions and docs
+   open with an ELI5 for a layman and build DOWN to the technical detail, and
+   comments explain intent/scenario rather than restate the code. The worker drives the task to
+   green and opens its OWN PR for the branch. Every commit the worker authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
    Record each handle's `conversation_id`
@@ -33,9 +37,12 @@ dependency).
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
 4. Send each finished task's PR through `cross-review`.
-5. polly does NOT merge — the PR is the deliverable. When cross-review passes,
-   the task is done: mark it ready in the registry with its PR URL and leave it
-   for the human to review and merge. Never run `git merge` / `gh pr merge`.
+5. When cross-review passes with no blocking issues, the task is done: mark it
+   ready in the registry with its PR URL and merge it yourself with
+   `gh pr merge` (squash + delete-branch unless the repo prefers otherwise).
+   Merge each PR independently as its review clears — don't batch. If a merge is
+   refused (branch protection / required human approval / conflicts), record it
+   and escalate; never force-push or hard-reset to work around it.
 6. Remove a finished worktree (`git worktree remove`) only once its PR is open
    and review is clean — the branch lives on the remote, so the worktree is
    disposable. Don't remove a worktree that still has open fix-tasks.
@@ -52,6 +59,8 @@ dependency).
 - A sub-agent that returns a dark or failing result: don't re-prompt it in a
   loop — re-dispatch a fresh implementation sub-agent in a clean worktree, or
   escalate to the user.
-- Because polly never merges, cross-PR conflicts surface when the human merges,
-  not here. Keeping each parallel task's file scope disjoint is what keeps that
-  rare — honor it.
+- polly merges each PR itself as its review clears, so cross-PR conflicts can
+  surface at merge time. Keeping each parallel task's file scope disjoint is what
+  keeps that rare — honor it. If a merge hits a conflict, re-dispatch that task's
+  worker to rebase and resolve, then re-review; never resolve conflicts by
+  force-push or hard-reset.

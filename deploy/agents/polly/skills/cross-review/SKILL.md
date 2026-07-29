@@ -22,13 +22,17 @@ anyone needs to read through.
    cases, and misses parametrized case expansion.
 3. Dispatch a DIFFERENT-vendor sub-agent as reviewer: pick any AVAILABLE worker
    whose vendor differs from the implementer's — `claude_code`, `codex`,
-   `opencode`, `cursor`, `hermes`, or `pi` (e.g. Claude built it → any of
-   `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
+   or `pi` (e.g. Claude built it → `codex` or `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", title="review-<task_slug>",
-   args={purpose: "review", input: "<the diff> + <the acceptance contract>.
-   Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
+   `sys_session_send(agent="claude_code"|"codex"|"pi", title="review-<task_slug>",
+   args={purpose: "review", input: "<the diff> + <the acceptance contract> +
+   polly's `prose` standard (inline it). Review against the contract, AND
+   re-check the diff's prose against the standard in case something slipped —
+   flag AI-writing tells, verbosity, over-referencing, a summary that dives into
+   low-level detail instead of opening with an ELI5, or comments that just
+   restate the code (usually suggestions; blocking only when the prose is
+   misleading or unreadable). Report blocking / non-blocking / suggestions.
+   Do not edit code."})`. Give it the diff as text — do NOT point
    it at the implementer's worktree. Fetch the diff and emit the
    `sys_session_send` call in the SAME turn you decide to review — never end a
    turn having only announced "I'll load cross-review and fetch the diff" with
@@ -46,8 +50,11 @@ anyone needs to read through.
    updates its existing PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the PR passes
-   review — mark it ready in the registry (with its PR URL) and leave it for
-   the human to merge. polly does NOT merge it.
+   review — mark it ready in the registry (with its PR URL) and merge it
+   yourself with `gh pr merge` (squash + delete-branch unless the repo prefers
+   otherwise). If the merge is refused — branch protection, a required human
+   approval, or conflicts — record that and escalate to the user rather than
+   forcing it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
 
@@ -58,9 +65,10 @@ anyone needs to read through.
   is available on the machine, you CANNOT run independent cross-vendor review:
   don't dispatch a reviewer that can't boot, say so explicitly, and pull in the
   human at the plan gate.
-- Give the reviewer ONLY the diff + contract — never the implementer's
-  transcript or worktree. The cross-vendor independence is the whole point.
-- Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`pi`) dispatched with
+- Give the reviewer ONLY the diff + contract (plus the generic `prose` standard) —
+  never the implementer's transcript or worktree. The cross-vendor independence is
+  the whole point.
+- Review is a coding sub-agent (`claude_code`/`codex`/`pi`) dispatched with
   `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It
   reports issues and never edits; only the implementer opens a PR, so a stray
   reviewer edit never reaches the deliverable.

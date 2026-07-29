@@ -62,10 +62,12 @@ on:
       - 'deploy/docker/Dockerfile'
       - 'deploy/docker/entrypoint.py'
       - 'omnigent/**'
-      # polly and debby are baked into the server image via omnigent's
-      # _examples_resources (server/app.py _ensure_default_{polly,debby}_agent),
-      # so a bundle edit must rebuild — otherwise the template agent stays stale.
-      - 'examples/polly/**'
+      # debby is baked into the server image via omnigent's _examples_resources
+      # (server/app.py _ensure_default_debby_agent), so a bundle edit must
+      # rebuild — otherwise the template agent stays stale. The fork's own
+      # polly / polly-fw bundles live in deploy/agents/ and are delivered to
+      # the Fly volume (OMNIGENT_BUILTIN_AGENT_DIRS), NOT baked into the image,
+      # so they deliberately do not trigger a rebuild.
       - 'examples/debby/**'
       - 'ap-web/**'
       # The server image bakes the SPA built from web/ (deploy/docker/Dockerfile
