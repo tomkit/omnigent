@@ -1986,7 +1986,7 @@ def _host(host_id: str, name: str, sandbox_provider: str | None) -> Host:
     return Host(
         host_id=host_id,
         name=name,
-        owner="alice@example.com",
+        user_id="alice@example.com",
         status="online",
         created_at=1,
         updated_at=1,

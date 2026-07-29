@@ -298,6 +298,68 @@
         "title": "BrowserActionRequestEvent",
         "type": "object"
       },
+      "BuildProvenance": {
+        "description": "Build & deploy provenance for the running server.\n\nBacks the web UI's \"Build & Deployment\" panel. Every field except\n`started_at` degrades to `None` on an unstamped local/dev build;\n`started_at` (this process's boot time) is always set. See\n`_build_provenance`.",
+        "properties": {
+          "build_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Build Time"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "version",
+          "sha",
+          "build_time",
+          "ref",
+          "started_at"
+        ],
+        "title": "BuildProvenance",
+        "type": "object"
+      },
       "CancelledEvent": {
         "description": "Terminal event for a turn cancelled before completion.",
         "properties": {
@@ -1916,6 +1978,106 @@
           "response"
         ],
         "title": "IncompleteEvent",
+        "type": "object"
+      },
+      "InfoResponse": {
+        "description": "Runtime capabilities probe payload returned by `GET /v1/info`.\n\nDrives conditional route registration and chrome on the SPA side and\ncarries build & deploy provenance for the \"Build & Deployment\" panel.\nSee the `/v1/info` handler for the meaning of each field.",
+        "properties": {
+          "accounts_enabled": {
+            "title": "Accounts Enabled",
+            "type": "boolean"
+          },
+          "build": {
+            "$ref": "#/components/schemas/BuildProvenance"
+          },
+          "databricks_features": {
+            "title": "Databricks Features",
+            "type": "boolean"
+          },
+          "dictation_available": {
+            "title": "Dictation Available",
+            "type": "boolean"
+          },
+          "harness_install_enabled": {
+            "title": "Harness Install Enabled",
+            "type": "boolean"
+          },
+          "installable_harnesses": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Installable Harnesses",
+            "type": "array"
+          },
+          "login_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login Url"
+          },
+          "managed_sandboxes_enabled": {
+            "title": "Managed Sandboxes Enabled",
+            "type": "boolean"
+          },
+          "needs_setup": {
+            "title": "Needs Setup",
+            "type": "boolean"
+          },
+          "public_sharing_enabled": {
+            "title": "Public Sharing Enabled",
+            "type": "boolean"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Provider"
+          },
+          "server_version": {
+            "title": "Server Version",
+            "type": "string"
+          },
+          "sharing_mode": {
+            "title": "Sharing Mode",
+            "type": "string"
+          },
+          "single_user": {
+            "title": "Single User",
+            "type": "boolean"
+          },
+          "smart_routing_enabled": {
+            "title": "Smart Routing Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "accounts_enabled",
+          "single_user",
+          "login_url",
+          "needs_setup",
+          "databricks_features",
+          "managed_sandboxes_enabled",
+          "sandbox_provider",
+          "sharing_mode",
+          "public_sharing_enabled",
+          "server_version",
+          "smart_routing_enabled",
+          "harness_install_enabled",
+          "installable_harnesses",
+          "dictation_available",
+          "build"
+        ],
+        "title": "InfoResponse",
         "type": "object"
       },
       "LaunchRunnerRequest": {
@@ -7782,36 +7944,14 @@
     },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`), the short sandbox\nprovider name (`sandbox_provider`) the web UI labels the\nnew-session sandbox option with, the installed\n`server_version` (already public via `/api/version`),\nand a `build` object carrying build & deploy provenance\n(`version`, `sha`, `build_time`, `started_at`,\n`ref`) for the web UI's \"Build & Deployment\" panel \u2014 see\n`_build_provenance`. None of this is sensitive: it is\nthe same build identifiers `/health` already exposes plus\nthis process's boot time.",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, the installed\n`server_version` (already public via `/api/version`),\nand a `build` object carrying build & deploy provenance\n(`version`, `sha`, `build_time`, `started_at`,\n`ref`) for the web UI's \"Build & Deployment\" panel \u2014 see\n`_build_provenance`. None of this is sensitive: it is\nthe same build identifiers `/health` already exposes plus\nthis process's boot time.",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "items": {
-                          "type": "string"
-                        },
-                        "type": "array"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "additionalProperties": true,
-                  "title": "Response Info V1 Info Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/InfoResponse"
                 }
               }
             },

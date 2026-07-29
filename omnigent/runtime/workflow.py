@@ -1654,6 +1654,8 @@ def _config_flag_is_true(value: object) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes"}
+
+
 def _coerce_optional_config_bool(value: Any) -> bool | None:
     """Coerce an ``executor.config`` scalar to ``bool | None``.
 

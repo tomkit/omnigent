@@ -158,6 +158,7 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /**
    * Build & deploy provenance for the settings "Build & Deployment" panel.
    * Always an object (never null) — individual fields are ``null`` when the
    * build wasn't stamped (local/dev). See :class:`BuildInfo`.
