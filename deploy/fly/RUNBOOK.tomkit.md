@@ -212,3 +212,41 @@ every worker thread. Verify before restoring service: `PRAGMA integrity_check`
 == ok, `alembic_version` == head, row counts unchanged, no `_alembic_tmp_*`
 tables, and `sqlite_stat1` non-empty. Keep the pre-upgrade DB on the volume
 (`chat.db.pre-v070`) until the new version has run clean for a while.
+
+## Fork-owned agent bundles (`deploy/agents/`)
+
+polly and polly-fw are **not** baked into the server image. They are delivered
+to the Fly volume and registered with:
+
+```
+OMNIGENT_BUILTIN_AGENT_DIRS=/data/artifacts/polly-fw:/data/artifacts/polly
+```
+
+That env var (a Fly secret on both apps) **shadows** the `examples/` copies the
+image bakes — so editing upstream's `examples/polly` changes nothing in
+production while conflicting on every rebase. The fork's copies therefore live
+at `deploy/agents/`, a path upstream never touches.
+
+Syncing a bundle change to a deployment:
+
+```bash
+cd deploy/agents
+# COPYFILE_DISABLE=1 is REQUIRED on macOS — a plain `tar` scatters ._* files
+# (AppleDouble) across the volume, which then show up inside skills/ dirs.
+COPYFILE_DISABLE=1 tar --no-xattrs -czf /tmp/polly.tar.gz polly
+fly ssh sftp put /tmp/polly.tar.gz /data/artifacts/polly.new.tar.gz -a <app>
+fly ssh console -a <app> -C "/bin/sh -c '
+  cd /data/artifacts && rm -rf polly && tar xzf polly.new.tar.gz &&
+  mv -f polly.new.tar.gz polly.tar.gz'"
+fly machine restart <machine-id> -a <app>   # bundles are read at boot
+```
+
+Verify by comparing **per-file hashes**, not just the parsed config — a partial
+extract or a stray `._*` file will still parse fine:
+
+```bash
+cd deploy/agents/polly && find . -type f | sort | \
+  while read f; do printf "%s  %s\n" "$(shasum -a 256 "$f" | cut -c1-16)" "$f"; done
+fly ssh console -a <app> -C "/bin/sh -c 'cd /data/artifacts/polly && find . -type f | sort |
+  while read f; do printf \"%s  %s\n\" \"\$(sha256sum \"\$f\" | cut -c1-16)\" \"\$f\"; done'"
+```
