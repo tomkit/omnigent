@@ -2811,6 +2811,9 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
+    # This fork gates injection on SessionStart having fired (the managed
+    # claude-native startup race), so the marker must exist before injecting.
+    _mark_session_started(bridge_dir)
 
     loaded_payloads: list[bytes] = []
     tui = {"pane": "❯ "}
