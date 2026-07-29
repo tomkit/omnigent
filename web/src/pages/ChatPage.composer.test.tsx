@@ -640,9 +640,6 @@ describe("Composer model/effort label", () => {
       sessionModelOverride: null,
       selectedEffort: null,
       llmModel: null,
-      // Reset the per-session override too: a test that sets it must not leak
-      // into the next, which now reads sessionModelOverride first for the label.
-      sessionModelOverride: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
     });

@@ -954,7 +954,6 @@ export function ChatPage() {
         ...activeConv,
         permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
         host_resumable: activeSession?.hostResumable ?? false,
-        host_resumable: activeSession?.hostResumable ?? false,
         // Managed sandbox hosts (non-null provider) are relaunchable-on-message
         // even when not resume-in-place, so they must not dead-end to
         // host_offline. Sourced from the snapshot like host_resumable.

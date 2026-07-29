@@ -19,7 +19,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
-import type { ServerInfo } from "@/lib/capabilities";
+import { BUILD_OFF, type ServerInfo } from "@/lib/capabilities";
 import type { DictationSessionEvents } from "@/lib/dictation";
 import { ComposerMicButton } from "./ComposerMicButton";
 
@@ -273,6 +273,7 @@ const DICTATION_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: true,
+  build: BUILD_OFF,
 };
 
 function renderServerMode(
