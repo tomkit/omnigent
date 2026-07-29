@@ -5062,18 +5062,6 @@
             "description": "Host that launched (or should launch) the runner for this session, e.g. `\"host_a1b2c3d4...\"`. `None` for CLI-initiated sessions.",
             "title": "Host Id"
           },
-          "host_name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Display name of the bound host, e.g. `\"corey-laptop\"` for an external host (the machine hostname) or `\"managed-a1b2c3d4\"` for a managed sandbox. Read from the host row already loaded for `host_resumable` (no extra query). `None` when the session has no `host_id` or the host row is missing.",
-            "title": "Host Name"
-          },
           "host_online": {
             "anyOf": [
               {
@@ -5091,22 +5079,6 @@
             "description": "Whether this session is bound to a dormant managed host the server can wake in place (its provider sets `SandboxLauncher.can_resume`). The open view reads it only when `host_online` is `False`, to split a confirmed host-down into a recoverable \"asleep\" state (send a message \u2014 the relaunch path resumes the sandbox) versus the terminal `host_offline` dead-end (reconnect from your machine / fork). `False` for non-managed or non-resumable hosts.",
             "title": "Host Resumable",
             "type": "boolean"
-          },
-          "host_type": {
-            "anyOf": [
-              {
-                "enum": [
-                  "managed",
-                  "local"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Coarse session environment derived from the bound host's `sandbox_provider`: `\"managed\"` when the host is a server-managed sandbox (`sandbox_provider` non-null), `\"local\"` for an external (user-connected) host. `None` when the session has no `host_id` or the host row is missing.",
-            "title": "Host Type"
           },
           "id": {
             "description": "Unique session identifier (also the underlying conversation ID), e.g. `\"conv_abc123\"`.",

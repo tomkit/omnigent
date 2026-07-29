@@ -257,20 +257,6 @@ export interface Session {
    */
   hostResumable?: boolean;
   /**
-   * Display name of the bound host (the host row's name), e.g.
-   * ``"corey-laptop"`` for an external host or ``"managed-a1b2c3d4"``
-   * for a managed sandbox. `null`/absent when the session has no host
-   * binding or the host row is missing. Surfaced in the header badge.
-   */
-  hostName?: string | null;
-  /**
-   * Coarse session environment derived from the bound host's sandbox
-   * provider: `"managed"` for a server-managed sandbox, `"local"` for an
-   * external (user-connected) host. `null`/absent when the session has no
-   * host binding. Drives the header badge's label + styling.
-   */
-  hostType?: "managed" | "local" | null;
-  /**
    * Raw sandbox provider backing a managed host, e.g. `"daytona"` /
    * `"modal"` / `"e2b"`, so the badge can name the provider. `null`/absent
    * for external (local/remote) hosts and host-less sessions.

@@ -1967,10 +1967,9 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
 class _HostStore:
     """Minimal host store returning one canned host for any id.
 
-    The snapshot path reads the bound host (via ``get_host``) once to
-    populate the environment fields (``host_name`` / ``host_type`` /
-    ``sandbox_provider``) and the resumability signal. ``None`` models a
-    missing host row.
+    The snapshot path reads the bound host (via ``get_host``) once to populate
+    ``sandbox_provider`` and the resumability signal. ``None`` models a missing
+    host row.
     """
 
     def __init__(self, host: Host | None) -> None:
@@ -1995,12 +1994,13 @@ def _host(host_id: str, name: str, sandbox_provider: str | None) -> Host:
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_marks_managed_host_environment() -> None:
-    """A session on a managed sandbox carries host_type="managed" + provider.
+async def test_session_snapshot_carries_sandbox_provider_for_managed_host() -> None:
+    """A managed session's provider rides the snapshot.
 
-    The web header badge reads these to show "Daytona" rather than a raw
-    machine hostname; ``sandbox_provider`` rides through verbatim so the
-    client can name the provider. One indexed host read serves all three.
+    The composer's relaunch-on-message path reads ``sandbox_provider`` to tell
+    a managed host (relaunchable, so keep the composer open) apart from a
+    genuinely offline laptop. Losing it here dead-ends every aged-out E2B
+    session at "host offline".
     """
     conv = Conversation(
         id="conv_managed",
@@ -2008,13 +2008,12 @@ async def test_session_snapshot_marks_managed_host_environment() -> None:
         updated_at=1,
         root_conversation_id="conv_managed",
         agent_id="ag_test",
-        host_id="host_daytona",
+        host_id="host_managed",
     )
     conv_store = _ConversationStore(
-        [_message_item("item_1", "hi")],
-        conversations={"conv_managed": conv},
+        [_message_item("item_1", "hi")], conversations={"conv_managed": conv}
     )
-    host_store = _HostStore(_host("host_daytona", "managed-a1b2c3d4", "daytona"))
+    host_store = _HostStore(_host("host_managed", "managed-a1b2c3d4", "e2b"))
 
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -2022,21 +2021,13 @@ async def test_session_snapshot_marks_managed_host_environment() -> None:
         host_store=host_store,  # type: ignore[arg-type]
     )
 
-    assert snapshot.host_type == "managed"
-    assert snapshot.host_name == "managed-a1b2c3d4"
-    assert snapshot.sandbox_provider == "daytona"
-    # Single host read — the env fields reuse the same lookup the
-    # resumability signal needs (no second query).
-    assert host_store.get_host_calls == ["host_daytona"]
+    assert snapshot.sandbox_provider == "e2b"
+    assert host_store.get_host_calls == ["host_managed"]
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_marks_local_host_environment() -> None:
-    """An external (user-connected) host reads host_type="local", no provider.
-
-    A null ``sandbox_provider`` is the discriminator for an external host;
-    the badge then shows the machine hostname instead of a provider name.
-    """
+async def test_session_snapshot_has_no_provider_for_an_external_host() -> None:
+    """An external (user-connected) host reports no provider."""
     conv = Conversation(
         id="conv_local",
         created_at=1,
@@ -2046,8 +2037,7 @@ async def test_session_snapshot_marks_local_host_environment() -> None:
         host_id="host_laptop",
     )
     conv_store = _ConversationStore(
-        [_message_item("item_1", "hi")],
-        conversations={"conv_local": conv},
+        [_message_item("item_1", "hi")], conversations={"conv_local": conv}
     )
     host_store = _HostStore(_host("host_laptop", "corey-laptop", None))
 
@@ -2057,18 +2047,12 @@ async def test_session_snapshot_marks_local_host_environment() -> None:
         host_store=host_store,  # type: ignore[arg-type]
     )
 
-    assert snapshot.host_type == "local"
-    assert snapshot.host_name == "corey-laptop"
     assert snapshot.sandbox_provider is None
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_host_environment_absent_without_binding() -> None:
-    """A host-less (CLI/local) session leaves the env fields null.
-
-    No ``host_id`` means no host read at all, so host_type/host_name stay
-    None and ``sandbox_provider`` is null — the badge renders nothing.
-    """
+async def test_session_snapshot_skips_the_host_read_without_a_binding() -> None:
+    """No ``host_id`` means no host read at all."""
     conv = Conversation(
         id="conv_nohost",
         created_at=1,
@@ -2077,10 +2061,9 @@ async def test_session_snapshot_host_environment_absent_without_binding() -> Non
         agent_id="ag_test",
     )
     conv_store = _ConversationStore(
-        [_message_item("item_1", "hi")],
-        conversations={"conv_nohost": conv},
+        [_message_item("item_1", "hi")], conversations={"conv_nohost": conv}
     )
-    host_store = _HostStore(_host("unused", "unused", "daytona"))
+    host_store = _HostStore(None)
 
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -2088,22 +2071,14 @@ async def test_session_snapshot_host_environment_absent_without_binding() -> Non
         host_store=host_store,  # type: ignore[arg-type]
     )
 
-    assert snapshot.host_type is None
-    assert snapshot.host_name is None
     assert snapshot.sandbox_provider is None
-    # No host binding → the host store is never consulted.
+    assert snapshot.host_resumable is False
     assert host_store.get_host_calls == []
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_host_environment_absent_when_host_row_missing() -> None:
-    """A host_id pointing at a missing host row degrades the env fields to null.
-
-    The session references a host that the store can no longer resolve (the
-    row was deleted / never registered on this replica). The snapshot must
-    still consult the store, then degrade gracefully — host_name/host_type
-    null, sandbox_provider null, and not resumable — instead of crashing.
-    """
+async def test_session_snapshot_degrades_when_the_host_row_is_missing() -> None:
+    """A host_id pointing at a deleted row degrades instead of crashing."""
     conv = Conversation(
         id="conv_dead_host",
         created_at=1,
@@ -2113,8 +2088,7 @@ async def test_session_snapshot_host_environment_absent_when_host_row_missing() 
         host_id="host_vanished",
     )
     conv_store = _ConversationStore(
-        [_message_item("item_1", "hi")],
-        conversations={"conv_dead_host": conv},
+        [_message_item("item_1", "hi")], conversations={"conv_dead_host": conv}
     )
     host_store = _HostStore(None)
 
@@ -2124,9 +2098,6 @@ async def test_session_snapshot_host_environment_absent_when_host_row_missing() 
         host_store=host_store,  # type: ignore[arg-type]
     )
 
-    assert snapshot.host_name is None
-    assert snapshot.host_type is None
     assert snapshot.sandbox_provider is None
     assert snapshot.host_resumable is False
-    # The host_id is set, so the store IS consulted — it just returns None.
     assert host_store.get_host_calls == ["host_vanished"]

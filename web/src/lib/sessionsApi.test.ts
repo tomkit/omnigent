@@ -75,8 +75,6 @@ describe("createSession", () => {
       runnerId: undefined,
       hostId: null,
       hostResumable: false,
-      hostName: null,
-      hostType: null,
       sandboxProvider: null,
       status: "idle",
       createdAt: 1704067200,
@@ -722,8 +720,6 @@ describe("getSession", () => {
       }),
     );
     const session = await getSession("conv_managed");
-    expect(session.hostType).toBe("managed");
-    expect(session.hostName).toBe("managed-a1b2c3d4");
     expect(session.sandboxProvider).toBe("daytona");
   });
 
@@ -743,8 +739,6 @@ describe("getSession", () => {
       }),
     );
     const local = await getSession("conv_local");
-    expect(local.hostType).toBe("local");
-    expect(local.hostName).toBe("corey-laptop");
     expect(local.sandboxProvider).toBeNull();
 
     fetchMock.mockResolvedValueOnce(
@@ -756,8 +750,6 @@ describe("getSession", () => {
       }),
     );
     const hostless = await getSession("conv_nohost");
-    expect(hostless.hostType).toBeNull();
-    expect(hostless.hostName).toBeNull();
     expect(hostless.sandboxProvider).toBeNull();
   });
 });

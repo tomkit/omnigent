@@ -654,7 +654,6 @@ def _build_session_response(
     runner_online: bool | None = None,
     host_online: bool | None = None,
     host_resumable: bool = False,
-    host_name: str | None = None,
     sandbox_provider: str | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
@@ -713,17 +712,11 @@ def _build_session_response(
         ``None`` when the session has no ``host_id`` or no lookup is
         wired (see :class:`SessionLiveness`). Used only to decide what
         the open view shows when ``runner_online`` is ``False``.
-    :param host_name: Display name of the bound host (the host row's
-        ``name``), e.g. ``"corey-laptop"`` or ``"managed-a1b2c3d4"``.
-        ``None`` when the session has no host binding or the host row is
-        missing. Sourced from the same host read that computes
-        ``host_resumable`` — no extra query.
     :param sandbox_provider: Raw ``sandbox_provider`` of the bound host,
-        e.g. ``"daytona"`` for a managed sandbox or ``None`` for an
-        external host. Drives the derived ``host_type`` field
-        (``"managed"`` when non-null, ``"local"`` when the host exists
-        with no provider) and is passed through verbatim so clients can
-        label the provider.
+        e.g. ``"e2b"`` for a managed sandbox or ``None`` for an external
+        host. Passed through verbatim; the composer's relaunch-on-message
+        path keys off it to tell a managed host (relaunchable) apart from
+        a genuinely offline laptop.
     :param pending_elicitation_events: Optional precomputed
         outstanding elicitation events. ``None`` reads only the
         current session's entries from the pending-elicitations index.
@@ -761,16 +754,6 @@ def _build_session_response(
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
-    # Derive the coarse session environment from the bound host's provider.
-    # ``host_name is None`` means no host row was resolved (CLI/local session
-    # or a missing host), in which case host_type stays None; otherwise a
-    # non-null provider marks a server-managed sandbox and a null one an
-    # external (user-connected) host.
-    host_type: Literal["managed", "local"] | None
-    if host_name is None:
-        host_type = None
-    else:
-        host_type = "managed" if sandbox_provider is not None else "local"
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -785,8 +768,6 @@ def _build_session_response(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        host_name=host_name,
-        host_type=host_type,
         sandbox_provider=sandbox_provider,
         reasoning_effort=conv.reasoning_effort,
         items=items,
@@ -6532,12 +6513,10 @@ async def _get_session_snapshot(
     # (its provider decides can_resume), but the env fields don't, so the read
     # is no longer gated on sandbox_config.
     host_resumable = False
-    host_name: str | None = None
     sandbox_provider: str | None = None
     if host_store is not None and conv.host_id is not None:
         bound_host = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if bound_host is not None:
-            host_name = bound_host.name
             sandbox_provider = bound_host.sandbox_provider
             if sandbox_config is not None:
                 host_resumable = host_resume_supported(bound_host, sandbox_config)
@@ -6557,7 +6536,6 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        host_name=host_name,
         sandbox_provider=sandbox_provider,
         pending_elicitation_events=await asyncio.to_thread(
             _pending_elicitation_snapshot_for_session,
