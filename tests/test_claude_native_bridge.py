@@ -25,8 +25,8 @@ from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _claude_pane_interactive,
     _claude_prompt_rendered,
-    _escape_unsupported_slash_command,
     _claude_welcome_screen_visible,
+    _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
     augment_claude_args,

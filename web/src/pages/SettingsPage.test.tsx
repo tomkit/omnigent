@@ -953,6 +953,8 @@ describe("SettingsPage", () => {
     expect(mocks.fetchNextPage).toHaveBeenCalled();
     expect(screen.getByTestId("archived-row")).toBeInTheDocument();
     expect(screen.getByText("Deep archive")).toBeInTheDocument();
+  });
+
   it("renders Build & deployment provenance with a commit link and relative time", () => {
     // Freeze now 3 minutes after this instance started.
     vi.useFakeTimers();

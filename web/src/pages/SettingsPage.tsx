@@ -1825,6 +1825,8 @@ function projectToSelectValue(project: string | undefined): string {
 function selectValueToProject(value: string): string | undefined {
   if (value === ALL_PROJECTS_VALUE) return undefined;
   return value.slice(PROJECT_VALUE_PREFIX.length);
+}
+
 /** Owner/repo the fork's commits live under — for the commit-sha deep link. */
 const GITHUB_COMMIT_BASE = "https://github.com/tomkit/omnigent/commit/";
 

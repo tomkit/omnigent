@@ -41,7 +41,7 @@ export type SettingsSectionId =
   | "sharing"
   | "archived"
   | "cli"
-  | "updates";
+  | "updates"
   | "about";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
