@@ -62,7 +62,7 @@ prompt: |
   - `claude_code` — Claude Code (`claude-native` harness).
   - `codex` — Codex (`codex-native` harness).
   - `pi` — Pi (`pi` harness) on GLM 5.2
-    (`accounts/fireworks/models/glm-5p2`), the REVIEW / EXPLORE specialist for
+    (`accounts/fireworks/models/glm-5p2`), the EXPLORE specialist for
     read-mostly work, and the only worker that can run ANY gateway model.
 
   Three vendors is enough for cross-vendor review (any implementer's diff can be
@@ -241,7 +241,8 @@ prompt: |
   Worker-routing policy. The skills above are workflows, not harness selectors,
   so something has to pick the worker per dispatch. Let the ROUTER do it: pass
   every eligible worker to `sys_advise_models` (above) and take its
-  recommendation. Two rules constrain it, and they are not negotiable:
+  recommendation (subject to the review preference below). Two rules constrain
+  it, and they are not negotiable:
   - Cross-vendor independence WINS over any recommendation: the reviewer MUST be
     a different vendor than the implementer. If the router hands back the
     implementer's own worker for that diff's review, take its next-best
@@ -249,9 +250,16 @@ prompt: |
   - Availability WINS too: never dispatch a worker the roster preflight didn't
     find. Drop it from the `agents` list you pass the router in the first place.
 
+  One PREFERENCE sits on top of those rules: `review` dispatches go to `codex`
+  whenever it is eligible (available and a different vendor than the
+  implementer) — even when the router recommends another worker. Pi's headless
+  wake path is the least reliable delivery route, so lean reviews on a native
+  worker; fall back to `claude_code`, then `pi`, only when codex is ineligible.
+
   When the router is unavailable (no `sys_advise_models` in your tool list) or
   it returns nothing for a task, fall back to this USER-SET preference order —
-  `claude_code` first, then `codex`, then `pi` — subject to the same two rules
+  `claude_code` first, then `codex`, then `pi` (for `review` dispatches:
+  `codex`, then `claude_code`, then `pi`) — subject to the same two rules
   above, and to any per-task override the human gives you. `pi` runs GLM 5.2, so
   pass `args.model: accounts/fireworks/models/glm-5p2` when you dispatch it
   without a router recommendation. If a preferred worker is unavailable, fall
@@ -342,6 +350,11 @@ tools:
   # implements, reviews (cross-vendor), and explores. The other agents/ specs
   # (opencode, cursor, hermes) ship in the bundle but are deliberately NOT
   # enabled here — three vendors already satisfy cross-vendor review.
+  #
+  # The native harness declarations (claude-native / codex-native) are
+  # deliberate: keep the server's per-session smart-routing toggle OFF for
+  # polly sessions — with it on, the server re-routes child harnesses and
+  # native turn-end delivery breaks (see deploy/fly/RUNBOOK.tomkit.md).
   agents:
     - claude_code
     - codex
