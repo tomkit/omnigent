@@ -247,28 +247,6 @@ _VERDICT_SCHEMA: dict[str, object] = {
 }
 
 
-def _first_output_text(response: Any) -> str | None:
-    """Return the first text payload in a judge response, or ``None``.
-
-    The judge's first output item is NOT reliably the assistant message.
-    Reasoning-style models (e.g. GLM behind an OpenAI-compatible gateway) emit
-    a reasoning / native-tool item first, so indexing ``output[0].content[0]``
-    raises ``AttributeError`` and the whole routing call fails open — the
-    router silently never routes. Scan instead, and take the first item that
-    actually carries text.
-
-    :param response: The raw LLM response object.
-    :returns: The first ``.text`` found across output items' content, else
-        ``None`` when the response carries no text at all.
-    """
-    for item in getattr(response, "output", None) or ():
-        for chunk in getattr(item, "content", None) or ():
-            text = getattr(chunk, "text", None)
-            if isinstance(text, str) and text.strip():
-                return text
-    return None
-
-
 class LLMRoutingClient:
     """Default routing client using the server-level PolicyLLMClient."""
 
@@ -301,9 +279,7 @@ class LLMRoutingClient:
                     }
                 },
             )
-            text = _first_output_text(response)
-            if text is None:
-                raise ValueError("judge response carried no text output")
+            text = response.output[0].content[0].text
             _logger.info("LLMRoutingClient: raw response: %s", text[:500])
             verdict = json.loads(text)
         except Exception:  # noqa: BLE001  # fail-open

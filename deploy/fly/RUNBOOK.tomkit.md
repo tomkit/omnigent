@@ -157,18 +157,19 @@ no `external_session_status` delivery path — so the child's idle edge and the
 parent wake are both dropped and the sub-agent session sits at
 `status: running` forever (observed on the pr66/pr67 review children).
 
-The trigger is the fork's smart-routing verdict-parsing fix (`7988cace`):
-vanilla upstream fails to parse the judge verdict and routing fails open, so
-the toggle was harmless before that patch. Until upstream fixes turn-end
-delivery, pick one:
+The trigger was the fork's smart-routing verdict-parsing fix (`7988cace`,
+since reverted): vanilla upstream fails to parse the judge verdict behind a
+reasoning-model gateway and routing fails open, so with the fork back on the
+vanilla parser the toggle is harmless on this deployment — the judge never
+returns a verdict, children keep their declared harnesses.
 
-- leave the routing toggle off for polly sessions (no other change needed);
-- drop the fork's smart_routing patch, returning that file to vanilla
-  fail-open (also disables model routing for top-level sessions); or
-- de-configure server-side routing in `/data/artifacts/config.yaml`: an
-  `llm:` block alone builds the local judge, and there is no clean off
-  switch — `routing: {provider: external}` with no `base_url` disables it
-  with a startup warning.
+The defect re-arms if routing ever starts succeeding again before upstream
+fixes turn-end delivery: configuring `routing: {provider: external}` in
+`/data/artifacts/config.yaml`, pointing the `llm:` judge at a non-reasoning
+model, or an upstream release fixing the verdict parser alone. Until turn-end
+delivery is fixed upstream, keep the routing toggle off for polly sessions in
+any of those configurations. The verdict-parsing fix should be re-landed
+UPSTREAM together with the turn-end fixes, not re-forked.
 
 The polly bundle keeps `codex` on `codex-native` deliberately (watchable
 terminal, human takeover); do not "fix" a stuck child by moving workers onto
