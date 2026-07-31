@@ -23,7 +23,7 @@ primary_region = "ord"
 [build]
   # Pinned to the v0.7.0 fork build (same image family as omnigent-tomkit).
   # See deploy/fly/RUNBOOK.tomkit.md for the offline-migrate cutover flow.
-  image = "ghcr.io/tomkit/omnigent-server:sha-fbf71ee"
+  image = "ghcr.io/tomkit/omnigent-server:sha-2399d3b"
 
 [env]
   HOST = "0.0.0.0"
