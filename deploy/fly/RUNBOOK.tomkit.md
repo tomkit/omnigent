@@ -142,6 +142,38 @@ The host `image:` digest is bumped here whenever a new `omnigent-host` image is
 published (see the host-image half of `fork-publish-server.yml`); pin the
 immutable `@sha256:` digest, not `:latest`.
 
+## Known issue (upstream v0.7.0): smart routing strands polly's native children
+
+Keep the per-session **smart-routing (cost) toggle OFF for polly sessions** on
+this release. With the toggle on, the server force-routes every child session
+polly spawns (`_force_auto_for_child` in
+`omnigent/server/routes/_sessions/orchestration.py`): the judge picks from the
+SDK candidate set (`claude-sdk` / `codex` / `pi`) and persists the pick as the
+child's `harness_override`, so a worker declared `codex-native` can actually
+run `pi`. Turn-end status then branches on the *declared* harness — upstream's
+`_publish_turn_status` early-returns for native harnesses on non-failed
+statuses, `_on_proxy_stream_end` isn't in a `finally`, and the `pi` harness has
+no `external_session_status` delivery path — so the child's idle edge and the
+parent wake are both dropped and the sub-agent session sits at
+`status: running` forever (observed on the pr66/pr67 review children).
+
+The trigger is the fork's smart-routing verdict-parsing fix (`7988cace`):
+vanilla upstream fails to parse the judge verdict and routing fails open, so
+the toggle was harmless before that patch. Until upstream fixes turn-end
+delivery, pick one:
+
+- leave the routing toggle off for polly sessions (no other change needed);
+- drop the fork's smart_routing patch, returning that file to vanilla
+  fail-open (also disables model routing for top-level sessions); or
+- de-configure server-side routing in `/data/artifacts/config.yaml`: an
+  `llm:` block alone builds the local judge, and there is no clean off
+  switch — `routing: {provider: external}` with no `base_url` disables it
+  with a startup warning.
+
+The polly bundle keeps `codex` on `codex-native` deliberately (watchable
+terminal, human takeover); do not "fix" a stuck child by moving workers onto
+SDK harnesses.
+
 ## Optional: enable auto-deploy on every fork `main` build
 
 The workflow has a `deploy-fly` job that is **inert unless a `FLY_API_TOKEN`
