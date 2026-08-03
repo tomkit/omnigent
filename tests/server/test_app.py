@@ -693,6 +693,73 @@ def test_ensure_extra_builtin_agents_skips_bad_path_and_seeds_good(
     assert seed_stores.agent_store.get_by_name("does-not-exist") is None
 
 
+def test_ensure_extra_builtin_agents_rejects_a_truncated_bundle(
+    seed_stores: _SeedStores,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-byte config.yaml is refused at boot, not registered.
+
+    An interrupted ``tar xzf`` on the Fly volume left every file in the polly
+    bundle zero-length. ``materialize_bundle`` copies without reading, so the
+    empty bundle registered cleanly and each session then died at turn setup
+    with "config.yaml must be a YAML mapping, got NoneType" — a runtime
+    failure far from its cause. Refusing it here turns that into one loud boot
+    error, while the sibling bundle still seeds (skip-and-continue).
+    """
+    broken = tmp_path / "broken"
+    (broken / "agents" / "worker").mkdir(parents=True)
+    (broken / "config.yaml").write_text("")  # truncated, exactly as observed
+    (broken / "agents" / "worker" / "config.yaml").write_text("name: worker\n")
+
+    good = tmp_path / "extra-ok.yaml"
+    good.write_text(
+        "name: extra-ok\n"
+        "executor:\n"
+        "  harness: claude-sdk\n"
+        "  model: claude-sonnet-4-20250514\n"
+        "prompt: hi\n"
+    )
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, f"{broken}{os.pathsep}{good}")
+
+    server_app._ensure_extra_builtin_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert seed_stores.agent_store.get_by_name("broken") is None, (
+        "a bundle with an empty config.yaml must not register"
+    )
+    assert seed_stores.agent_store.get_by_name("extra-ok") is not None, (
+        "a valid sibling must still seed after a rejected bundle"
+    )
+
+
+def test_ensure_extra_builtin_agents_rejects_a_truncated_subagent_config(
+    seed_stores: _SeedStores,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-byte SUB-agent config is refused too.
+
+    The same truncation emptied polly's ``agents/*/config.yaml``. Those parse
+    lazily at dispatch, so a root-only check would still ship a bundle that
+    breaks the first time a worker is spawned.
+    """
+    broken = tmp_path / "broken-child"
+    (broken / "agents" / "worker").mkdir(parents=True)
+    (broken / "config.yaml").write_text(
+        "name: broken-child\nexecutor:\n  harness: claude-sdk\nprompt: hi\n"
+    )
+    (broken / "agents" / "worker" / "config.yaml").write_text("")
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(broken))
+
+    server_app._ensure_extra_builtin_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert seed_stores.agent_store.get_by_name("broken-child") is None
+
+
 def test_ensure_default_qwen_agent_seeds_card(seed_stores: _SeedStores) -> None:
     """
     Seeding registers qwen-native-ui as a built-in the picker can render.

@@ -270,9 +270,25 @@ COPYFILE_DISABLE=1 tar --no-xattrs -czf /tmp/polly.tar.gz polly
 fly ssh sftp put /tmp/polly.tar.gz /data/artifacts/polly.new.tar.gz -a <app>
 fly ssh console -a <app> -C "/bin/sh -c '
   cd /data/artifacts && rm -rf polly && tar xzf polly.new.tar.gz &&
+  test -z \"$(find polly -type f -size 0)\" &&
   mv -f polly.new.tar.gz polly.tar.gz'"
 fly machine restart <machine-id> -a <app>   # bundles are read at boot
 ```
+
+> [!WARNING]
+> **The `-size 0` guard is load-bearing.** An interrupted `tar xzf` leaves the
+> files created but empty, and every step downstream still succeeds: the
+> extract exits 0, the server boots, the agent registers. The damage only
+> surfaces later, per session, as
+> `turn setup failed: config.yaml must be a YAML mapping, got NoneType`.
+> This happened on omnigent-tomkit (2026-08-04) — every file under
+> `/data/artifacts/polly/` was zero-length while the tarball beside it was
+> intact, and local-circuits was unaffected by the same sync. Recovery is to
+> re-extract from that tarball and restart. The server now also refuses to
+> register a bundle whose `config.yaml` is empty or unparseable
+> (`_reject_unparseable_bundle_configs`), so a repeat is one loud boot error
+> instead of a silent per-session failure — but keep the guard: it stops the
+> bad tree from ever reaching the volume.
 
 Verify by comparing **per-file hashes**, not just the parsed config — a partial
 extract or a stray `._*` file will still parse fine:

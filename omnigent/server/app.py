@@ -15,6 +15,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol
 
+import yaml
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -600,6 +601,37 @@ def _ensure_default_agents(
 _EXTRA_BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
 
 
+def _reject_unparseable_bundle_configs(bundle_dir: Path) -> None:
+    """Fail a built-in bundle whose spec files are empty or not a mapping.
+
+    ``materialize_bundle`` copies files without reading them, so a truncated
+    sync (an interrupted ``tar xzf`` leaves zero-byte files) registers a bundle
+    that looks fine at boot and only breaks later, per session, as
+    "config.yaml must be a YAML mapping, got NoneType" at turn setup.
+
+    Checked deliberately narrowly — YAML parses and is a mapping — so this
+    catches file corruption without rejecting a spec that is merely
+    env-dependent or uses a field this server build doesn't know.
+
+    :param bundle_dir: Materialized bundle root.
+    :raises OmnigentError: Naming the first bad ``config.yaml``.
+    """
+    for config in sorted(bundle_dir.rglob("config.yaml")):
+        try:
+            parsed = yaml.safe_load(config.read_text())
+        except yaml.YAMLError as exc:
+            raise OmnigentError(
+                f"{config.relative_to(bundle_dir)} is not valid YAML: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise OmnigentError(
+                f"{config.relative_to(bundle_dir)} is empty or not a YAML mapping "
+                f"(got {type(parsed).__name__}); the bundle looks truncated",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+
 def _ensure_extra_builtin_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -640,6 +672,9 @@ def _ensure_extra_builtin_agents(
             name = source.stem if source.is_file() else source.name
             with tempfile.TemporaryDirectory() as tmpdir:
                 bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+                # Catch a truncated sync here, where it is one loud boot error,
+                # instead of at every session's turn setup.
+                _reject_unparseable_bundle_configs(bundle_dir)
                 bundle_bytes = _tar_gz_dir(bundle_dir)
             _ensure_builtin_agent(
                 agent_store,
