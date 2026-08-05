@@ -81,6 +81,7 @@ on:
       - 'pyproject.toml'
       - 'setup.py'
       - 'uv.lock'
+      - 'pnpm-lock.yaml'
       - 'ap-web/package-lock.json'
       - '.github/workflows/fork-publish-server.yml'
   workflow_dispatch: {}
