@@ -108,9 +108,16 @@ def register_agent_routes(
         :returns: The bound agent's :class:`AgentObject`.
         :raises OmnigentError: If the session or agent is not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Managed-runner fallback: the in-sandbox runner fetches its own agent
+        # spec here on cache miss, carrying only its tunnel binding token (no
+        # user creds). READ access, scoped to its own session; user/loopback
+        # paths unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         conv = access.conversation
         if conv is None:
@@ -159,9 +166,16 @@ def register_agent_routes(
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Managed-runner fallback: the in-sandbox runner downloads its agent
+        # bundle here on cache miss, carrying only its tunnel binding token (no
+        # user creds). READ access, scoped to its own session; user/loopback
+        # paths unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         conv = access.conversation
         if conv is None:

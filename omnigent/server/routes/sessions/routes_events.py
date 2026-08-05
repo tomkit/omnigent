@@ -326,10 +326,39 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        # Same-session EDIT write, authorized by event type BEFORE any side
+        # effect runs. A server-managed sandbox runner has no user credential,
+        # so it authorizes via its tunnel binding token (capped at EDIT) — the
+        # callback path the agent uses to stream output and complete tasks. But
+        # the token proves only the in-sandbox runner's identity, never the
+        # HUMAN decision-maker: a runner-owned event type takes the token
+        # fallback, while a user-control type (``approval`` — resolves an
+        # approval gate / applies deferred policy writes) and ANY unclassified
+        # type fall through to user-only auth and fail closed (401) for the
+        # credential-less runner. ``user_id`` (``None`` on the runner fallback
+        # path) is still the actor / attribution identity below; the owner-only
+        # ``stop_session`` branch re-checks LEVEL_OWNER, so a token can't
+        # escalate past EDIT here.
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-        )
+        if body.type in _RUNNER_OWNED_EVENT_TYPES:
+            access = await _authorize_session_with_runner_fallback(
+                request,
+                session_id,
+                level=LEVEL_EDIT,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+        else:
+            # User-control or unclassified event type: a binding token must
+            # never stand in for the human verdict. Require a real user, so the
+            # credential-less runner fails closed (401) here — before
+            # ``_resolve_elicitation`` / ``_apply_pending_policy_ask_writes``
+            # (the approval branch) can run any side effect.
+            user_id = _require_user(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            )
         conv = access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)

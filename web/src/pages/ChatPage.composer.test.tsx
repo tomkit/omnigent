@@ -639,11 +639,13 @@ describe("Composer model/effort label", () => {
       conversationId: "conv_test",
       skills: [],
       selectedModel: null,
+      // Reset the session override too: a test that sets it (e.g. the
+      // sessionModelOverride-priority case) must not leak "sonnet" into a
+      // later test whose trigger would then resolve to it instead of its own
+      // expected label (regression after #1513 made the override win).
+      sessionModelOverride: null,
       selectedEffort: null,
       llmModel: null,
-      // Reset the per-session override too: a test that sets it must not leak
-      // into the next, which now reads sessionModelOverride first for the label.
-      sessionModelOverride: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
     });
@@ -701,7 +703,7 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("High");
   });
 
-  it("prefers a claude session override over the cross-session sticky model", () => {
+  it("prefers a claude session override over the cross-session sticky model", async () => {
     useChatStore.setState({
       selectedModel: "opus",
       sessionModelOverride: "sonnet",

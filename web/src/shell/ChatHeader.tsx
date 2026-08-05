@@ -104,6 +104,11 @@ interface ChatHeaderProps {
   conversationId: string | undefined;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
+  /**
+   * The session's runtime environment (managed sandbox vs local host),
+   * derived from the bound host on the snapshot. `null`/undefined when the
+   * session has no host binding — the env badge then renders nothing.
+   */
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
   /** Whether the rendered Share controls should be disabled. */
@@ -257,6 +262,11 @@ export function ChatHeader({
             </div>
           </>
         )}
+        {/* Where the session runs: the provider name for a managed sandbox
+            ("Daytona") or the machine hostname for a local/remote host. Sits
+            beside the agent identity on sub-agent sessions and after the
+            sidebar toggle on top-level ones; renders nothing without a host
+            binding. */}
       </div>
 
       <div className="flex items-center gap-1">

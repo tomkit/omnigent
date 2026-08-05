@@ -82,6 +82,7 @@ import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentPageView } from "@/lib/analytics";
+import type { BuildInfo } from "@/lib/capabilities";
 import {
   type Conversation,
   useArchiveConversation,
@@ -90,7 +91,7 @@ import {
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
-import { absoluteTime } from "@/lib/relativeTime";
+import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import {
   normalizeResolvedTheme,
@@ -233,6 +234,7 @@ export function SettingsPage() {
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
       {section === "updates" && isElectronShell() && <UpdatesSection />}
+      {section === "about" && <AboutSection />}
     </PageScroll>
   );
 }
@@ -1848,6 +1850,120 @@ function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   if (date >= sevenDaysAgo) return "Previous 7 days";
   if (date >= thirtyDaysAgo) return "Previous 30 days";
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+/** Owner/repo the fork's commits live under — for the commit-sha deep link. */
+const GITHUB_COMMIT_BASE = "https://github.com/tomkit/omnigent/commit/";
+
+/** Format an ISO-8601 instant as readable UTC, or null if unparseable. */
+function formatUtc(iso: string | null): string | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return null;
+  return (
+    new Date(ms).toLocaleString(undefined, {
+      timeZone: "UTC",
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }) + " UTC"
+  );
+}
+
+/** Human "3m ago" / "just now" for an ISO instant, or null if unparseable. */
+function relativeAgo(iso: string | null): string | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return null;
+  const rel = relativeTime(ms);
+  return rel === "now" ? "just now" : `${rel} ago`;
+}
+
+/** One label/value row in the Build & Deployment list. */
+function InfoRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5 border-b border-border py-3 last:border-b-0 sm:flex-row sm:items-baseline sm:gap-4">
+      <dt className="w-40 shrink-0 text-sm text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 text-sm font-medium break-all">{children}</dd>
+    </div>
+  );
+}
+
+/** Muted placeholder for a field the server didn't report (local/dev build). */
+const UNKNOWN = <span className="font-normal text-muted-foreground">Unknown</span>;
+
+/** Absolute UTC + relative-ago for a timestamp field; placeholder if absent. */
+function TimestampValue({ iso }: { iso: string | null }) {
+  const abs = formatUtc(iso);
+  const rel = relativeAgo(iso);
+  if (!abs) return UNKNOWN;
+  return (
+    <span>
+      {abs}
+      {rel && <span className="ml-2 font-normal text-muted-foreground">({rel})</span>}
+    </span>
+  );
+}
+
+/**
+ * Build & deployment provenance — lets the operator confirm the live instance
+ * actually updated after a deploy. ``Last deployed`` (this process's boot time)
+ * is the strongest signal: it changes on every redeploy/restart. Fields the
+ * server can't report (unstamped local/dev builds) read "Unknown".
+ */
+function AboutSection() {
+  const info = useServerInfo();
+
+  return (
+    <Section
+      title="Build & deployment"
+      description="Verify which build is live and when this instance last started."
+    >
+      {info === "loading" ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : (
+        <BuildDetails build={info.build} />
+      )}
+    </Section>
+  );
+}
+
+/** The provenance table, given a resolved {@link BuildInfo}. */
+function BuildDetails({ build }: { build: BuildInfo }) {
+  const sha = build.sha;
+  // Strip the "sha-" prefix for the GitHub commit URL; show the full token.
+  const shaForLink = sha?.replace(/^sha-/, "") ?? null;
+
+  return (
+    <dl className="max-w-2xl">
+      <InfoRow label="Version">{build.version ?? UNKNOWN}</InfoRow>
+      <InfoRow label="Commit">
+        {sha && shaForLink ? (
+          <a
+            href={`${GITHUB_COMMIT_BASE}${shaForLink}`}
+            target="_blank"
+            rel="noreferrer"
+            className="text-primary underline-offset-2 hover:underline"
+            data-testid="build-commit-link"
+          >
+            {sha}
+          </a>
+        ) : (
+          UNKNOWN
+        )}
+      </InfoRow>
+      <InfoRow label="Ref">{build.ref ?? UNKNOWN}</InfoRow>
+      <InfoRow label="Build time">
+        <TimestampValue iso={build.build_time} />
+      </InfoRow>
+      <InfoRow label="Last deployed">
+        <TimestampValue iso={build.started_at} />
+      </InfoRow>
+    </dl>
+  );
 }
 
 function ArchivedSection() {

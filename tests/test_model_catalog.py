@@ -24,6 +24,7 @@ import omnigent.model_catalog as model_catalog
 from omnigent.model_catalog import (
     ModelEntry,
     ModelListing,
+    _drop_gated_routers,
     catalog_for_spec,
     catalog_model_entries,
     list_models_for_worker,
@@ -851,6 +852,31 @@ def test_subscription_listing_is_static_and_unverified(
     }
 
 
+def test_codex_subscription_listing_includes_gpt_5_6_sol(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Codex subscription catalog advertises the current Power model.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  codex:\n    kind: subscription\n    cli: codex\n    default: true\n",
+    )
+    listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
+
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert [m.id for m in listing.models] == [
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+    ]
+
+
 def test_cli_config_listing_is_static_and_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1542,3 +1568,53 @@ def test_keychain_credential_ref_degrades_not_crashes(
     assert listing.source == "none"
     assert not listing.models
     assert listing.note, "degraded keychain row must carry an explanatory note"
+
+
+def _fw_listing() -> ModelListing:
+    """A Fireworks-style listing mixing direct models and a gated router."""
+    return ModelListing(
+        source="openai-compatible",
+        verified=True,
+        models=(
+            ModelEntry(id="accounts/fireworks/models/glm-5p2", family="openai"),
+            ModelEntry(id="accounts/fireworks/routers/glm-latest", family="openai"),
+            ModelEntry(id="accounts/fireworks/models/deepseek-v4-pro", family="openai"),
+        ),
+        note="",
+    )
+
+
+def test_drop_gated_routers_removes_router_ids() -> None:
+    """FireRouter ids (accounts/fireworks/routers/*) are dropped by default.
+
+    Fireworks lists routers in /v1/models, but most accounts get a 403 when
+    invoking one; surfacing them lets the advisor pick an unusable model.
+    """
+    out = _drop_gated_routers(_fw_listing())
+    assert [m.id for m in out.models] == [
+        "accounts/fireworks/models/glm-5p2",
+        "accounts/fireworks/models/deepseek-v4-pro",
+    ]
+
+
+def test_drop_gated_routers_escape_hatch_keeps_routers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_ALLOW_FIREWORKS_ROUTERS=1 keeps routers for FireRouter-enabled accounts.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_ALLOW_FIREWORKS_ROUTERS", "1")
+    out = _drop_gated_routers(_fw_listing())
+    assert any("/routers/" in m.id for m in out.models)
+
+
+def test_drop_gated_routers_noop_when_no_routers() -> None:
+    """A listing with no routers is returned unchanged (same object)."""
+    listing = ModelListing(
+        source="static",
+        verified=False,
+        models=(ModelEntry(id="gpt-5.4", family="openai"),),
+        note="",
+    )
+    assert _drop_gated_routers(listing) is listing

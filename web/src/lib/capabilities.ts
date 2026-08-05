@@ -32,6 +32,38 @@ import { hostFetch } from "./host";
 export type SharingMode = "on" | "read_only" | "restricted_read_only" | "off";
 const SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
 
+/**
+ * Build & deploy provenance the server reports under ``/v1/info``'s ``build``
+ * key. Lets an operator confirm the live instance actually updated after a
+ * deploy. Every field except ``started_at`` is ``null`` on unstamped local/dev
+ * builds; ``started_at`` is always set (this process's boot time).
+ */
+export interface BuildInfo {
+  /** Installed omnigent package version, e.g. ``"0.3.0.dev0"``. */
+  version: string | null;
+  /** Git sha baked into the image, e.g. ``"sha-ff243ad"`` (same as /health). */
+  sha: string | null;
+  /** ISO-8601 UTC instant the image was built. */
+  build_time: string | null;
+  /** ISO-8601 UTC instant THIS server process booted. Always set. */
+  started_at: string | null;
+  /** Git ref/branch the image was built from, e.g. ``"main"``. */
+  ref: string | null;
+}
+
+/**
+ * ``build`` value when the probe failed or the server omitted it — every field
+ * null. Exported so the boot-time offline fallbacks (``main.tsx`` /
+ * ``embed.tsx``) can fill the required ``build`` field without duplicating it.
+ */
+export const BUILD_OFF: BuildInfo = {
+  version: null,
+  sha: null,
+  build_time: null,
+  started_at: null,
+  ref: null,
+};
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
@@ -126,6 +158,12 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /**
+   * Build & deploy provenance for the settings "Build & Deployment" panel.
+   * Always an object (never null) — individual fields are ``null`` when the
+   * build wasn't stamped (local/dev). See :class:`BuildInfo`.
+   */
+  build: BuildInfo;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
@@ -147,7 +185,26 @@ const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  build: BUILD_OFF,
 };
+
+/**
+ * Coerce the server's ``build`` blob into a {@link BuildInfo}, tolerating a
+ * missing field, a missing object, or a non-string value (each becomes
+ * ``null``). Never throws — an older server that predates the ``build`` key
+ * yields an all-null object, so the panel degrades to placeholders.
+ */
+function parseBuildInfo(raw: unknown): BuildInfo {
+  const obj = (raw ?? {}) as Record<string, unknown>;
+  const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  return {
+    version: str(obj.version),
+    sha: str(obj.sha),
+    build_time: str(obj.build_time),
+    started_at: str(obj.started_at),
+    ref: str(obj.ref),
+  };
+}
 
 let cachedServerInfo: ServerInfo | null = null;
 let pendingServerInfo: Promise<ServerInfo> | null = null;
@@ -192,6 +249,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          build: parseBuildInfo(data.build),
         };
         return cachedServerInfo;
       }

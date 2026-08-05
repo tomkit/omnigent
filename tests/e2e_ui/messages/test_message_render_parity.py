@@ -174,15 +174,20 @@ def _assert_no_duplicate_render(
     :param assistant_tokens: Per-turn unique assistant tokens, oldest first.
     """
     # Exactly one bubble per token — a second bubble means duplicate rendering
-    # (e.g. a native live-preview that was never reconciled away).
+    # (e.g. a native live-preview that was never reconciled away). 30s (not the
+    # 15s default): this helper runs after several native/mock turns, and under
+    # sharded xdist load the last bubble can settle past 15s. to_have_count
+    # auto-waits, so the larger ceiling only raises the bound, never the floor.
     for marker in user_markers:
-        expect(page.locator(_USER, has_text=marker)).to_have_count(1)
+        expect(page.locator(_USER, has_text=marker)).to_have_count(1, timeout=30_000)
     for token in assistant_tokens:
-        expect(page.locator(_ASSISTANT, has_text=token)).to_have_count(1)
+        expect(page.locator(_ASSISTANT, has_text=token)).to_have_count(1, timeout=30_000)
     # One user bubble per turn — no phantom/duplicated user echoes.
-    expect(page.locator(_USER)).to_have_count(len(user_markers))
+    expect(page.locator(_USER)).to_have_count(len(user_markers), timeout=30_000)
 
-    # DOM render order matches the turn order for both roles.
+    # DOM render order matches the turn order for both roles. The count
+    # assertions above already auto-waited the DOM to exactly these bubbles, so
+    # the inner-text snapshots below read a settled tree, not a half-rendered one.
     user_texts = page.locator(_USER).all_inner_texts()
     assert _ordered_token_sequence(user_texts, user_markers) == user_markers, (
         "user bubbles are out of order or a marker rendered more than once"

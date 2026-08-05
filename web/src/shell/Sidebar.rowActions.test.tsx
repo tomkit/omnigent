@@ -12,7 +12,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { ServerInfo } from "@/lib/capabilities";
+import { BUILD_OFF, type ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
@@ -190,6 +190,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    build: BUILD_OFF,
     ...overrides,
   };
 }

@@ -63,6 +63,7 @@ from omnigent.reasoning_effort import (
     validate_effort,
 )
 from omnigent.runner.identity import (
+    RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
 from omnigent.runner.routing import RunnerRouter
@@ -85,9 +86,11 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    AuthProvider,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -98,7 +101,16 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
 )
 from omnigent.server.routes._auth_helpers import (
+    SessionAccess as _SessionAccess,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import (
@@ -7693,6 +7705,163 @@ def _require_cost_control_label_authority(
     )
 
 
+async def _resolve_managed_runner_session_read(
+    request: Request,
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> _SessionAccess | None:
+    """Authorize a session READ for the session's own managed runner, or ``None``.
+
+    The REST analog of the runner-tunnel auth fallback (see
+    ``_resolve_managed_runner_owner`` in :mod:`omnigent.server.app`): a
+    server-managed sandbox runner never ran ``omnigent login``, so its
+    in-sandbox REST callbacks carry no user credential — only the per-runner
+    tunnel binding token the server minted, delivered as the
+    ``X-Omnigent-Runner-Tunnel-Token`` header. The same trust model the
+    ``cost_control.*`` label write already uses
+    (:func:`_require_cost_control_label_authority`): the token is accepted iff
+    its ``token_bound_runner_id`` equals the target session's persisted
+    ``runner_id``. SHA-256 preimage resistance means only the rightful
+    in-sandbox runner holds a token whose digest is this session's runner id,
+    so possession proves identity without persisting any raw secret.
+
+    Scoped to exactly this one session and to READ. Fails closed — returns
+    ``None`` so the caller raises the same 401 the user path would — on a
+    missing / empty token, a token whose derived runner id does not match this
+    session, a session with no bound runner id, an unknown session, or a
+    session with no resolvable owner.
+
+    :param request: The incoming request (read for the tunnel-token header).
+    :param session_id: Target session, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store used to read the session's bound
+        ``runner_id`` and confirm a single owner.
+    :returns: A :class:`SessionAccess` (READ + the fetched conversation) when
+        the bound runner is proven, else ``None``.
+    """
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not token:
+        return None
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None or conv.runner_id is None:
+        return None
+    try:
+        derived_runner_id = token_bound_runner_id(token)
+    except RuntimeError:
+        # Empty/whitespace token — already guarded above, but stay defensive.
+        return None
+    if derived_runner_id != conv.runner_id:
+        return None
+    # Final fail-closed guard: the session must resolve to a real owner. A
+    # dangling runner binding on an ownerless session must not grant access.
+    # The owner identity itself is not needed downstream (access is already
+    # pinned to this session) — only its unambiguous existence matters.
+    owner = await asyncio.to_thread(conversation_store.get_session_owner, session_id)
+    if owner is None:
+        return None
+    return _SessionAccess(level=LEVEL_READ, conversation=conv)
+
+
+async def _authorize_session_with_runner_fallback(
+    request: Request,
+    session_id: str,
+    *,
+    level: int,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> _SessionAccess:
+    """Authorize a session-scoped request at ``level``, with a managed-runner fallback.
+
+    The consolidated authorizer behind every route a server-managed sandbox
+    runner reaches without a user credential: READ snapshots *and* the
+    same-session WRITE callbacks (``POST .../events``, the non-privileged
+    ``PATCH /sessions/{id}`` fields, ``POST .../policies/evaluate``) it needs to
+    stream output back and complete a task.
+
+    Normal path is byte-for-byte the prior per-route behavior: when the request
+    carries a user identity, or auth is disabled entirely (no auth provider —
+    loopback / single-user), this is exactly ``require_access_and_level`` at
+    ``level``. User-auth and loopback callers never reach the fallback.
+
+    Fallback path — only when an auth provider is configured AND no user
+    identity is present: admit the session's own managed sandbox runner, proven
+    by a binding token whose ``token_bound_runner_id`` equals this session's
+    persisted ``runner_id`` (see :func:`_resolve_managed_runner_session_read`).
+    Anything else fails closed with the same 401 the user path raises.
+
+    Security cap: the binding token can NEVER satisfy a privileged level. A
+    request asking for more than ``LEVEL_EDIT`` (MANAGE / OWNER — archive,
+    permission grants, ownership transfer) is rejected with 401 *before* the
+    proof is even consulted, so a valid token cannot be widened into a
+    privileged grant. Privileged routes must keep requiring a real user.
+
+    :param request: The incoming request (auth + tunnel-token header).
+    :param session_id: Target session, e.g. ``"conv_abc123"``.
+    :param level: Minimum numeric level the route requires (1=read, 2=edit).
+    :param auth_provider: The server's auth provider, or ``None`` when auth is
+        disabled.
+    :param permission_store: Permission store, or ``None`` when disabled.
+    :param conversation_store: Conversation store for the fallback lookups.
+    :returns: A :class:`SessionAccess` granting at least ``level``.
+    :raises OmnigentError: 401 / 403 / 404 exactly as the user path does.
+    """
+    user_id = _get_user_id(request, auth_provider)
+    if user_id is not None or auth_provider is None:
+        return await _require_access_and_level(
+            user_id, session_id, level, permission_store, conversation_store
+        )
+    # HARD CAP — a binding token proves only the in-sandbox runner's identity,
+    # never an owning user. It must never reach a privileged (MANAGE/OWNER)
+    # grant, so reject before consulting the proof at all.
+    if level > LEVEL_EDIT:
+        raise OmnigentError(
+            "Authentication required",
+            code=ErrorCode.UNAUTHORIZED,
+        )
+    proven = await _resolve_managed_runner_session_read(request, session_id, conversation_store)
+    if proven is not None:
+        return _SessionAccess(level=level, conversation=proven.conversation)
+    raise OmnigentError(
+        "Authentication required",
+        code=ErrorCode.UNAUTHORIZED,
+    )
+
+
+async def _authorize_session_read_with_runner_fallback(
+    request: Request,
+    session_id: str,
+    *,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> _SessionAccess:
+    """READ-authorize a session-scoped GET, with a managed-runner token fallback.
+
+    Thin ``LEVEL_READ`` wrapper over
+    :func:`_authorize_session_with_runner_fallback`, kept so the GET routes read
+    unchanged: user-auth / loopback take the normal path, and an
+    unauthenticated caller is admitted only when its binding token proves the
+    session's bound runner.
+
+    :param request: The incoming request (auth + tunnel-token header).
+    :param session_id: Target session, e.g. ``"conv_abc123"``.
+    :param auth_provider: The server's auth provider, or ``None`` when auth is
+        disabled.
+    :param permission_store: Permission store, or ``None`` when disabled.
+    :param conversation_store: Conversation store for the fallback lookups.
+    :returns: A :class:`SessionAccess` granting at least READ.
+    :raises OmnigentError: 401 / 403 / 404 exactly as the user path does.
+    """
+    return await _authorize_session_with_runner_fallback(
+        request,
+        session_id,
+        level=LEVEL_READ,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        conversation_store=conversation_store,
+    )
+
+
 def _persist_stored_session_bundle(
     conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
@@ -8724,6 +8893,8 @@ __all__ = [
     "_approval_access_from_grants",
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
+    "_authorize_session_read_with_runner_fallback",
+    "_authorize_session_with_runner_fallback",
     "_await_settled_managed_launch",
     "_build_actor",
     "_build_evaluation_context",
@@ -8873,6 +9044,7 @@ __all__ = [
     "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",
     "_resolve_llm_model",
+    "_resolve_managed_runner_session_read",
     "_resolve_skill_meta_text_via_runner",
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
