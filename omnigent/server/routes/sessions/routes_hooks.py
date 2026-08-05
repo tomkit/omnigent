@@ -64,6 +64,7 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.helpers import (
     _allow_all_edits_eligible,
     _allow_remember_eligible,
+    _authorize_session_with_runner_fallback,
     _build_actor,
     _build_evaluation_context,
     _claude_native_remember_host,

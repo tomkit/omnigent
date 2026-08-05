@@ -115,6 +115,8 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
+    _authorize_session_read_with_runner_fallback,
+    _authorize_session_with_runner_fallback,
     _codex_plan_mode_enabled,
     _discovery_key,
     _forward_session_change_to_runner,

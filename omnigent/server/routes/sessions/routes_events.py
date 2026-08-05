@@ -101,6 +101,7 @@ from omnigent.server.routes._sessions.common import (
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _INTERRUPT_TYPE,
     _MCP_ELICITATION_TYPE,
+    _RUNNER_OWNED_EVENT_TYPES,
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
@@ -116,6 +117,7 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _apply_pending_policy_ask_writes,
+    _authorize_session_with_runner_fallback,
     _await_settled_managed_launch,
     _build_actor,
     _build_skill_slash_command_policy_body,

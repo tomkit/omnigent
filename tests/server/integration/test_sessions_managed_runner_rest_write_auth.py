@@ -53,11 +53,13 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.routes import sessions as sessions_route
-from omnigent.server.routes.sessions import (
+from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _RUNNER_OWNED_EVENT_TYPES,
     _USER_CONTROL_EVENT_TYPES,
+)
+from omnigent.server.routes._sessions.helpers import (
     _authorize_session_with_runner_fallback,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore

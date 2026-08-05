@@ -7758,7 +7758,11 @@ async def _resolve_managed_runner_session_read(
     owner = await asyncio.to_thread(conversation_store.get_session_owner, session_id)
     if owner is None:
         return None
-    return _SessionAccess(level=LEVEL_READ, conversation=conv)
+    # can_approve is hard-False on the token path: a binding token proves the
+    # in-sandbox RUNNER's identity, never the human decision-maker — the same
+    # trust boundary that keeps ``approval`` events user-only. v0.8.2's
+    # delegated-approval authority must never ride a runner credential.
+    return _SessionAccess(level=LEVEL_READ, conversation=conv, can_approve=False)
 
 
 async def _authorize_session_with_runner_fallback(
@@ -7820,7 +7824,7 @@ async def _authorize_session_with_runner_fallback(
         )
     proven = await _resolve_managed_runner_session_read(request, session_id, conversation_store)
     if proven is not None:
-        return _SessionAccess(level=level, conversation=proven.conversation)
+        return _SessionAccess(level=level, conversation=proven.conversation, can_approve=False)
     raise OmnigentError(
         "Authentication required",
         code=ErrorCode.UNAUTHORIZED,

@@ -457,6 +457,12 @@ _RUNNER_OWNED_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_SUBAGENT_START_TYPE,
         _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
         _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+        # Mirrors a permission-mode change the human made IN the codex TUI onto
+        # the session's terminal_launch_args so a relaunch preserves it. Pure
+        # forwarder reporting — no approval gate resolved, no policy write —
+        # and the args only affect relaunches on the same runner, which that
+        # runner already fully controls.
+        _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
     }
 )
 

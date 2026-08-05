@@ -1128,6 +1128,7 @@ def create_app(
     from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
         OMNIGENT_SESSION_ENV_VALUE,
         OMNIGENT_SESSION_ENV_VAR,
         RUNNER_ID_ENV_VAR,

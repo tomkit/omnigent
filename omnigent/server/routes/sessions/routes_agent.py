@@ -53,6 +53,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _authorize_session_read_with_runner_fallback,
     _build_actor,
     _handle_mcp_tools_list,
     _mcp_error_response,
