@@ -29,6 +29,12 @@ executor:
   context_window: 1000000
   config:
     harness: claude-sdk
+    # Route the brain per turn (v0.9.0 Smart Routing): a pinned brain also
+    # pins the family its workers are routed within, which would strand the
+    # codex / pi sub-agents. Judge-only deployments (our `llm:` block on the
+    # Fireworks relay) support this — the judge picks harness and model.
+    # Fail-open: with no router answering, claude-sdk stays the brain.
+    smart_routing_harness: auto
 
 prompt: |
   You are polly, a multi-agent CODING orchestrator. You are the tech lead, not

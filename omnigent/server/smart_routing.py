@@ -547,6 +547,29 @@ _VERDICT_SCHEMA: dict[str, object] = {
 }
 
 
+def _first_output_text(response: Any) -> str | None:
+    """Return the first text payload in a judge response, or ``None``.
+
+    The judge's first output item is NOT reliably the assistant message.
+    Reasoning-style models (e.g. GLM behind an OpenAI-compatible gateway) emit
+    a reasoning / native-tool item first — the adapter wraps those as
+    ``NativeToolOutput`` and keeps them in ``output`` — so indexing
+    ``output[0].content[0]`` raises ``AttributeError`` and the judge fails
+    open on every call: routing reads as enabled while nothing ever routes.
+    Scan instead, and take the first item that actually carries text.
+
+    :param response: The raw LLM response object.
+    :returns: The first ``.text`` found across output items' content, else
+        ``None`` when the response carries no text at all.
+    """
+    for item in getattr(response, "output", None) or ():
+        for chunk in getattr(item, "content", None) or ():
+            text = getattr(chunk, "text", None)
+            if isinstance(text, str) and text.strip():
+                return text
+    return None
+
+
 class LLMRoutingClient:
     """Default routing client using the server-level PolicyLLMClient.
 
@@ -603,7 +626,9 @@ class LLMRoutingClient:
                 ),
                 timeout=ROUTING_REQUEST_TIMEOUT_S,
             )
-            text = response.output[0].content[0].text
+            text = _first_output_text(response)
+            if text is None:
+                raise ValueError("judge response carried no text output")
             # The verdict can echo prompt text in its rationale, so keep it off
             # INFO; the chosen model is logged by the caller either way.
             _logger.debug("LLMRoutingClient: raw response: %s", text[:500])

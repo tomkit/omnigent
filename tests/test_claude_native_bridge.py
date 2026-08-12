@@ -72,6 +72,7 @@ def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
 
+
 def _mark_session_started(bridge_dir: Path, session_id: str = "sess-test-123") -> None:
     """
     Seed the bridge state as if Claude's ``SessionStart`` hook fired.
