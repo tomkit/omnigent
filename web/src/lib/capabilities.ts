@@ -46,7 +46,7 @@ export interface SmartRoutingSources {
 }
 
 /**
-* Build & deploy provenance the server reports under ``/v1/info``'s ``build``
+ * Build & deploy provenance the server reports under ``/v1/info``'s ``build``
  * key. Lets an operator confirm the live instance actually updated after a
  * deploy. Every field except ``started_at`` is ``null`` on unstamped local/dev
  * builds; ``started_at`` is always set (this process's boot time).
@@ -224,9 +224,10 @@ function parseSmartRoutingSources(raw: unknown, routingEnabled: boolean): SmartR
   }
   const sources = raw as Partial<Record<keyof SmartRoutingSources, unknown>>;
   return { external: sources.external === true, oss: sources.oss === true };
+}
 
 /**
-* Coerce the server's ``build`` blob into a {@link BuildInfo}, tolerating a
+ * Coerce the server's ``build`` blob into a {@link BuildInfo}, tolerating a
  * missing field, a missing object, or a non-string value (each becomes
  * ``null``). Never throws — an older server that predates the ``build`` key
  * yields an all-null object, so the panel degrades to placeholders.
