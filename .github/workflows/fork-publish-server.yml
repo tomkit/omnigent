@@ -1,0 +1,456 @@
+# Fork-owned image publish (tomkit): server image + host image.
+#
+# WHY THIS EXISTS: the upstream `Publish images (public)` workflow
+# (.github/workflows/oss-publish-images.yml) is gated to
+# `github.repository == 'omnigent-ai/omnigent'`, so it is INERT in this fork —
+# it never publishes anything to our namespace. Without this workflow the
+# `omnigent-tomkit` Fly app keeps pulling the UPSTREAM
+# `ghcr.io/omnigent-ai/omnigent-server:latest`, which OVERWRITES our merged
+# fork patches (idle-suspend/reclaim-retention, bidirectional context sync) on
+# every redeploy. This workflow builds the SAME images from
+# `deploy/docker/Dockerfile` and publishes them to OUR GHCR namespace so the
+# fork code actually runs in production.
+#
+# TWO IMAGES, published in lockstep from the same commit (so a managed session's
+# server half and runner half always run the same fork code):
+#
+#   omnigent-server  (default target) — the FastAPI/WS coordinator the Fly app
+#                    runs. Carries the fork server patches AND the server-side
+#                    401 fallback added by PR #14.
+#
+#   omnigent-host    (`host` target)  — the prebaked HOST image that managed
+#                    Daytona sandboxes boot from. ROOT CAUSE this image now
+#                    exists: managed sandboxes default to the UPSTREAM host
+#                    image `ghcr.io/omnigent-ai/omnigent-host:latest`
+#                    (DEFAULT_HOST_IMAGE), which ships the UPSTREAM
+#                    `omnigent/runner/_entry.py` WITHOUT PR #14's runner-side
+#                    token-attach change. So the in-sandbox runner sends no
+#                    `X-Omnigent-Runner-Tunnel-Token`, the server's 401 fallback
+#                    can't trigger, the runner's REST callbacks 401, and the
+#                    native Claude terminal never starts. Building the host image
+#                    from the fork bakes in the patched `_entry.py` (the `host`
+#                    target installs the full omnigent package via the shared
+#                    `builder` stage). The server can then be pointed at this
+#                    fork host image (sandbox.daytona.image /
+#                    OMNIGENT_DAYTONA_HOST_IMAGE) so both halves match.
+#
+# Self-contained: GHCR auth uses the built-in `GITHUB_TOKEN` (no org secrets).
+# The optional Fly auto-deploy leg is fully gated on a `FLY_API_TOKEN` repo
+# secret existing — with no secret it is inert, so this is safe to merge before
+# any secret is wired and CI still passes. The Fly deploy swaps only the SERVER
+# image; the host image is consumed by managed sandboxes, not Fly.
+#
+# Tag scheme (deliberately minimal vs upstream's release/rc/nightly matrix —
+# the fork tracks main, not semver releases), applied to BOTH images:
+#   :sha-<short>   immutable per-commit pin, published on every build. Deploys
+#                  pin to this so a redeploy is reproducible.
+#   :latest        moves to the newest main build. `fly.tomkit.toml` points the
+#                  server image here.
+#
+# FIRST RUN creates the `omnigent-server` AND `omnigent-host` packages PRIVATE
+# under the user's GHCR packages. Flip BOTH to PUBLIC once in the package
+# settings so the Fly remote builder / Daytona can pull them unauthenticated
+# (cannot be done from CI). See deploy/fly/RUNBOOK.tomkit.md.
+name: Publish fork images
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild when something that lands in the image changes (mirrors the
+    # upstream workflow's path filter).
+    paths:
+      - 'deploy/docker/Dockerfile'
+      - 'deploy/docker/entrypoint.py'
+      - 'omnigent/**'
+      # debby is baked into the server image via omnigent's _examples_resources
+      # (server/app.py _ensure_default_debby_agent), so a bundle edit must
+      # rebuild — otherwise the template agent stays stale. The fork's own
+      # polly / polly-fw bundles live in deploy/agents/ and are delivered to
+      # the Fly volume (OMNIGENT_BUILTIN_AGENT_DIRS), NOT baked into the image,
+      # so they deliberately do not trigger a rebuild.
+      - 'examples/debby/**'
+      - 'ap-web/**'
+      # The server image bakes the SPA built from web/ (deploy/docker/Dockerfile
+      # web-builder: WORKDIR /web/web, COPY web/ -> vite build ->
+      # omnigent/server/static/web-ui). Without this, a web/**-only change (e.g.
+      # a UI-only fix like #43) never rebuilds the image, so it silently ships
+      # nowhere. `web/**` also covers web/package-lock.json. (ap-web is a
+      # separate app dir.)
+      - 'web/**'
+      - 'sdks/**'
+      - 'pyproject.toml'
+      - 'setup.py'
+      - 'uv.lock'
+      - 'pnpm-lock.yaml'
+      - 'ap-web/package-lock.json'
+      - '.github/workflows/fork-publish-server.yml'
+  workflow_dispatch: {}
+
+# Read-only at the top level; write scopes live on the jobs below.
+permissions:
+  contents: read
+
+concurrency:
+  # Key by SHA so back-to-back merges each build; don't cancel mid-push.
+  group: fork-publish-images-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    # Gated to THIS fork; inert in upstream and in forks-of-the-fork.
+    if: github.repository == 'tomkit/omnigent'
+    permissions:
+      contents: read
+      packages: write # push the image to GHCR via GITHUB_TOKEN
+    runs-on: ubuntu-latest
+    # Multi-arch: the linux/arm64 leg cross-builds under QEMU emulation on this
+    # amd64 runner, which roughly doubles build time. Give it headroom.
+    timeout-minutes: 60
+    outputs:
+      short-sha: ${{ steps.tags.outputs.short_sha }}
+      digest: ${{ steps.build-server.outputs.digest }}
+      host-digest: ${{ steps.build-host.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      # Register binfmt handlers so Buildx can cross-build the linux/arm64
+      # variant on this amd64 runner (emulated).
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Compute the tag set. The owner is lower-cased because GHCR repository
+      # paths must be lowercase (github.repository_owner can contain uppercase).
+      - name: Compute image tags
+        id: tags
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          # Git ref the build runs against (branch name on push, e.g. "main").
+          # Read via env, not inlined into the script, to avoid expression
+          # injection.
+          GH_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          OWNER_LC=$(echo "${GH_OWNER}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LC}/omnigent-server"
+          HOST_IMAGE="ghcr.io/${OWNER_LC}/omnigent-host"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          # Build-time provenance: ISO-8601 UTC instant of this build, and the
+          # git ref it was built from. Baked into both images (server + host) as
+          # OMNIGENT_BUILD_TIME / OMNIGENT_BUILD_REF so the running server can
+          # report them in /v1/info -> build.
+          BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "short_sha=${SHORT_SHA}"
+            echo "build_time=${BUILD_TIME}"
+            echo "build_ref=${GH_REF_NAME}"
+            echo "tags=${IMAGE}:sha-${SHORT_SHA},${IMAGE}:latest"
+            echo "host_tags=${HOST_IMAGE}:sha-${SHORT_SHA},${HOST_IMAGE}:latest"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing server: ${IMAGE}:sha-${SHORT_SHA} + ${IMAGE}:latest"
+          echo "Publishing host:   ${HOST_IMAGE}:sha-${SHORT_SHA} + ${HOST_IMAGE}:latest"
+          echo "Build time: ${BUILD_TIME}  ref: ${GH_REF_NAME}"
+
+      # Build-args: the registry ARGs default to public registries (matches the
+      # upstream server build), but OMNIGENT_EXTRAS defaults to EMPTY in the
+      # server-builder stage, which skips the optional managed-sandbox provider
+      # SDKs. Both fork Fly apps (`omnigent-tomkit` AND `local-circuits`) now run
+      # `sandbox.provider: e2b` managed sessions, and the launcher (omnigent/
+      # onboarding/sandboxes/e2b.py) lazily imports the `e2b` SDK — without the
+      # extra the managed launch fails at import ("The E2B SDK is required for
+      # the 'e2b' sandbox provider"). `daytona` is kept alongside it for the
+      # legacy launch path / rollback safety. So pass OMNIGENT_EXTRAS=daytona,e2b
+      # to bake BOTH extras (pyproject: daytona>=0.180,<1 and e2b>=2.26,<3) into
+      # the image. This is the durable replacement for the per-deploy thin layer
+      # that used to `pip install e2b` on top of the canonical image — that layer
+      # vanished on any plain redeploy from the canonical image, silently
+      # breaking e2b launches. Each provider's relay/endpoint (e.g. the daytona
+      # Cloudflare Worker; E2B's api) is reached over the SDK's own bundled HTTP
+      # stack, so no additional omnigent extra is needed for either. Multi-arch
+      # manifest list (amd64 + arm64); the Fly machine is amd64 and pulls the
+      # amd64 variant from the list.
+      - name: Build and push
+        id: build-server
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            OMNIGENT_EXTRAS=daytona,e2b
+            OMNIGENT_BUILD_SHA=sha-${{ steps.tags.outputs.short_sha }}
+            OMNIGENT_BUILD_TIME=${{ steps.tags.outputs.build_time }}
+            OMNIGENT_BUILD_REF=${{ steps.tags.outputs.build_ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: true
+
+      # Host image: same Dockerfile, `host` target, also multi-arch (amd64 +
+      # arm64). The `host` stage does NOT consume OMNIGENT_EXTRAS (that arg
+      # lives only in the server-builder stage) — it installs the full omnigent
+      # package via the shared `builder` stage's editable `uv pip install -e .`,
+      # so the fork's patched omnigent/runner/_entry.py (PR #14's runner-side
+      # token-attach) is baked in with no extras needed. The managed-host
+      # runtime deps (git/tmux/harness CLIs/agy) are baked by the Dockerfile's
+      # host stage itself, not via extras. The only build-args it takes are the
+      # provenance trio (sha/time/ref), stamped here so the host half of a
+      # managed session self-reports the SAME build metadata as the server half
+      # (both built from this one commit). Runs after the server build so it
+      # reuses the shared builder-stage layers from the gha cache.
+      #
+      # NOTE (rebase onto upstream v0.3.0): the fork's former workflow-level agy
+      # pin — a manifest pre-check plus an ``AGY_EXPECTED_VERSION`` build-arg —
+      # was superseded by upstream's Dockerfile, which now pins agy to an
+      # immutable per-arch GitHub release asset AND verifies its SHA256 (a
+      # stronger supply-chain control than the old install.sh + version-string
+      # check). The pin now lives in deploy/docker/Dockerfile (``AGY_VERSION`` +
+      # both ``AGY_SHA256_*``); to adopt a new agy, bump it there. The redundant
+      # workflow step and dead build-arg were dropped here.
+      - name: Build and push host image
+        id: build-host
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: host
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.host_tags }}
+          build-args: |
+            OMNIGENT_BUILD_SHA=sha-${{ steps.tags.outputs.short_sha }}
+            OMNIGENT_BUILD_TIME=${{ steps.tags.outputs.build_time }}
+            OMNIGENT_BUILD_REF=${{ steps.tags.outputs.build_ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: true
+
+  # OPTIONAL auto-deploy leg. Fully GATED on a FLY_API_TOKEN repo secret: the
+  # `secrets` context is not available in job/step `if:`, so the secret is
+  # mapped to an env var and a guard step decides whether to proceed. With no
+  # secret the job runs but every real step is skipped — nothing mutates the
+  # live app, and CI stays green. To ENABLE: add a `FLY_API_TOKEN` repo secret
+  # (`fly tokens create deploy -a omnigent-tomkit`). See RUNBOOK.tomkit.md.
+  deploy-fly:
+    needs: build-and-push
+    if: github.repository == 'tomkit/omnigent'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: omnigent-tomkit
+      # Immutable per-commit SERVER image rolled out to the Fly machine.
+      IMAGE_REF: ghcr.io/tomkit/omnigent-server:sha-${{ needs.build-and-push.outputs.short-sha }}
+      # The /health version string the freshly-deployed server must report.
+      EXPECTED_VERSION: sha-${{ needs.build-and-push.outputs.short-sha }}
+      HEALTH_URL: https://omnigent-tomkit.fly.dev/health
+    steps:
+      - name: Decide whether to deploy
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ -z "${FLY_API_TOKEN:-}" ]; then
+            echo "FLY_API_TOKEN not set — auto-deploy disabled (this is the safe default)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "FLY_API_TOKEN present — will deploy ${IMAGE_REF}."
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up flyctl
+        if: steps.gate.outputs.enabled == 'true'
+        uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be  # v1.5
+
+      # ROLLBACK CAPTURE — snapshot the CURRENTLY-LIVE state BEFORE mutating
+      # anything, so a failed health check can restore it. Two things change in
+      # this job: (a) the SERVER image on the Fly machine, and (b) the
+      # OMNIGENT_DAYTONA_HOST_IMAGE Fly secret that managed Daytona sandboxes
+      # read. We record the prior value of BOTH here.
+      #
+      # SECRET-READBACK LIMITATION: `flyctl secrets list` shows only secret
+      # NAMES + value digests, never the plaintext — so the prior host image
+      # CANNOT be recovered from the secrets API at rollback time. It CAN be
+      # read from the running machine's process env via `printenv` over
+      # `flyctl ssh console` (the secret is injected into the process env),
+      # which we attempt best-effort here. If the ssh probe fails (no wireguard
+      # / ssh not provisioned on the CI runner), prev_host_image is left empty
+      # and rollback will NOT restore the host secret — see the rollback step.
+      - name: Capture pre-deploy state for rollback
+        id: prev
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          # Prior SERVER image — reliably readable from the Fly API. Pin by
+          # digest when available (immutable), else fall back to the tag.
+          # `flyctl image show --json` returns an ARRAY of image objects (one
+          # per machine; this app is single-machine, so take the first). The
+          # `if type=="array"` guard keeps it working if flyctl ever returns a
+          # bare object instead. Keys are lower-cased before extraction to
+          # tolerate flyctl JSON key-case drift. An empty array or a missing
+          # field yields "" (never an error) under `set -euo pipefail`.
+          PREV_SERVER=""
+          if SHOW=$(flyctl image show --app "$FLY_APP" --json 2>/dev/null); then
+            OBJ=$(echo "$SHOW" | jq -c '(if type=="array" then (.[0] // {}) else . end) | with_entries(.key |= ascii_downcase)' 2>/dev/null || echo '{}')
+            REG=$(echo "$OBJ"  | jq -r '.registry   // empty')
+            REPO=$(echo "$OBJ" | jq -r '.repository // empty')
+            DIG=$(echo "$OBJ"  | jq -r '.digest     // empty')
+            TAG=$(echo "$OBJ"  | jq -r '.tag        // empty')
+            if [ -n "$REG" ] && [ -n "$REPO" ]; then
+              if [ -n "$DIG" ]; then
+                PREV_SERVER="${REG}/${REPO}@${DIG}"
+              elif [ -n "$TAG" ]; then
+                PREV_SERVER="${REG}/${REPO}:${TAG}"
+              fi
+            fi
+          fi
+          echo "prev_server_image=${PREV_SERVER}" >> "$GITHUB_OUTPUT"
+          echo "Prior server image: ${PREV_SERVER:-<unresolved>}"
+
+          # Prior HOST image secret — best-effort read from the live machine's
+          # process env (the only place the plaintext is observable).
+          PREV_HOST=""
+          if VAL=$(flyctl ssh console --app "$FLY_APP" \
+                     -C 'printenv OMNIGENT_DAYTONA_HOST_IMAGE' 2>/dev/null); then
+            PREV_HOST=$(echo "$VAL" | tr -d '\r' | tail -n 1)
+          fi
+          echo "prev_host_image=${PREV_HOST}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PREV_HOST" ]; then
+            echo "Prior host image secret captured (restorable on rollback)."
+          else
+            echo "Prior host image secret NOT capturable — rollback will not restore it."
+          fi
+
+      # STEP 1 — PIN THE DAYTONA HOST IMAGE BY DIGEST.
+      # Managed Daytona sandboxes boot from OMNIGENT_DAYTONA_HOST_IMAGE. Pinning
+      # by DIGEST (not a :latest / :sha tag) dodges Daytona's tag cache, which
+      # can keep serving a stale/poisoned image after a tag is moved.
+      # `flyctl secrets set` WITHOUT --stage triggers its OWN deployment, which
+      # would roll out the new host secret on the OLD server image before the
+      # intended server deploy (the sequencing race the contract forbids). So we
+      # use `--stage` to set the secret WITHOUT deploying; the server
+      # `flyctl deploy` in the next step is then the SINGLE rollout that applies
+      # the new server image AND this staged host secret together.
+      - name: Pin Daytona host image by digest
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          # docker/build-push-action emits the digest already prefixed with
+          # `sha256:`; guard against double-prefixing either way.
+          HOST_DIGEST="${{ needs.build-and-push.outputs.host-digest }}"
+          case "$HOST_DIGEST" in
+            sha256:*) HOST_REF="ghcr.io/tomkit/omnigent-host@${HOST_DIGEST}" ;;
+            *)        HOST_REF="ghcr.io/tomkit/omnigent-host@sha256:${HOST_DIGEST}" ;;
+          esac
+          echo "Staging OMNIGENT_DAYTONA_HOST_IMAGE=${HOST_REF} (applied by the deploy below)"
+          flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${HOST_REF}" \
+            --stage \
+            --app "$FLY_APP"
+
+      # STEP 2 — DEPLOY THE SERVER IMAGE (the original behaviour). This is the
+      # final rolling restart and also picks up the host-image secret set above.
+      # Preserves the live machine's volume mount, internal port, and health
+      # checks because fly.tomkit.toml mirrors them exactly and `fly deploy`
+      # only swaps the image. Requires the GHCR package to be PUBLIC (or Fly
+      # registry creds configured) so the remote builder can pull it.
+      - name: Deploy to Fly
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          flyctl deploy \
+            --config deploy/fly/fly.tomkit.toml \
+            --app "$FLY_APP" \
+            --image "${IMAGE_REF}"
+
+      # STEP 3 — HEALTH VERIFY. Poll /health until it returns HTTP 200 AND
+      # reports the version we just shipped (sha-<short>). ~90s budget. Fail
+      # LOUDLY if it never converges: a red job is the signal to intervene, and
+      # it triggers the rollback step below.
+      - name: Verify deploy health
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          echo "Expecting ${HEALTH_URL} -> HTTP 200 with version=${EXPECTED_VERSION}"
+          for i in $(seq 1 9); do
+            CODE=$(curl -s -o /tmp/health.json -w '%{http_code}' --max-time 10 "$HEALTH_URL" || echo "000")
+            VER=$(jq -r '.version // empty' /tmp/health.json 2>/dev/null || echo "")
+            echo "attempt ${i}/9: http=${CODE} version=${VER:-<none>}"
+            if [ "$CODE" = "200" ] && [ "$VER" = "$EXPECTED_VERSION" ]; then
+              echo "Health OK: live version matches ${EXPECTED_VERSION}."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Health check did NOT converge to version=${EXPECTED_VERSION} within ~90s."
+          exit 1
+
+      # STEP 4 — ROLLBACK on health failure. Runs ONLY when an earlier step in
+      # this job failed (primarily the health check) and the gate was enabled.
+      #
+      # SERVER: redeploy the prior image captured at job start. Reliable.
+      # HOST SECRET: restore the prior OMNIGENT_DAYTONA_HOST_IMAGE ONLY if we
+      #   read it back from the live machine env at the start (see the
+      #   SECRET-READBACK LIMITATION note above). If we could NOT capture it, we
+      #   leave the freshly-pinned host digest in place — it is internally
+      #   consistent (built from the same commit), just newer than the
+      #   rolled-back server — and rely on the loud red job for manual
+      #   intervention. Fly's own machine-level health-check auto-rollback
+      #   covers the SERVER machine but NOT this secret, so we never depend on
+      #   it for the host image.
+      - name: Rollback on health failure
+        if: failure() && steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          PREV_SERVER="${{ steps.prev.outputs.prev_server_image }}"
+          PREV_HOST="${{ steps.prev.outputs.prev_host_image }}"
+
+          # Restore the prior host secret. Mirror the forward path's
+          # single-rollout discipline: if we are about to redeploy the prior
+          # server image (PREV_SERVER set), --stage the secret so that deploy
+          # applies it in ONE rollout. If there is NO server deploy to follow
+          # (PREV_SERVER empty), set it WITHOUT --stage so it actually applies
+          # on its own.
+          if [ -n "$PREV_HOST" ]; then
+            if [ -n "$PREV_SERVER" ]; then
+              echo "Staging prior host image secret (applied by the rollback deploy below)."
+              flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${PREV_HOST}" \
+                --stage --app "$FLY_APP" || echo "WARNING: failed to stage host secret."
+            else
+              echo "Restoring prior host image secret (no server deploy to follow — applying directly)."
+              flyctl secrets set "OMNIGENT_DAYTONA_HOST_IMAGE=${PREV_HOST}" \
+                --app "$FLY_APP" || echo "WARNING: failed to restore host secret."
+            fi
+          else
+            echo "WARNING: prior host image secret was not capturable — leaving the new digest pinned (manual intervention may be required)."
+          fi
+
+          if [ -n "$PREV_SERVER" ]; then
+            echo "Rolling server back to ${PREV_SERVER}"
+            flyctl deploy \
+              --config deploy/fly/fly.tomkit.toml \
+              --app "$FLY_APP" \
+              --image "${PREV_SERVER}"
+          else
+            echo "::error::No prior server image captured — cannot auto-roll-back. Intervene manually."
+          fi
+          # Keep the job RED even though rollback ran — the failed deploy still
+          # needs a human to look at it.
+          exit 1

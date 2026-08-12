@@ -19,6 +19,7 @@ from omnigent.server.routes.sessions import (
     _truncate_label,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.host_store import Host
 
 
 async def _drain_runner_skills(session_id: str) -> None:
@@ -2285,3 +2286,142 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
         captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
         == "runner_error"
     )
+
+
+class _HostStore:
+    """Minimal host store returning one canned host for any id.
+
+    The snapshot path reads the bound host (via ``get_host``) once to populate
+    ``sandbox_provider`` and the resumability signal. ``None`` models a missing
+    host row.
+    """
+
+    def __init__(self, host: Host | None) -> None:
+        self._host = host
+        self.get_host_calls: list[str] = []
+
+    def get_host(self, host_id: str) -> Host | None:
+        self.get_host_calls.append(host_id)
+        return self._host
+
+
+def _host(host_id: str, name: str, sandbox_provider: str | None) -> Host:
+    return Host(
+        host_id=host_id,
+        name=name,
+        user_id="alice@example.com",
+        status="online",
+        created_at=1,
+        updated_at=1,
+        sandbox_provider=sandbox_provider,
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_carries_sandbox_provider_for_managed_host() -> None:
+    """A managed session's provider rides the snapshot.
+
+    The composer's relaunch-on-message path reads ``sandbox_provider`` to tell
+    a managed host (relaunchable, so keep the composer open) apart from a
+    genuinely offline laptop. Losing it here dead-ends every aged-out E2B
+    session at "host offline".
+    """
+    conv = Conversation(
+        id="conv_managed",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_managed",
+        agent_id="ag_test",
+        host_id="host_managed",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")], conversations={"conv_managed": conv}
+    )
+    host_store = _HostStore(_host("host_managed", "managed-a1b2c3d4", "e2b"))
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_managed",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.sandbox_provider == "e2b"
+    assert host_store.get_host_calls == ["host_managed"]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_has_no_provider_for_an_external_host() -> None:
+    """An external (user-connected) host reports no provider."""
+    conv = Conversation(
+        id="conv_local",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_local",
+        agent_id="ag_test",
+        host_id="host_laptop",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")], conversations={"conv_local": conv}
+    )
+    host_store = _HostStore(_host("host_laptop", "corey-laptop", None))
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_local",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.sandbox_provider is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_skips_the_host_read_without_a_binding() -> None:
+    """No ``host_id`` means no host read at all."""
+    conv = Conversation(
+        id="conv_nohost",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_nohost",
+        agent_id="ag_test",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")], conversations={"conv_nohost": conv}
+    )
+    host_store = _HostStore(None)
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_nohost",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.sandbox_provider is None
+    assert snapshot.host_resumable is False
+    assert host_store.get_host_calls == []
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_degrades_when_the_host_row_is_missing() -> None:
+    """A host_id pointing at a deleted row degrades instead of crashing."""
+    conv = Conversation(
+        id="conv_dead_host",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_dead_host",
+        agent_id="ag_test",
+        host_id="host_vanished",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")], conversations={"conv_dead_host": conv}
+    )
+    host_store = _HostStore(None)
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_dead_host",
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.sandbox_provider is None
+    assert snapshot.host_resumable is False
+    assert host_store.get_host_calls == ["host_vanished"]

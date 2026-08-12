@@ -1,14 +1,9 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { ChatHeader } from "./ChatHeader";
-import {
-  TerminalFirstContextProvider,
-  type TerminalFirstContextValue,
-} from "./TerminalFirstContext";
 
 // Minimal mobile-menu prop block. All gating booleans are false / counts are
 // zero so the mobile FAB and three-dot menu never render — these tests only

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import httpx
@@ -27,13 +28,41 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 
 
 @pytest.mark.asyncio
-async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
-    """GET /health returns HTTP 200 and ``{"status": "ok"}``."""
+async def test_health_returns_ok(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /health returns HTTP 200 with status ok + a build version.
+
+    With ``OMNIGENT_BUILD_SHA`` unset (the local/dev default), ``version``
+    degrades to ``"unknown"`` rather than crashing or omitting the field.
+    """
+    monkeypatch.delenv("OMNIGENT_BUILD_SHA", raising=False)
     resp = await client.get("/health")
     assert resp.status_code == 200
-    # Exact shape — a regression that changes the key name or value
+    # Exact shape — a regression that changes the key names or values
     # would break health-check integrations that parse this response.
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "version": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_health_reports_build_sha_version(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /health surfaces the baked-in build sha as ``version``.
+
+    The publish workflow bakes the git-sha image tag into the image as
+    ``OMNIGENT_BUILD_SHA``; ``/health`` echoes it so an operator can tell
+    which build is live. Read at request time, so setting the env var is
+    enough — no app rebuild.
+    """
+    monkeypatch.setenv("OMNIGENT_BUILD_SHA", "sha-6d4847d")
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["version"] == "sha-6d4847d"
 
 
 @pytest.mark.asyncio
@@ -68,6 +97,61 @@ def test_server_version_reads_version_constant() -> None:
     from omnigent.version import VERSION
 
     assert server_app._server_version() == VERSION
+
+
+@pytest.mark.asyncio
+async def test_info_build_provenance_unstamped(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /v1/info exposes a ``build`` object that degrades gracefully.
+
+    With the build env vars unset (the local/dev default), ``sha``,
+    ``build_time`` and ``ref`` are ``None`` rather than missing or crashing,
+    but ``started_at`` (this process's boot time) and ``version`` (the
+    installed package) are always populated — that's the "the instance is
+    alive and on this code" signal the web UI's Build & Deployment panel needs.
+    """
+    for var in ("OMNIGENT_BUILD_SHA", "OMNIGENT_BUILD_TIME", "OMNIGENT_BUILD_REF"):
+        monkeypatch.delenv(var, raising=False)
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    build = resp.json()["build"]
+    # All five keys present so the UI can rely on the shape.
+    assert set(build) == {"version", "sha", "build_time", "started_at", "ref"}
+    assert build["sha"] is None
+    assert build["build_time"] is None
+    assert build["ref"] is None
+    assert build["version"] == _pkg_version("omnigent")
+    # started_at is captured once at import, so it's always set and parseable.
+    assert isinstance(build["started_at"], str) and build["started_at"]
+    from datetime import datetime
+
+    parsed = datetime.fromisoformat(build["started_at"])
+    assert parsed.tzinfo is not None, "started_at must be timezone-aware UTC"
+
+
+@pytest.mark.asyncio
+async def test_info_build_provenance_stamped(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /v1/info echoes the baked-in build metadata when stamped.
+
+    The publish workflow bakes sha/time/ref into the image as env vars; the
+    endpoint reads them at request time, so setting the env is enough — no app
+    rebuild. This is how an operator confirms a redeploy actually shipped.
+    """
+    monkeypatch.setenv("OMNIGENT_BUILD_SHA", "sha-ff243ad")
+    monkeypatch.setenv("OMNIGENT_BUILD_TIME", "2026-06-30T12:00:00Z")
+    monkeypatch.setenv("OMNIGENT_BUILD_REF", "main")
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    build = resp.json()["build"]
+    assert build["sha"] == "sha-ff243ad"
+    assert build["build_time"] == "2026-06-30T12:00:00Z"
+    assert build["ref"] == "main"
+    assert build["started_at"]
 
 
 class _StubWebSocket:
@@ -396,19 +480,23 @@ async def test_info_includes_server_version(
 
 
 @pytest.mark.asyncio
-async def test_health_bare_returns_status_ok(db_uri: str, tmp_path: Path) -> None:
+async def test_health_bare_returns_status_ok(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    ``GET /health`` with no session params still returns the bare
-    ``{"status": "ok"}`` — the liveness rearchitecture must not break the
-    plain health-check integrations that parse this exact shape.
+    ``GET /health`` with no session params returns only status + version
+    (``{"status": "ok", "version": "unknown"}`` with no build sha set) —
+    the liveness rearchitecture must not leak session keys into the bare
+    shape that plain health-check integrations parse.
     """
+    monkeypatch.delenv("OMNIGENT_BUILD_SHA", raising=False)
     app = _build_liveness_app(db_uri, tmp_path).app
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get("/health")
     assert resp.status_code == 200
     # Exact shape — no session/sessions keys leak in when none were asked for.
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "version": "unknown"}
 
 
 @pytest.mark.asyncio
@@ -607,6 +695,73 @@ def test_ensure_extra_builtin_agents_skips_bad_path_and_seeds_good(
     assert seeded is not None, "valid extra built-in must seed even after a bad entry"
     assert seeded.session_id is None, "extra built-ins must be session-scope NULL"
     assert seed_stores.agent_store.get_by_name("does-not-exist") is None
+
+
+def test_ensure_extra_builtin_agents_rejects_a_truncated_bundle(
+    seed_stores: _SeedStores,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-byte config.yaml is refused at boot, not registered.
+
+    An interrupted ``tar xzf`` on the Fly volume left every file in the polly
+    bundle zero-length. ``materialize_bundle`` copies without reading, so the
+    empty bundle registered cleanly and each session then died at turn setup
+    with "config.yaml must be a YAML mapping, got NoneType" — a runtime
+    failure far from its cause. Refusing it here turns that into one loud boot
+    error, while the sibling bundle still seeds (skip-and-continue).
+    """
+    broken = tmp_path / "broken"
+    (broken / "agents" / "worker").mkdir(parents=True)
+    (broken / "config.yaml").write_text("")  # truncated, exactly as observed
+    (broken / "agents" / "worker" / "config.yaml").write_text("name: worker\n")
+
+    good = tmp_path / "extra-ok.yaml"
+    good.write_text(
+        "name: extra-ok\n"
+        "executor:\n"
+        "  harness: claude-sdk\n"
+        "  model: claude-sonnet-4-20250514\n"
+        "prompt: hi\n"
+    )
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, f"{broken}{os.pathsep}{good}")
+
+    server_app._ensure_extra_builtin_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert seed_stores.agent_store.get_by_name("broken") is None, (
+        "a bundle with an empty config.yaml must not register"
+    )
+    assert seed_stores.agent_store.get_by_name("extra-ok") is not None, (
+        "a valid sibling must still seed after a rejected bundle"
+    )
+
+
+def test_ensure_extra_builtin_agents_rejects_a_truncated_subagent_config(
+    seed_stores: _SeedStores,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-byte SUB-agent config is refused too.
+
+    The same truncation emptied polly's ``agents/*/config.yaml``. Those parse
+    lazily at dispatch, so a root-only check would still ship a bundle that
+    breaks the first time a worker is spawned.
+    """
+    broken = tmp_path / "broken-child"
+    (broken / "agents" / "worker").mkdir(parents=True)
+    (broken / "config.yaml").write_text(
+        "name: broken-child\nexecutor:\n  harness: claude-sdk\nprompt: hi\n"
+    )
+    (broken / "agents" / "worker" / "config.yaml").write_text("")
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(broken))
+
+    server_app._ensure_extra_builtin_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert seed_stores.agent_store.get_by_name("broken-child") is None
 
 
 def test_ensure_default_native_agents_seeds_qwen_card(seed_stores: _SeedStores) -> None:
@@ -1126,7 +1281,13 @@ async def test_api_only_root_does_not_shadow_real_routes(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get("/health", headers={"accept": "text/html"})
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    # The real /health JSON is served (not shadowed by the HTML landing). It
+    # also carries the build version (fork provenance); that value is
+    # env-dependent (OMNIGENT_BUILD_SHA or "unknown"), so this test pins only
+    # the status — the point here is that the route isn't shadowed.
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "version" in body
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,6 @@ import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
-import { ViewModeToggle } from "./ViewModeToggle";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -276,6 +275,11 @@ export function ChatHeader({
             </div>
           </>
         )}
+        {/* Where the session runs: the provider name for a managed sandbox
+            ("Daytona") or the machine hostname for a local/remote host. Sits
+            beside the agent identity on sub-agent sessions and after the
+            sidebar toggle on top-level ones; renders nothing without a host
+            binding. */}
       </div>
 
       <div className="flex items-center gap-2">
@@ -291,9 +295,6 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
-        {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
-            null otherwise (and in the iOS shell, where it's the native bar). */}
-        {conversationId && <ViewModeToggle />}
         {/* Mobile-only three-dot menu folding the action buttons above
             (Share · Agent info) so the header stays
             uncluttered on a phone. The right-panel/rail control is

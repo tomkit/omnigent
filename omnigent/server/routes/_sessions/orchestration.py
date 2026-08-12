@@ -925,6 +925,7 @@ def _build_session_response(
     runner_online: bool | None = None,
     host_online: bool | None = None,
     host_resumable: bool = False,
+    sandbox_provider: str | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
@@ -982,6 +983,11 @@ def _build_session_response(
         ``None`` when the session has no ``host_id`` or no lookup is
         wired (see :class:`SessionLiveness`). Used only to decide what
         the open view shows when ``runner_online`` is ``False``.
+    :param sandbox_provider: Raw ``sandbox_provider`` of the bound host,
+        e.g. ``"e2b"`` for a managed sandbox or ``None`` for an external
+        host. Passed through verbatim; the composer's relaunch-on-message
+        path keys off it to tell a managed host (relaunchable) apart from
+        a genuinely offline laptop.
     :param pending_elicitation_events: Optional precomputed
         outstanding elicitation events. ``None`` reads only the
         current session's entries from the pending-elicitations index.
@@ -1034,6 +1040,7 @@ def _build_session_response(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
+        sandbox_provider=sandbox_provider,
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
@@ -8822,11 +8829,19 @@ async def _get_session_snapshot(
     # chat passes include_liveness=False, so host_online is None here and
     # liveness arrives via the poll/stream). One indexed host read, gated to
     # host-bound sessions.
+    # One indexed host read serves both the resumability signal AND the
+    # environment fields (host_name / host_type / sandbox_provider). Gated to
+    # host-bound sessions; host_resumable additionally needs a sandbox_config
+    # (its provider decides can_resume), but the env fields don't, so the read
+    # is no longer gated on sandbox_config.
     host_resumable = False
-    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
-        host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
-        if host_for_resume is not None:
-            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    sandbox_provider: str | None = None
+    if host_store is not None and conv.host_id is not None:
+        bound_host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+        if bound_host is not None:
+            sandbox_provider = bound_host.sandbox_provider
+            if sandbox_config is not None:
+                host_resumable = host_resume_supported(bound_host, sandbox_config)
     return _build_session_response(
         conv,
         items,
@@ -8843,6 +8858,7 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
+        sandbox_provider=sandbox_provider,
         pending_elicitation_events=await asyncio.to_thread(
             _pending_elicitation_snapshot_for_session,
             conv_store,

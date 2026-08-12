@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { ServerInfo, SharingMode } from "@/lib/capabilities";
+import { BUILD_OFF, type ServerInfo, type SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { PermissionsModal } from "./PermissionsModal";
 
@@ -72,6 +72,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    build: BUILD_OFF,
     ...overrides,
   };
 }

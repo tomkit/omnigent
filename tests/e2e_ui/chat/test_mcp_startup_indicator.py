@@ -106,7 +106,14 @@ def test_mcp_startup_band_lifecycle(
         },
     )
     page.goto(f"{base_url}/c/{session_id}")
-    expect(band).to_contain_text("Starting MCP servers (0/3): glean, jira, safe", timeout=15_000)
+    # Initial appearance: the SPA cold-load (bundle parse + hydrate + first
+    # session fetch) plus the snapshot-cache seeding of the band can run past the
+    # 15s default expect timeout when the e2e_ui shard is under xdist load. Gate
+    # the first band assertion with the generous initial-load budget
+    # (open_right_rail uses 60s for its rail toggle); to_contain_text auto-waits,
+    # so it returns the instant the band renders — the larger timeout only raises
+    # the ceiling, it doesn't slow the happy path.
+    expect(band).to_contain_text("Starting MCP servers (0/3): glean, jira, safe", timeout=60_000)
 
     # 2. Live progress: one server settles, the count advances and the
     #    settled name drops out of the pending list. This is the first

@@ -4676,7 +4676,7 @@ def create_runner_app(
     async def _native_cost_popup_config_file(conv_id: str, harness: str) -> Path:
         from omnigent.cli_auth import databricks_request_headers
         from omnigent.opencode_native_bridge import write_cost_popup_config
-        from omnigent.runner._entry import _make_auth_token_factory
+        from omnigent.runner._entry import _make_auth_token_factory, _runner_forwarder_headers
 
         if harness == "claude-native":
             from omnigent import claude_native_bridge as _cnb
@@ -4703,7 +4703,10 @@ def create_runner_app(
             write_cost_popup_config,
             bridge_dir,
             ap_server_url=_server_url,
-            ap_auth_headers=databricks_request_headers(_server_url, bearer_token=_token),
+            ap_auth_headers={
+                **_runner_forwarder_headers(_token),
+                **databricks_request_headers(_server_url),
+            },
         )
 
     async def _repop_pending_cost_popup_on_attach(

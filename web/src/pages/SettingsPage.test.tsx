@@ -11,6 +11,22 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
+interface BuildInfoMock {
+  version: string | null;
+  sha: string | null;
+  build_time: string | null;
+  started_at: string | null;
+  ref: string | null;
+}
+
+const NULL_BUILD: BuildInfoMock = {
+  version: null,
+  sha: null,
+  build_time: null,
+  started_at: null,
+  ref: null,
+};
+
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
@@ -35,6 +51,13 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  build: {
+    version: null,
+    sha: null,
+    build_time: null,
+    started_at: null,
+    ref: null,
+  } as BuildInfoMock,
 }));
 
 vi.mock("next-themes", () => ({
@@ -46,6 +69,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    build: mocks.build,
   }),
 }));
 vi.mock("@/lib/accountsApi", () => ({
@@ -201,6 +225,7 @@ beforeEach(() => {
   mocks.pages = undefined;
   mocks.projectNames = [];
   mocks.hasNextPage = false;
+  mocks.build = { ...NULL_BUILD };
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 afterEach(() => {
@@ -987,5 +1012,45 @@ describe("SettingsPage", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("renders Build & deployment provenance with a commit link and relative time", () => {
+    // Freeze now 3 minutes after this instance started.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-30T12:00:00Z"));
+    mocks.build = {
+      version: "0.3.0.dev0",
+      sha: "sha-ff243ad",
+      build_time: "2026-06-30T11:30:00Z",
+      started_at: "2026-06-30T11:57:00Z",
+      ref: "main",
+    };
+    renderPage("/settings/about");
+
+    expect(screen.getByRole("heading", { name: "Build & deployment" })).toBeInTheDocument();
+    expect(screen.getByText("0.3.0.dev0")).toBeInTheDocument();
+
+    // Commit renders as a link to the fork's commit page, sha- prefix stripped.
+    const link = screen.getByTestId("build-commit-link");
+    expect(link).toHaveTextContent("sha-ff243ad");
+    expect(link).toHaveAttribute("href", "https://github.com/tomkit/omnigent/commit/ff243ad");
+
+    // The git ref/branch the image was built from renders its own row.
+    expect(screen.getByText("Ref")).toBeInTheDocument();
+    expect(screen.getByText("main")).toBeInTheDocument();
+
+    // "Last deployed" (process start) shows the 3-minutes-ago relative hint.
+    expect(screen.getByText("(3m ago)")).toBeInTheDocument();
+  });
+
+  it("shows Unknown placeholders for an unstamped local/dev build", () => {
+    mocks.build = { ...NULL_BUILD };
+    renderPage("/settings/about");
+
+    expect(screen.getByRole("heading", { name: "Build & deployment" })).toBeInTheDocument();
+    // No commit link when sha is absent.
+    expect(screen.queryByTestId("build-commit-link")).toBeNull();
+    // Every field degrades to the muted "Unknown" placeholder (incl. Ref).
+    expect(screen.getAllByText("Unknown").length).toBeGreaterThanOrEqual(5);
   });
 });
