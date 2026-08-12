@@ -1560,8 +1560,6 @@ def register_core_routes(
                 permission_store=permission_store,
                 conversation_store=conversation_store,
             )
-        if body.archived is True:
-            await _best_effort_stop(session_id, conversation_store, runner_router)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
