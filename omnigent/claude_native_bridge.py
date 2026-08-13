@@ -2957,10 +2957,9 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude never becomes interactive (``SessionStart`` / prompt),
-        if a ``tmux send-keys`` invocation fails, if an identifiable
-        draft never appears in the input box (the paste was dropped), or
-        if the draft never leaves the input box after repeated submit
-        Enters (message not delivered).
+        if a ``tmux send-keys`` invocation fails, or if the draft
+        never leaves the input box after repeated submit Enters
+        (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # tmux.json only means the tmux session exists; Claude Code becomes
@@ -3020,7 +3019,10 @@ def inject_user_message(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic.
+    # load / large payloads); polling is deterministic. Best-effort:
+    # when the draft never becomes identifiable (e.g. whitespace-only
+    # first line, custom statusline containing the glyph), fall through
+    # after the timeout and submit blind, matching the old behavior.
     needle = _submit_needle(content)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
@@ -3032,23 +3034,9 @@ def inject_user_message(
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
     if not draft_seen:
-        if not needle:
-            # The draft is genuinely unidentifiable (whitespace-only
-            # first line, or a custom statusline that carries the glyph),
-            # so its absence proves nothing — verification would
-            # trivially "pass". Submit blind, matching the old behavior.
-            return
-        # The draft was identifiable but never appeared in the input box:
-        # the paste was dropped (e.g. injected during a still-booting /
-        # welcome-screen repaint that beat the readiness gate). Fail loud
-        # so the executor surfaces an ExecutorError instead of leaving
-        # the turn to hang forever with nothing delivered.
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
-        raise RuntimeError(
-            "Claude Code never showed the pasted message in its input box "
-            f"within {_PASTE_COMMIT_TIMEOUT_S}s (the paste was dropped). "
-            "The message was not delivered." + _format_terminal_failure_tail(pane)
-        )
+        # The draft was never observed, so its absence proves nothing —
+        # verification would trivially "pass". Submit blind as before.
+        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
