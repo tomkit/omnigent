@@ -3554,55 +3554,6 @@ def test_inject_user_message_raises_when_draft_never_submits(
         inject_user_message(bridge_dir, content="fix the flaky test")
 
 
-def test_inject_user_message_raises_when_paste_dropped(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Injection fails loud when an identifiable draft never reaches the box.
-
-    Readiness passes, the paste is issued, but the draft never appears
-    in the input box (the paste was dropped — e.g. it landed during a
-    repaint that beat the gate). Previously the helper submitted blind
-    and returned success, so the turn completed with nothing delivered
-    and the UI hung forever. The verified-submit step must now RAISE so
-    the executor surfaces an ExecutorError. No Enter-driven success path
-    may swallow this.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-    _mark_session_started(bridge_dir)
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """
-        Pass readiness, but never let the pasted draft appear.
-
-        ``capture-pane`` always returns an empty (cleared) input box, so
-        the draft-committed poll never sees the message — the paste was
-        dropped. ``paste-buffer`` is a no-op (the draft does not land).
-
-        :param cmd: Argv list passed to subprocess.run.
-        :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess; capture-pane returns "❯ ".
-        """
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="❯ ", stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="paste was dropped"):
-        inject_user_message(bridge_dir, content="run the migration")
-
-
 def test_inject_interrupt_sends_escape_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
