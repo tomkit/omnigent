@@ -55,6 +55,7 @@ from omnigent.onboarding.provider_config import (
     ProviderEntry,
     default_provider_for_harness,
     first_available_provider,
+    get_default_provider,
     harness_family,
     load_config,
     load_providers,
@@ -869,10 +870,15 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
             f"credentials resolve{detail}, then retry.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # pi carries a single credential: anthropic's when present, else openai's.
-    # The model fallback must match the family that supplied that credential.
+    # pi carries a single credential. When both families resolve (a sandbox
+    # commonly injects ANTHROPIC_API_KEY *and* OPENAI_API_KEY), the model picks
+    # the family: a Claude model id uses Anthropic, anything else uses OpenAI —
+    # so a pi+Fireworks agent (e.g. ``accounts/fireworks/...``) isn't hijacked
+    # onto the Anthropic endpoint. With only one family present, use it.
     auth_source: FamilyConfig | None
-    if anthropic is not None:
+    pinned_model = env.get("HARNESS_PI_MODEL")
+    prefer_anthropic = pinned_model is not None and "claude" in pinned_model.lower()
+    if anthropic is not None and (prefer_anthropic or openai is None):
         auth_source = anthropic
         auth_family = ANTHROPIC_FAMILY
     else:
@@ -1085,6 +1091,16 @@ def _resolve_provider_for_build(
         # The model name itself signals Databricks intent (no pinned profile).
         return _legacy_databricks_provider(None, harness_type=harness_type, for_launch=for_launch)
     effective = effective_config_with_detected(explicit_config)
+    # pi consumes both families. When a sandbox injects BOTH an anthropic and an
+    # openai key (ambient detection finds two providers), the model picks which
+    # family to route — a Claude id → anthropic, anything else → openai — so a
+    # pi+Fireworks model isn't hijacked onto an ambient Anthropic key by the
+    # anthropic-first fallback in :func:`default_provider_for_harness`.
+    if harness_type == "pi" and model is not None:
+        preferred = ANTHROPIC_FAMILY if "claude" in model.lower() else OPENAI_FAMILY
+        by_model = get_default_provider(effective, preferred)
+        if by_model is not None:
+            return by_model
     ambient_default = default_provider_for_harness(effective, harness)
     if ambient_default is not None:
         return ambient_default
@@ -1765,6 +1781,24 @@ def _set_openai_agents_reasoning_item_id_policy_env(
     env["HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY"] = value
 
 
+def _coerce_optional_config_bool(value: Any) -> bool | None:
+    """Coerce an ``executor.config`` scalar to ``bool | None``.
+
+    The spec parser stringifies every ``executor.config`` value, so a YAML
+    ``use_responses: false`` reaches this code as the string ``"False"`` — which
+    is truthy, so a naive ``"true" if value else "false"`` would emit ``true``
+    and route the harness at the OpenAI ``/responses`` API (a 404 on
+    chat-completions-only gateways like Fireworks). Treat the usual falsy
+    spellings as ``False`` and leave ``None`` (unset) untouched so callers can
+    still fall back to a model-derived default.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("", "false", "0", "no", "off", "none")
+
+
 def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Build the env-var dict the openai-agents harness wrap reads.
@@ -1818,7 +1852,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     provider = _resolve_provider_for_build(spec, harness_type="openai-agents-sdk", for_launch=True)
     if provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="openai-agents-sdk")
-        use_responses = spec.executor.config.get("use_responses")
+        use_responses = _coerce_optional_config_bool(spec.executor.config.get("use_responses"))
         if use_responses is not None:
             env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = (
                 "true" if _config_flag_is_true(use_responses) else "false"
@@ -1876,7 +1910,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     elif "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE" in env:
         ucode_profile = env["HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE"]
 
-    use_responses = spec.executor.config.get("use_responses")
+    use_responses = _coerce_optional_config_bool(spec.executor.config.get("use_responses"))
     if use_responses is not None:
         env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = (
             "true" if _config_flag_is_true(use_responses) else "false"

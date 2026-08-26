@@ -55,6 +55,19 @@ export type LivenessRow = Pick<Conversation, "host_id" | "permission_level" | "c
    * should offer the resume picker immediately. Absent ⇒ treated `false`.
    */
   imported?: boolean;
+  /**
+   * Whether this session's host is a MANAGED sandbox host (any provider) —
+   * bound to a server-provisioned sandbox rather than an external/laptop host.
+   * Like `host_resumable`, it rides the session snapshot (`sandbox_provider` is
+   * non-null for managed hosts) and is spliced in via
+   * {@link livenessRowFromSession}. A managed host whose sandbox is down is
+   * recoverable by sending a message even when it is NOT resume-in-place
+   * (`host_resumable` false): the server relaunches a FRESH sandbox seeded from
+   * server-side items (E2B/Modal have a hard lifetime cap and no persistent
+   * volume). So it joins `host_resumable` in flipping row 3 to `host_asleep`
+   * instead of the `host_offline` dead-end. Absent ⇒ treated `false`.
+   */
+  host_managed?: boolean;
 };
 
 /** Label marking a session imported from a local harness transcript. */
@@ -74,7 +87,13 @@ export function livenessRowFromSession(
   session:
     | Pick<
         Session,
-        "hostId" | "permissionLevel" | "createdAt" | "hostResumable" | "kind" | "labels"
+        | "hostId"
+        | "permissionLevel"
+        | "createdAt"
+        | "hostResumable"
+        | "kind"
+        | "labels"
+        | "sandboxProvider"
       >
     | null
     | undefined,
@@ -87,6 +106,10 @@ export function livenessRowFromSession(
     host_resumable: session.hostResumable ?? false,
     kind: session.kind,
     imported: Boolean(session.labels?.[IMPORT_SOURCE_LABEL_KEY]),
+    // A non-null sandbox provider is the "server-managed host" discriminator
+    // (external/laptop hosts have none), so a down managed sandbox is
+    // relaunchable-on-message rather than a reconnect dead-end.
+    host_managed: session.sandboxProvider != null,
   };
 }
 
@@ -112,19 +135,22 @@ export function livenessRowFromSession(
  *   open. The open view renders no banner for this state — typing
  *   silently relaunches the runner (which then flips it to `starting`).
  * - `host_asleep` — the session is host-bound, the host tunnel is down, but
- *   the host is a resumable managed host: the server wakes the sandbox on the
- *   next message (the send-message relaunch path calls `resume_managed_host`).
- *   Treated like `runner_asleep` — the composer stays open, no reconnect
- *   banner, and typing wakes it. This is what makes the backend resume
- *   reachable from the web; without it a resumable host would dead-end on
- *   `host_offline` below. While a just-sent turn is waking it (`turnActive`),
- *   this upgrades to `starting` so the ~85s cold wake shows a "Connecting…"
- *   intermediate rather than a blank screen.
+ *   the host is a MANAGED sandbox host the server brings back on the next
+ *   message: a resume-in-place provider (`host_resumable`) wakes the same
+ *   sandbox (`resume_managed_host`), and a non-resumable managed provider
+ *   (`host_managed`, e.g. E2B/Modal) is relaunched onto a fresh sandbox seeded
+ *   from server-side items (`relaunch_managed_host`). Treated like
+ *   `runner_asleep` — the composer stays open, no reconnect banner, and typing
+ *   brings it back. This is what makes the backend resume/relaunch reachable
+ *   from the web; without it a managed host would dead-end on `host_offline`
+ *   below. While a just-sent turn is bringing it back (`turnActive`), this
+ *   upgrades to `starting` so the cold wake shows a "Connecting…" intermediate
+ *   rather than a blank screen.
  * - `host_offline` — the session is host-bound and the host tunnel is down,
- *   and the host is NOT resumable from the web (an external/laptop host, or a
- *   managed provider without a stop/resume lifecycle). The owner must
- *   reconnect the host from that machine (`isOwner` true), and any viewer can
- *   fork to continue independently.
+ *   and the host is NOT a managed sandbox (an external/laptop host, no sandbox
+ *   provider) — so the server cannot bring it back. The owner must reconnect
+ *   the host from that machine (`isOwner` true), and any viewer can fork to
+ *   continue independently.
  * - `local_stranded` — not host-bound (no `host_id`) and the runner is
  *   down. There's no host to relaunch it; the user restarts from their
  *   own machine, and forking is the escape hatch.
@@ -164,9 +190,9 @@ function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined
  * |---|---------------|-------------|---------|------------|----------------------|
  * | 1 | true          | (any)       | (any)   | (any)      | online               |
  * | 2 | not-true      | (any)       | (any)   | (any)      | starting (fresh*)    |
- * | 3 | not-true      | false       | set+resumable | true  | starting (waking)    |
- * | 3'| not-true      | false       | set+resumable | false | host_asleep          |
- * | 3"| not-true      | false       | set, non-resum| (any) | host_offline {owner} |
+ * | 3 | not-true      | false       | set+managed   | true  | starting (waking)    |
+ * | 3'| not-true      | false       | set+managed   | false | host_asleep          |
+ * | 3"| not-true      | false       | set, external | (any) | host_offline {owner} |
  * | 4 | undefined     | (any)       | (any)   | (any)      | unknown (pre-poll)   |
  * | 5 | false         | true        | (any)   | true       | starting (relaunch)  |
  * | 5'| false         | true        | (any)   | false      | runner_asleep        |
@@ -182,9 +208,10 @@ function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined
  * runner tunnel is the only signal that means "chat now." A just-created
  * session whose runner hasn't registered yet (row 2) is cold-booting, not
  * stranded: surface `starting` rather than a reconnect banner until the
- * grace window lapses. A confirmed host-down splits on resumability: a
- * resumable managed host is `host_asleep` (row 3 — wakeable by sending a
- * message, composer open), a non-resumable one is `host_offline` (row 3' —
+ * grace window lapses. A confirmed host-down splits on whether the host is a
+ * managed sandbox: a managed host — resume-in-place OR relaunch-fresh — is
+ * `host_asleep` (rows 3/3' — brought back by sending a message, composer
+ * open), while a non-managed external/laptop host is `host_offline` (row 3" —
  * reconnect / fork).
  * Pre-poll `undefined` (row 4) stays `unknown` so a not-yet-resolved poll
  * doesn't flash a banner over a live session. A known-down runner with a
@@ -274,16 +301,20 @@ export function useSessionLiveness(
     return { kind: "starting" };
   }
 
-  // 3. A host-bound session whose host is confirmed offline. If the host is
-  // a resumable managed host, the server wakes the sandbox on the next
-  // message (the send-message relaunch path calls resume_managed_host). A
-  // just-sent turn (turnActive) is waking it *now* — surface the same
-  // `starting` "Connecting…" intermediate as a fresh launch so the ~85s cold
-  // wake isn't a blank screen; idle (no turn) stays `host_asleep` (composer
-  // open, no banner). Either way it's NOT the host_offline dead-end.
-  // Otherwise (non-resumable) it's genuinely stuck: `host_offline`.
+  // 3. A host-bound session whose host is confirmed offline. If the host is a
+  // MANAGED sandbox host, the server brings it back on the next message: a
+  // resume-in-place provider (`host_resumable`) wakes the SAME sandbox +
+  // volume (resume_managed_host), while a non-resumable managed provider
+  // (`host_managed`, e.g. E2B/Modal — hard lifetime cap, no persistent
+  // volume) is relaunched onto a FRESH sandbox seeded from server-side items
+  // (relaunch_managed_host). Both recover from a message, so both stay
+  // `host_asleep` (composer open, no banner) — NOT the host_offline dead-end.
+  // A just-sent turn (turnActive) is bringing it back *now* — surface the same
+  // `starting` "Connecting…" intermediate as a fresh launch so the cold wake
+  // isn't a blank screen. Only a genuinely external (laptop) host — no sandbox
+  // provider, neither flag set — is stuck: `host_offline`.
   if (hostId && hostOnline === false) {
-    if (conv?.host_resumable) {
+    if (conv?.host_resumable || conv?.host_managed) {
       return opts?.turnActive ? { kind: "starting" } : { kind: "host_asleep" };
     }
     return { kind: "host_offline", isOwner: isOwner(conv) };

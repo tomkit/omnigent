@@ -1311,15 +1311,24 @@ async def _auto_create_opencode_terminal(
 
         policy_env["OMNIGENT_RELAY_FILE"] = str(bridge_dir / _TOOL_RELAY_FILE)
         # Bake fallback headers for the first calls before relay starts.
-        from omnigent.runner._entry import _make_auth_token_factory
+        from omnigent.runner._entry import _make_auth_token_factory, _runner_forwarder_headers
 
         _policy_factory = _make_auth_token_factory()
         _policy_token = _policy_factory() if _policy_factory is not None else None
         if _policy_token:
             from omnigent.cli_auth import databricks_request_headers
 
+            # Bake the FULL routing header map (bearer + tunnel binding token +
+            # workspace / deployment selectors), not a bare bearer: the plugin
+            # POSTs /policies/evaluate to the omnigent server out-of-process, so
+            # without the selectors it could land on a different server instance
+            # than the runner's, and without the binding token a managed-sandbox
+            # runner (which holds no user credential) is rejected.
             policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
-                databricks_request_headers(runner_server_url, bearer_token=_policy_token)
+                {
+                    **_runner_forwarder_headers(_policy_token),
+                    **databricks_request_headers(runner_server_url),
+                }
             )
 
     # Merge the user's global provider definitions (e.g. OpenAI-compatible
@@ -2103,14 +2112,20 @@ async def _auto_create_pi_terminal(
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
     # Route the extension's out-of-process POSTs (/events, /mcp,
-    # /policies/evaluate) through the shared header builder so they carry the
-    # workspace / deployment routing selectors, not just a bare bearer. A bare
-    # bearer skips those selectors and can land on a different server instance
-    # than the one the runner (and the web UI) are on, so live-streamed items
-    # never reach the browser's in-process event stream (they only appear on reload).
+    # /policies/evaluate) through the shared header builders so they carry the
+    # workspace / deployment routing selectors AND the tunnel binding token, not
+    # just a bare bearer. A bare bearer skips those selectors and can land on a
+    # different server instance than the one the runner (and the web UI) are on,
+    # so live-streamed items never reach the browser's in-process event stream
+    # (they only appear on reload); dropping the binding token breaks callbacks
+    # from a runner that has no user credential (a server-managed sandbox).
     from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner._entry import _runner_forwarder_headers
 
-    auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
+    auth_headers = {
+        **_runner_forwarder_headers(auth_token),
+        **databricks_request_headers(launch_config.server_url),
+    }
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's
@@ -3629,11 +3644,16 @@ async def _auto_create_kimi_terminal(
     _auth_factory = _make_auth_token_factory()
     _auth_token = _auth_factory() if _auth_factory is not None else None
     # The hook subprocess replays these static headers from its config (no
-    # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
-    # the workspace-routing header so neither is dropped.
+    # refresh-capable httpx.Auth of its own). Carry the bearer plus the tunnel
+    # binding token (managed-sandbox runners hold no user credential), then fold
+    # in the workspace-routing header so none of the three is dropped.
     from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner._entry import _runner_forwarder_headers
 
-    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
+    _runner_headers = {
+        **_runner_forwarder_headers(_auth_token),
+        **databricks_request_headers(server_url),
+    }
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -6196,6 +6216,7 @@ async def _auto_create_claude_terminal(
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
         ensure_claude_workspace_trusted,
+        ensure_env_api_key_approved,
         prepare_bridge_dir,
     )
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
@@ -6292,6 +6313,15 @@ async def _auto_create_claude_terminal(
     # nothing shown in the UI. Acute with per-session worktrees,
     # which launch Claude in a brand-new, untrusted directory.
     ensure_claude_workspace_trusted(Path(workspace))
+    # Managed (Daytona) sandboxes inject ANTHROPIC_API_KEY into the sandbox
+    # env, which this runner — and the Claude terminal it spawns — inherits.
+    # Claude Code shows a blocking "Detected a custom API key in your
+    # environment" prompt for an env key BEFORE SessionStart fires, and no
+    # one is at this host-spawned terminal to answer it, so the session never
+    # starts. Pre-approve the env key so launch proceeds to SessionStart.
+    # No-op when ANTHROPIC_API_KEY is unset (local / non-managed flows deliver
+    # the key via apiKeyHelper, not the env).
+    ensure_env_api_key_approved()
 
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
@@ -6310,11 +6340,16 @@ async def _auto_create_claude_terminal(
     # The forwarder uses refresh-capable auth directly; ``None`` is a no-op.
     _auth_token = _auth_factory() if _auth_factory is not None else None
     # The hook subprocess replays these static headers from its config (no
-    # refresh-capable auth of its own); the helper pairs the bearer with the
-    # workspace-routing header so neither is dropped.
+    # refresh-capable auth of its own). Carry the bearer plus the tunnel binding
+    # token (managed-sandbox runners hold no user credential), then fold in the
+    # workspace-routing header so none of the three is dropped.
     from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner._entry import _runner_forwarder_headers
 
-    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
+    _runner_headers = {
+        **_runner_forwarder_headers(_auth_token),
+        **databricks_request_headers(server_url),
+    }
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_launcher import resolve_claude_launch

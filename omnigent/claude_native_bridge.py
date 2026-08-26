@@ -103,6 +103,15 @@ _TMUX_FILE = "tmux.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+# Environment variable carrying a static Anthropic API key. When this is
+# present in the env Claude Code launches in, the CLI shows a blocking
+# "Detected a custom API key in your environment" trust prompt before its
+# SessionStart hook fires (see ``ensure_env_api_key_approved``).
+_ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+# Claude Code identifies an approved/rejected custom API key by the last
+# 20 characters of the key, recorded under ``customApiKeyResponses`` in
+# ``~/.claude.json``.
+_CUSTOM_API_KEY_ID_LEN = 20
 _MCP_SERVER_NAME = "omnigent"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 # Tools-changed: harness POSTs to the bridge MCP server's localhost
@@ -158,6 +167,15 @@ _BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
+# Markers that only appear on Claude Code's WELCOME / splash screen.
+# That screen renders an input box (so it carries the ``❯`` glyph) while
+# the session is still mid-``SessionStart`` and NOT yet accepting input —
+# a bracketed paste delivered then is silently dropped. The readiness
+# gate treats a pane carrying any of these as still-booting, not ready,
+# so the prompt glyph alone can't mistake the splash for interactivity.
+# Kept to banner text that never appears during normal interaction (the
+# input box is empty at the readiness stage, so it can't echo these).
+_CLAUDE_WELCOME_MARKERS: tuple[str, ...] = ("Welcome to Claude Code",)
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -1138,6 +1156,109 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
         changed = True
 
     if not changed:
+        return
+    _atomic_write_user_json(config_path, data)
+
+
+def ensure_env_api_key_approved() -> None:
+    """
+    Pre-accept Claude Code's env-provided "custom API key" trust prompt.
+
+    When ``ANTHROPIC_API_KEY`` is set in the environment Claude Code
+    launches in, the CLI shows a blocking prompt — "Detected a custom API
+    key in your environment … Do you want to use this API key? 1.Yes /
+    2.No" — BEFORE the welcome screen and BEFORE the ``SessionStart``
+    hook fires. On a host-spawned (web-UI-driven) managed session nobody
+    is at the terminal to answer it, so the CLI parks on the prompt,
+    ``SessionStart`` never fires, and the turn fails the injection
+    readiness gate. Managed (Daytona) sandboxes inject the harness
+    credential into the sandbox env, which the runner — and thus the
+    Claude terminal it spawns — inherits, so this prompt is hit on every
+    managed claude-native launch.
+
+    Seed Claude Code's own approval record (``customApiKeyResponses``)
+    for the env key's identifier so the CLI proceeds straight to
+    ``SessionStart`` without a human. The full key is never written —
+    only its last-20-char identifier, matching Claude's own format — and
+    it lands only in the runner-owned, owner-only (``0o600``)
+    ``~/.claude.json``.
+
+    No-op when ``ANTHROPIC_API_KEY`` is unset, which is the local /
+    non-managed case: those flows deliver the credential via an
+    ``apiKeyHelper`` rather than the environment, so this prompt never
+    fires and nothing is written. This is read-modify-write of the same
+    file Claude rewrites; it runs once before launch and uses an atomic
+    replace, matching :func:`ensure_claude_workspace_trusted`'s
+    concurrency posture.
+
+    :returns: None.
+    :raises RuntimeError: If ``ANTHROPIC_API_KEY`` is set but shorter than
+        the 20-char identifier length, so its last-20-char "identifier"
+        would be the whole key — refuse to persist a full secret.
+    :raises ValueError: If an existing ``~/.claude.json`` (or its
+        ``customApiKeyResponses`` block) is not the expected JSON shape.
+    :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is not
+        valid JSON. Both surface rather than silently overwrite a corrupt
+        or unexpected user config (fail loud).
+    """
+    api_key = os.environ.get(_ANTHROPIC_API_KEY_ENV, "").strip()
+    if not api_key:
+        return
+    # The approval identifier is the key's last 20 chars. For a key shorter
+    # than that, ``api_key[-20:]`` is the WHOLE key — persisting it would
+    # write the full secret to disk. Real Anthropic keys are well over 20
+    # chars, so a sub-20 value is a malformed/misconfigured env: fail loud
+    # and persist nothing rather than leak it.
+    if len(api_key) < _CUSTOM_API_KEY_ID_LEN:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is too short to derive a safe approval identifier; "
+            "refusing to persist it."
+        )
+
+    config_path = Path.home() / ".claude.json"
+    if config_path.exists():
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"{config_path} is not a JSON object; refusing to overwrite.")
+    else:
+        data = {}
+
+    # Claude Code records per-key trust decisions under
+    # ``customApiKeyResponses`` as ``{"approved": [...], "rejected": [...]}``,
+    # keyed by the LAST 20 CHARACTERS of the key (never the full secret). A
+    # key whose identifier is in ``approved`` is used without the prompt.
+    key_id = api_key[-_CUSTOM_API_KEY_ID_LEN:]
+    responses = data.setdefault("customApiKeyResponses", {})
+    if not isinstance(responses, dict):
+        raise ValueError(
+            f"{config_path} 'customApiKeyResponses' is not a JSON object; refusing to overwrite."
+        )
+    approved = responses.setdefault("approved", [])
+    rejected = responses.setdefault("rejected", [])
+    if not isinstance(approved, list) or not isinstance(rejected, list):
+        raise ValueError(
+            f"{config_path} 'customApiKeyResponses.approved/rejected' is not a JSON array; "
+            "refusing to overwrite."
+        )
+
+    changed = False
+    if key_id not in approved:
+        approved.append(key_id)
+        changed = True
+    # A prior "No" (id in ``rejected``) would keep suppressing the key even
+    # once approved, so clear it.
+    if key_id in rejected:
+        responses["rejected"] = [item for item in rejected if item != key_id]
+        changed = True
+
+    if not changed:
+        # Even when the content is unchanged, guarantee the file is
+        # owner-only: this config also holds the Claude OAuth account block,
+        # so a pre-existing world/group-readable ~/.claude.json must not be
+        # left with loose perms. _atomic_write_user_json pins 0600 on the
+        # write paths; this covers the no-write early return.
+        if config_path.exists() and stat.S_IMODE(config_path.stat().st_mode) != 0o600:
+            config_path.chmod(0o600)
         return
     _atomic_write_user_json(config_path, data)
 
@@ -3044,15 +3165,17 @@ def inject_user_message(
     Deliver a user message into the Claude terminal via tmux send-keys.
 
     Before typing, this waits for two readiness conditions: the runner
-    advertising ``tmux.json``, then Claude Code's input box rendering
-    (see :func:`_wait_for_claude_prompt_ready`). The second gate closes
-    a race on freshly-created sessions where the first message would
-    otherwise be typed into a still-booting TUI and silently dropped.
-    Between the two, anything the person left occupying the composer
-    from the embedded terminal — a ctrl+r history search, a rewind
-    dialog, a ``/config`` panel, ``!`` shell mode — is dismissed with
-    Escape (see :func:`_restore_occupied_input`), so the message reclaims
-    the input box instead of being typed into that surface.
+    advertising ``tmux.json``, then Claude Code becoming truly
+    interactive (see :func:`_wait_for_claude_prompt_ready` — its
+    ``SessionStart`` hook fired AND the welcome/splash screen is gone).
+    The second gate closes a race on freshly-created sessions where the
+    first message would otherwise be typed into a still-booting TUI (or
+    its welcome screen) and silently dropped. Between the two, anything
+    the person left occupying the composer from the embedded terminal —
+    a ctrl+r history search, a rewind dialog, a ``/config`` panel, ``!``
+    shell mode — is dismissed with Escape (see
+    :func:`_restore_occupied_input`), so the message reclaims the input
+    box instead of being typed into that surface.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -3081,19 +3204,22 @@ def inject_user_message(
         (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
-        if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, or if the draft never leaves the input box
-        after repeated submit Enters (message not delivered).
+        if Claude never becomes interactive (``SessionStart`` / prompt),
+        if a ``tmux send-keys`` invocation fails, or if the draft
+        never leaves the input box after repeated submit Enters
+        (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
     _restore_occupied_input(info["socket_path"], info["tmux_target"])
-    # tmux.json only means the tmux session exists; Claude Code's input
-    # box mounts a few seconds later. Block until the prompt renders so
-    # the first message isn't typed into a still-booting TUI and dropped.
+    # tmux.json only means the tmux session exists; Claude Code becomes
+    # interactive a few seconds later (SessionStart fires, the welcome
+    # screen clears). Block until then so the first message isn't typed
+    # into a still-booting TUI / its splash and silently dropped.
     _wait_for_claude_prompt_ready(
+        bridge_dir,
         info["socket_path"],
         info["tmux_target"],
         timeout_s=timeout_s,
@@ -3572,7 +3698,7 @@ def set_permission_mode(
     # The footer only renders once the input box is mounted; without
     # this gate a shift+tab sent mid-boot is dropped and the read below
     # reports a mode the keystroke never reached.
-    _wait_for_claude_prompt_ready(socket_path, tmux_target, timeout_s=timeout_s)
+    _wait_for_claude_prompt_ready(bridge_dir, socket_path, tmux_target, timeout_s=timeout_s)
     current = _read_settled_permission_mode(socket_path, tmux_target)
     if current is None:
         pane = _capture_pane(socket_path, tmux_target)
@@ -4052,6 +4178,39 @@ def _is_box_rule(line: str) -> bool:
     return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
 
 
+def _claude_welcome_screen_visible(pane: str) -> bool:
+    """
+    Return whether a pane is showing Claude Code's welcome/splash screen.
+
+    The splash renders an input box — so it carries
+    :data:`_CLAUDE_PROMPT_GLYPH` — while the session is still
+    mid-``SessionStart`` and not yet accepting keystrokes. Matching any
+    of :data:`_CLAUDE_WELCOME_MARKERS` lets the readiness gate reject
+    that transient state instead of mistaking the glyph for an
+    interactive prompt.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the welcome/splash banner is on screen.
+    """
+    return any(marker in pane for marker in _CLAUDE_WELCOME_MARKERS)
+
+
+def _claude_pane_interactive(pane: str) -> bool:
+    """
+    Return whether a pane shows a truly-interactive Claude Code prompt.
+
+    Stronger than :func:`_claude_prompt_rendered`: the input box must be
+    mounted **and** the welcome/splash screen must be gone. The splash
+    renders an ``❯`` box before the TUI accepts input, so the bare glyph
+    scan alone reads it as ready and the first injected message lands
+    during the ``SessionStart`` repaint and is dropped.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the prompt is mounted past the splash.
+    """
+    return _claude_prompt_rendered(pane) and not _claude_welcome_screen_visible(pane)
+
+
 def _submit_needle(content: str) -> str:
     r"""
     Derive a short marker string used to spot a draft in the input box.
@@ -4137,20 +4296,39 @@ def _format_terminal_failure_tail(pane: str) -> str:
 
 
 def _wait_for_claude_prompt_ready(
+    bridge_dir: Path,
     socket_path: str,
     tmux_target: str,
     *,
     timeout_s: float,
 ) -> None:
     """
-    Block until Claude Code's TUI input box is ready for keystrokes.
+    Block until Claude Code's TUI is truly interactive for keystrokes.
 
     The runner advertises ``tmux.json`` as soon as the tmux session
     exists, but Claude Code's input box mounts a few seconds later
     (longer on a cold first boot). Keystrokes sent into that gap are
-    dropped, so the first web-UI message silently vanishes. This gate
-    polls ``capture-pane`` for the input prompt before injection;
-    it returns immediately once mounted, so 2nd+ messages are
+    dropped, so the first web-UI message silently vanishes. Worse, the
+    WELCOME / splash screen renders an ``❯`` input box *before* the
+    session is interactive (still mid-``SessionStart`` repaint), so the
+    bare glyph scan would read the splash as ready and the first message
+    would land during the repaint and be dropped.
+
+    Readiness therefore requires BOTH:
+
+    * Claude's ``SessionStart`` hook has fired — i.e.
+      :func:`read_claude_session_id` returns a non-``None`` id. This is
+      the authoritative signal that the session is past startup; the
+      bridge records it from the hook payload. On a fresh managed
+      session it is unset until ``SessionStart``, so this is what closes
+      the startup race the glyph alone missed.
+    * The pane shows a mounted prompt with the welcome/splash gone
+      (see :func:`_claude_pane_interactive`) — belt-and-suspenders for
+      the brief window where the id is set but the splash is still
+      painting.
+
+    It returns immediately once both hold, so 2nd+ messages (where the
+    session id is already recorded and the prompt is live) are
     unaffected.
 
     Claude-native only — this is called from :func:`inject_user_message`,
@@ -4158,22 +4336,33 @@ def _wait_for_claude_prompt_ready(
     used for generic terminals, whose programs never render
     :data:`_CLAUDE_PROMPT_GLYPH` and would always time out.
 
+    :param bridge_dir: Bridge directory path, used to read the
+        ``SessionStart``-recorded Claude session id.
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
+    :param timeout_s: Seconds to wait for readiness, e.g. ``30.0``.
     :returns: None.
-    :raises ClaudePromptTimeout: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries a poll
-        count, how many of those polls saw an empty capture, and the tail
-        of the last non-empty capture the loop actually observed (see
-        :func:`_format_terminal_failure_tail`) so the true failure mode —
-        a startup crash, a torn/empty capture under a mid-turn repaint, or
-        a box that never appeared — is diagnosable from the error alone.
+    :raises ClaudePromptTimeout: If the session never becomes interactive within
+        *timeout_s* (Claude failed to boot, or its ``SessionStart`` hook
+        never fired). The message carries a poll count, how many of those
+        polls saw an empty capture, whether ``SessionStart`` ever fired, and
+        the tail of the last non-empty capture the loop actually observed
+        (see :func:`_format_terminal_failure_tail`) so the true failure mode
+        — a startup crash, a torn/empty capture under a mid-turn repaint, a
+        box that never appeared, or a session that never signalled startup —
+        is diagnosable from the error alone.
     """
     deadline = time.monotonic() + timeout_s
     polls = 0
     empty_polls = 0
+    # Whether SessionStart has fired yet. The bridge records the Claude
+    # session id from the hook payload, so a non-None id means the session is
+    # past the welcome/splash and accepting input — the authoritative signal
+    # that closes the fresh-session startup race. Tracked across polls so the
+    # timeout error can separate "SessionStart never fired" from "prompt
+    # never rendered".
+    session_started = False
     # Keep the last non-empty capture the loop actually saw, not a fresh
     # capture taken after the deadline. A post-timeout re-capture can show
     # a different (often healthier-looking) frame than any decision the
@@ -4190,7 +4379,12 @@ def _wait_for_claude_prompt_ready(
             last_nonempty = pane
         else:
             empty_polls += 1
-        if _claude_prompt_rendered(pane):
+        # Readiness requires BOTH the SessionStart id (the past-startup
+        # signal that closes the fresh-session race) AND a mounted prompt
+        # with the welcome/splash gone (belt-and-suspenders for the window
+        # where the id is set but the splash is still painting).
+        session_started = read_claude_session_id(bridge_dir) is not None
+        if session_started and _claude_pane_interactive(pane):
             return
         if time.monotonic() >= deadline:
             break
@@ -4199,12 +4393,13 @@ def _wait_for_claude_prompt_ready(
     # mostly-empty captures point at a torn read under a busy repaint (the
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
-    # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
+    # e.g. a ``JSON Parse error``, whose text the tail then surfaces); and a
+    # session id that never appeared points at SessionStart never firing.
+    reason = "input prompt never rendered" if session_started else "SessionStart never fired"
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {timeout_s}s "
-        f"(input prompt never rendered in {polls} polls, "
-        f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        f"({reason} in {polls} polls, {empty_polls} empty captures). "
+        f"The message was not delivered." + _format_terminal_failure_tail(last_nonempty)
     )
 
 

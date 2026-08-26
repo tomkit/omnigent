@@ -284,6 +284,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Raw sandbox provider backing a managed host, e.g. `"daytona"` /
+   * `"modal"` / `"e2b"`, so the badge can name the provider. `null`/absent
+   * for external (local/remote) hosts and host-less sessions.
+   */
+  sandboxProvider?: string | null;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status

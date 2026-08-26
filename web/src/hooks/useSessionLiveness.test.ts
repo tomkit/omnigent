@@ -147,10 +147,37 @@ describe("useSessionLiveness — derivation truth table", () => {
     ).toEqual({ kind: "starting" });
   });
 
-  it("host_offline (not host_asleep) when the down host is NOT resumable", () => {
-    // The default for an external/non-resumable host: the actionable
-    // reconnect/fork dead-end, unchanged.
-    expect(derive(false, false, conv({ host_id: "h1", host_resumable: false }))).toEqual({
+  it("host_asleep when a non-resumable MANAGED host is down — relaunch-on-message", () => {
+    // A managed sandbox host that is NOT resume-in-place (e.g. E2B/Modal:
+    // hard lifetime cap, no persistent volume) is still recoverable — the
+    // server relaunches a FRESH sandbox seeded from prior items on the next
+    // message. host_managed flips row 3 to host_asleep, NOT the host_offline
+    // dead-end, so the composer stays open.
+    expect(
+      derive(false, false, conv({ host_id: "h1", host_resumable: false, host_managed: true })),
+    ).toEqual({ kind: "host_asleep" });
+    // Server-side relaunch, not owner-gated: managed wins even when shared.
+    expect(
+      derive(
+        false,
+        false,
+        conv({ host_id: "h1", permission_level: 1, host_resumable: false, host_managed: true }),
+      ),
+    ).toEqual({ kind: "host_asleep" });
+  });
+
+  it("starting (NOT host_asleep) while a just-sent turn relaunches the managed host", () => {
+    expect(
+      derive(false, false, conv({ host_id: "h1", host_managed: true }), { turnActive: true }),
+    ).toEqual({ kind: "starting" });
+  });
+
+  it("host_offline only when the down host is neither resumable NOR managed", () => {
+    // The external/laptop host: no sandbox provider, so the server cannot
+    // bring it back — the actionable reconnect/fork dead-end, unchanged.
+    expect(
+      derive(false, false, conv({ host_id: "h1", host_resumable: false, host_managed: false })),
+    ).toEqual({
       kind: "host_offline",
       isOwner: true,
     });
@@ -340,7 +367,7 @@ describe("useSessionLiveness — derivation truth table", () => {
       } as Session;
     }
 
-    it("maps hostId / permissionLevel / createdAt / hostResumable / kind into the snake_case row", () => {
+    it("maps hostId / permissionLevel / createdAt / hostResumable / kind / sandboxProvider into the snake_case row", () => {
       expect(
         livenessRowFromSession(session({ hostId: "h1", permissionLevel: 1, createdAt: 123 })),
       ).toEqual({
@@ -350,6 +377,7 @@ describe("useSessionLiveness — derivation truth table", () => {
         host_resumable: false,
         kind: undefined,
         imported: false,
+        host_managed: false,
       });
       // hostResumable flows through so an off-sidebar resumable host can
       // classify host_asleep rather than dead-ending on host_offline.
@@ -360,6 +388,12 @@ describe("useSessionLiveness — derivation truth table", () => {
       expect(livenessRowFromSession(session({ kind: "sub_agent" }))).toMatchObject({
         kind: "sub_agent",
       });
+      // A non-null sandboxProvider marks a MANAGED host: host_managed true so a
+      // down non-resumable managed sandbox (e.g. E2B past its lifetime cap)
+      // classifies host_asleep (relaunch-on-message) rather than host_offline.
+      expect(
+        livenessRowFromSession(session({ hostId: "h1", sandboxProvider: "e2b" })),
+      ).toMatchObject({ host_managed: true });
     });
 
     it("returns null for a null/undefined snapshot", () => {

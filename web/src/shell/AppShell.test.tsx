@@ -15,7 +15,7 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { ServerInfo } from "@/lib/capabilities";
+import { BUILD_OFF, type ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
@@ -237,10 +237,13 @@ import { useChatStore } from "@/store/chatStore";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
- * The production view toggle lives in the header (ViewModeToggle); these
- * tests are scoped to the shell's state machine, so we use a probe
- * component with its own "Chat" / "Terminal" buttons to drive `setView`
- * and read the context's derived flags off data attributes.
+ * The production view toggle now lives inside ChatPage's
+ * ConnectionIndicator; these tests are scoped to the shell's state
+ * machine, so we use a probe component with the exact same
+ * `aria-label`s as the production pill ("Chat" / "Terminal" — see
+ * ConnectedTerminalFirstPill in ChatPage.tsx) to drive `setView`. If
+ * the production labels ever change, these tests fail loudly instead
+ * of drifting silently.
  */
 function TerminalFirstViewProbe() {
   const ctx = useTerminalFirst();
@@ -368,6 +371,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    build: BUILD_OFF,
     ...overrides,
   };
 }

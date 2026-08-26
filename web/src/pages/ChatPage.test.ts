@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { BUILD_OFF } from "@/lib/capabilities";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
@@ -1692,6 +1693,7 @@ describe("routing eligibility gates", () => {
       harness_install_enabled: false,
       installable_harnesses: [],
       dictation_available: false,
+      build: BUILD_OFF,
     };
   }
 

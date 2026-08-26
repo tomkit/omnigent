@@ -116,6 +116,8 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
+    _authorize_session_read_with_runner_fallback,
+    _authorize_session_with_runner_fallback,
     _codex_plan_mode_enabled,
     _discovery_key,
     _forward_session_change_to_runner,
@@ -751,14 +753,24 @@ def register_core_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
+        # Viewer identity for per-user label projection — ``None`` on the
+        # managed-runner fallback path below, which is correct: the in-sandbox
+        # runner is not a viewer and has no pins of its own.
         user_id = _get_user_id(request, auth_provider)
         # Single permission pass: authorize + resolve the display level +
         # fetch the conversation once, then reuse the conversation in the
         # snapshot (the snapshot's read is skipped). Replaces the former
         # require_access + get_permission_level + snapshot-get_conversation
-        # sequence, which made ~5-6 separate store round-trips.
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # sequence, which made ~5-6 separate store round-trips. The
+        # managed-runner fallback admits the session's own in-sandbox runner
+        # (binding token, no user creds) for READ; user/loopback paths
+        # are unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         return await _get_session_snapshot(
             conversation_store,
@@ -801,9 +813,20 @@ def register_core_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
+        # Viewer identity for per-user pin-key collapsing — ``None`` on the
+        # managed-runner fallback path, which is correct: the in-sandbox runner
+        # is not a viewer and must not see another user's pin keys.
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Native runner bridge setup resolves labels during harness spawn, so
+        # the managed-runner fallback admits the session's own in-sandbox
+        # runner (binding token, no user creds) for READ — identical trust
+        # model to GET /v1/sessions/{id}. User / loopback paths are unchanged.
+        access = await _authorize_session_read_with_runner_fallback(
+            request,
+            session_id,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
         conv = access.conversation
         if conv is None:
@@ -1542,9 +1565,24 @@ def register_core_routes(
             required_level = LEVEL_OWNER
         else:
             required_level = LEVEL_EDIT
-        await _require_access(
-            user_id, session_id, required_level, permission_store, conversation_store
-        )
+        if required_level > LEVEL_EDIT:
+            # Privileged (archive / project) branch: real owning user only, NO
+            # runner fallback. A binding token must never archive a session.
+            await _require_access(
+                user_id, session_id, required_level, permission_store, conversation_store
+            )
+        else:
+            # Non-privileged edits (title / labels / model / effort): the
+            # session's own managed runner may authorize via its binding token
+            # (capped at EDIT). User-auth callers take the unchanged path.
+            await _authorize_session_with_runner_fallback(
+                request,
+                session_id,
+                level=required_level,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store

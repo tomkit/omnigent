@@ -397,6 +397,55 @@ async def test_llm_routing_client_rejects_empty_model() -> None:
     assert result is None
 
 
+@dataclass
+class _FakeNativeToolOutput:
+    """A judge output item with no ``content`` — a reasoning/native-tool item.
+
+    Reasoning-style models behind an OpenAI-compatible gateway (observed live
+    with GLM on Fireworks) emit one of these BEFORE the assistant message, so
+    the verdict is never at ``output[0]``.
+    """
+
+    type: str = "native_tool"
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_reads_verdict_after_a_tool_output() -> None:
+    """A verdict that is not the FIRST output item still routes."""
+
+    class _ToolFirstLLM:
+        async def create(self, **kwargs: Any) -> _FakeResponse:
+            models = infer_models("claude-sdk")
+            verdict = {"harness": "claude-sdk", "model": models[-1], "rationale": "hard"}
+            return _FakeResponse(
+                output=[
+                    _FakeNativeToolOutput(),
+                    _FakeMessageOutput(content=[_FakeOutputText(text=json.dumps(verdict))]),
+                ],
+            )
+
+    models = infer_models("claude-sdk")
+    assert models is not None
+    client = LLMRoutingClient(_ToolFirstLLM())
+    result = await client.route("refactor everything", {"claude-sdk": models})
+    assert result is not None
+    assert result.model == models[-1]
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_returns_none_when_no_output_carries_text() -> None:
+    """A response with no text anywhere fails open rather than raising."""
+
+    class _TextlessLLM:
+        async def create(self, **kwargs: Any) -> _FakeResponse:
+            return _FakeResponse(output=[_FakeNativeToolOutput()])
+
+    models = infer_models("claude-sdk")
+    assert models is not None
+    client = LLMRoutingClient(_TextlessLLM())
+    assert await client.route("hello", {"claude-sdk": models}) is None
+
+
 @pytest.mark.asyncio
 async def test_llm_routing_client_returns_none_on_error() -> None:
     class _BrokenLLM:

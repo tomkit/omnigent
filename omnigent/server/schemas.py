@@ -1768,6 +1768,10 @@ class SessionResponse(BaseModel):
         path resumes the sandbox) versus the terminal ``host_offline``
         dead-end (reconnect from your machine / fork). ``False`` for
         non-managed or non-resumable hosts.
+    :param sandbox_provider: Raw sandbox provider backing a managed
+        host, e.g. ``"daytona"`` / ``"modal"`` / ``"e2b"``, so clients
+        can label the provider by name. ``None`` for external (local /
+        remote) hosts and for sessions with no host binding.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -1972,6 +1976,7 @@ class SessionResponse(BaseModel):
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
+    sandbox_provider: str | None = None
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None

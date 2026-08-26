@@ -1,4 +1,4 @@
-import type { ServerInfo } from "./capabilities";
+import { BUILD_OFF, type ServerInfo } from "./capabilities";
 
 export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   accounts_enabled: false,
@@ -19,6 +19,7 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   branding: null,
+  build: BUILD_OFF,
 };
 
 /**

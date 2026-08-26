@@ -10,10 +10,12 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import yaml
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -103,6 +105,64 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
+# Wall-clock instant this server process started, captured once at module
+# import. This is the strongest "the live instance actually updated" signal: it
+# moves on every deploy/restart regardless of whether the image's build
+# metadata was stamped. Exposed (ISO-8601 UTC) via /v1/info -> build.started_at.
+_PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
+
+class BuildProvenance(BaseModel):
+    """Build & deploy provenance for the running server.
+
+    Backs the web UI's "Build & Deployment" panel. Every field except
+    ``started_at`` degrades to ``None`` on an unstamped local/dev build;
+    ``started_at`` (this process's boot time) is always set. See
+    :func:`_build_provenance`.
+    """
+
+    version: str | None
+    sha: str | None
+    build_time: str | None
+    ref: str | None
+    started_at: str
+
+
+def _build_provenance() -> BuildProvenance:
+    """Collect build & deploy provenance for the running server.
+
+    Backs the web UI's "Build & Deployment" panel and lets an operator verify
+    that a redeploy actually swapped the live instance. Every field degrades to
+    ``None`` when its source is unavailable (unstamped local/dev build), so the
+    UI renders a placeholder instead of a misleading value:
+
+    * ``version`` — installed ``omnigent`` package version (e.g.
+      ``"0.3.0.dev0"``); ``None`` if the package metadata is unresolvable.
+    * ``sha`` — git sha baked into the image (``OMNIGENT_BUILD_SHA`` env, e.g.
+      ``"sha-ff243ad"``); the same value ``/health`` reports.
+    * ``build_time`` — ISO-8601 UTC instant the image was built
+      (``OMNIGENT_BUILD_TIME`` env).
+    * ``ref`` — git ref/branch the image was built from
+      (``OMNIGENT_BUILD_REF`` env).
+    * ``started_at`` — ISO-8601 UTC instant THIS process booted; always set.
+
+    :returns: A :class:`BuildProvenance` with the fields above.
+    """
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        version: str | None = _pkg_version("omnigent")
+    except PackageNotFoundError:  # pragma: no cover - package always installed in CI
+        version = None
+    return BuildProvenance(
+        version=version,
+        sha=os.environ.get("OMNIGENT_BUILD_SHA") or None,
+        build_time=os.environ.get("OMNIGENT_BUILD_TIME") or None,
+        ref=os.environ.get("OMNIGENT_BUILD_REF") or None,
+        started_at=_PROCESS_STARTED_AT.isoformat(),
+    )
+
 
 class SmartRoutingSourcesInfo(BaseModel):
     external: bool
@@ -141,6 +201,7 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     dictation_available: bool
     branding: BrandingInfo
+    build: BuildProvenance
 
 
 def _server_version() -> str:
@@ -536,6 +597,37 @@ def _ensure_default_agents(
 _EXTRA_BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
 
 
+def _reject_unparseable_bundle_configs(bundle_dir: Path) -> None:
+    """Fail a built-in bundle whose spec files are empty or not a mapping.
+
+    ``materialize_bundle`` copies files without reading them, so a truncated
+    sync (an interrupted ``tar xzf`` leaves zero-byte files) registers a bundle
+    that looks fine at boot and only breaks later, per session, as
+    "config.yaml must be a YAML mapping, got NoneType" at turn setup.
+
+    Checked deliberately narrowly — YAML parses and is a mapping — so this
+    catches file corruption without rejecting a spec that is merely
+    env-dependent or uses a field this server build doesn't know.
+
+    :param bundle_dir: Materialized bundle root.
+    :raises OmnigentError: Naming the first bad ``config.yaml``.
+    """
+    for config in sorted(bundle_dir.rglob("config.yaml")):
+        try:
+            parsed = yaml.safe_load(config.read_text())
+        except yaml.YAMLError as exc:
+            raise OmnigentError(
+                f"{config.relative_to(bundle_dir)} is not valid YAML: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise OmnigentError(
+                f"{config.relative_to(bundle_dir)} is empty or not a YAML mapping "
+                f"(got {type(parsed).__name__}); the bundle looks truncated",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+
 def _ensure_extra_builtin_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -576,6 +668,9 @@ def _ensure_extra_builtin_agents(
             name = source.stem if source.is_file() else source.name
             with tempfile.TemporaryDirectory() as tmpdir:
                 bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+                # Catch a truncated sync here, where it is one loud boot error,
+                # instead of at every session's turn setup.
+                _reject_unparseable_bundle_configs(bundle_dir)
                 bundle_bytes = _tar_gz_dir(bundle_dir)
             _ensure_builtin_agent(
                 agent_store,
@@ -1825,8 +1920,9 @@ def create_app(
         """
         Liveness check with optional session-scoped runner status.
 
-        Without session params, returns ``{"status": "ok"}`` (bare
-        liveness). With ``session_id``, adds a single ``session``
+        Always returns ``status`` plus a ``version`` build identifier
+        (detailed below). Without session params that bare object is the
+        whole response. With ``session_id``, adds a single ``session``
         object. With ``session_ids`` (comma-separated), adds a
         ``sessions`` dict keyed by id — used by the sidebar to
         batch-check all visible sessions in one request. The batch
@@ -1842,15 +1938,25 @@ def create_app(
         :param session_ids: Optional comma-separated session ids
             for batch lookup, e.g.
             ``"conv_abc,conv_def,conv_ghi"``.
-        :returns: ``{"status": "ok"}`` with optional ``session``
-            and/or ``sessions`` fields. Each session object has shape
-            ``{"runner_online": bool, "host_online": bool | None,
-            "host_version": str | None}`` (the single ``session``
+        :returns: ``{"status": "ok", "version": "<sha>"}`` with optional
+            ``session`` and/or ``sessions`` fields. ``version`` is the
+            git-sha build identifier baked into the image at build time
+            (the ``OMNIGENT_BUILD_SHA`` env var, e.g. ``"sha-6d4847d"``),
+            or ``"unknown"`` when unset (local/dev). Each session object
+            has shape ``{"runner_online": bool, "host_online": bool |
+            None, "host_version": str | None}`` (the single ``session``
             object also includes its ``id``). ``host_version`` is the
             bound host's reported version, or ``None`` when there's no
             host binding / the version isn't resolvable on this replica.
         """
-        result: dict[str, Any] = {"status": "ok"}
+        # Build-sha image tag baked in by the publish workflow (see
+        # deploy/docker/Dockerfile + fork-publish-server.yml). Degrades to
+        # "unknown" for local/dev runs where the env var is unset — never
+        # raises, so the liveness probe always answers.
+        result: dict[str, Any] = {
+            "status": "ok",
+            "version": os.environ.get("OMNIGENT_BUILD_SHA") or "unknown",
+        }
         batch_ids = [s.strip() for s in session_ids.split(",") if s.strip()] if session_ids else []
         # Resolve every requested id (single + batch) in ONE lookup. The
         # online-dot lookups hit the database (conversations + hosts
@@ -1986,8 +2092,14 @@ def create_app(
         ``managed_sandboxes_enabled``, ``dictation_available``,
         ``single_user``), the short sandbox provider name
         (``sandbox_provider``) the web UI labels the new-session
-        sandbox option with, and the installed
-        ``server_version`` (already public via ``/api/version``).
+        sandbox option with, the installed
+        ``server_version`` (already public via ``/api/version``),
+        and a ``build`` object carrying build & deploy provenance
+        (``version``, ``sha``, ``build_time``, ``started_at``,
+        ``ref``) for the web UI's "Build & Deployment" panel — see
+        :func:`_build_provenance`. None of this is sensitive: it is
+        the same build identifiers ``/health`` already exposes plus
+        this process's boot time.
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
 
@@ -2116,6 +2228,12 @@ def create_app(
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "branding": branding_snapshot.config(),
+                # Build & deploy provenance for the web UI's "Build & Deployment"
+                # panel: {version, sha, build_time, started_at, ref}. started_at is
+                # the per-process boot time (changes on every redeploy/restart);
+                # the rest come from the image's stamped build metadata. All fields
+                # degrade to null when unstamped (local/dev). See _build_provenance.
+                "build": _build_provenance(),
             }
         )
 
