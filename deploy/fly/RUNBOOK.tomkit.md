@@ -97,32 +97,22 @@ carry over. If `OMNIGENT_CONFIG` ever needs re-setting it is
 `fly secrets set OMNIGENT_CONFIG="$(cat config.json)" -a omnigent-tomkit` — but
 that is NOT part of a normal image swap.
 
-## Managed-sandbox config (`/data/artifacts/config.yaml`)
+## App config (`/data/artifacts/config.yaml`)
 
 The server reads its app config from the file the `OMNIGENT_CONFIG` env var
 points at — `/data/artifacts/config.yaml`, **on the persistent volume** (not in
-git, not the secret store). It carries the `sandbox:` block that drives managed
-Daytona hosts. The live shape:
+git, not the secret store).
 
-```yaml
-sandbox:
-  provider: daytona
-  server_url: https://omnigent-daytona-relay.zz957kkf2k.workers.dev
-  daytona:
-    env: [OPENAI_API_KEY, OPENAI_BASE_URL, GIT_TOKEN, ANTHROPIC_API_KEY]
-    image: ghcr.io/tomkit/omnigent-host@sha256:<digest>   # the fork host image
-    idle_minutes: 30        # REQUIRED on free tier — see below
-```
-
-> [!IMPORTANT]
-> **`idle_minutes: 30` is not optional on the Daytona free tier.** Without it,
-> every managed host is created always-on (`auto_stop_interval=0`) and never
-> releases its slice of the **10 GiB org memory cap** — a few live sessions
-> exhaust the quota and *new* sandbox launches fail with
-> `Total memory limit exceeded. Maximum allowed: 10GiB`. With it, Daytona stops
-> an idle host after 30 min (freeing the memory) and the server's wake path
-> resumes it in place on the next message, reattaching the same workspace disk
-> (`auto_delete_interval` is pinned to disabled so the disk survives the stop).
+> [!NOTE]
+> **Managed sandbox hosting was retired 2026-08-25.** The `sandbox:` block that
+> drove e2b/Daytona hosts is removed from this file on both apps, the provider
+> SDK extras are no longer baked into the image, and the fork code that served
+> in-sandbox runners is gone (see `deploy/FORK_SURFACE.md`). Every session now
+> runs on a host that connects to the server — the Mac runner. The dead
+> secrets (`E2B_API_KEY`, `DAYTONA_API_KEY`, `OMNIGENT_DAYTONA_HOST_IMAGE`,
+> `OMNIGENT_DAYTONA_SANDBOX_ENV`) are unset. To bring managed hosting back you
+> need upstream's own managed-sandbox path plus the `OMNIGENT_EXTRAS`
+> build-arg — do not re-fork the REST-auth block.
 
 Editing it (the change is **not** picked up until the machine restarts):
 
@@ -134,15 +124,15 @@ fly ssh console -a omnigent-tomkit -C \
 fly machine restart $(fly machines list -a omnigent-tomkit --json | jq -r '.[0].id') -a omnigent-tomkit
 ```
 
-Verify it took effect by creating a managed session and inspecting the new
-sandbox: `auto_stop_interval` should read `30` (was `0`) and
-`auto_delete_interval` `-1` (disabled) via the Daytona SDK / dashboard.
+## Historical: smart routing stranded polly's native children (upstream v0.7.0)
 
-The host `image:` digest is bumped here whenever a new `omnigent-host` image is
-published (see the host-image half of `fork-publish-server.yml`); pin the
-immutable `@sha256:` digest, not `:latest`.
-
-## Known issue (upstream v0.7.0): smart routing strands polly's native children
+> [!NOTE]
+> **Resolved upstream at v0.9.0** — a named-worker spawn keeps its declared
+> harness and a routed-harness turn completion now delivers to the inbox. The
+> fork's judge-parser scan was re-applied on top (upstream still reads the
+> verdict from `output[0]`, which is a reasoning item behind the GLM gateway),
+> and polly's brain routes via `smart_routing_harness: auto`. Kept below for
+> the reasoning, not as live guidance.
 
 Keep the per-session **smart-routing (cost) toggle OFF for polly sessions** on
 this release. With the toggle on, the server force-routes every child session
