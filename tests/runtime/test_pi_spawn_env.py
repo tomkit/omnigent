@@ -11,7 +11,6 @@ This is a unit test — no subprocess spawn, no real pi CLI.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -78,59 +77,6 @@ def test_pi_spawn_env_threads_cwd_separately_from_bundle_dir(tmp_path: Path) -> 
 
     assert env["HARNESS_PI_CWD"] == str(workspace)
     assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
-
-
-def test_env_injected_openai_only_wires_fireworks(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Injected OPENAI_BASE_URL/KEY wire the pi gateway (managed-sandbox path).
-
-    Managed sandboxes ship no providers config and inject creds as env vars;
-    the generic-provider resolution reads them as the OpenAI global default and
-    wires the pi gateway at the Fireworks endpoint — no Databricks fallback.
-    """
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
-    monkeypatch.setenv("OPENAI_API_KEY", "fw-test")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-    spec = _make_spec(model="accounts/fireworks/routers/glm-latest")
-    env = _build_pi_spawn_env(spec, workdir=None)
-
-    assert env["HARNESS_PI_GATEWAY"] == "true"
-    base_urls = json.loads(env["HARNESS_PI_GATEWAY_BASE_URLS"])
-    assert base_urls["openai"] == "https://api.fireworks.ai/inference/v1"
-    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s fw-test"
-    assert env["HARNESS_PI_MODEL"] == "accounts/fireworks/routers/glm-latest"
-    assert "HARNESS_PI_DATABRICKS_PROFILE" not in env
-
-
-def test_both_keys_fireworks_model_selects_openai(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With both keys injected, a Fireworks model picks the OpenAI credential.
-
-    A managed sandbox injects ANTHROPIC_API_KEY *and* OPENAI_API_KEY. A
-    pi+Fireworks agent must auth with the OpenAI (Fireworks) key, not be
-    hijacked onto Anthropic — the model id drives the family.
-    """
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
-    monkeypatch.setenv("OPENAI_API_KEY", "fw-test")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-
-    spec = _make_spec(model="accounts/fireworks/routers/glm-latest")
-    env = _build_pi_spawn_env(spec, workdir=None)
-
-    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s fw-test"
-    base_urls = json.loads(env["HARNESS_PI_GATEWAY_BASE_URLS"])
-    assert base_urls["openai"] == "https://api.fireworks.ai/inference/v1"
-
-
-def test_both_keys_claude_model_selects_anthropic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With both keys injected, a Claude model picks the Anthropic credential."""
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1")
-    monkeypatch.setenv("OPENAI_API_KEY", "fw-test")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-
-    spec = _make_spec(model="claude-opus-4-8")
-    env = _build_pi_spawn_env(spec, workdir=None)
-
-    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-test"
 
 
 def _ucode_state_for_pi(

@@ -162,21 +162,9 @@ jobs:
           echo "Build time: ${BUILD_TIME}  ref: ${GH_REF_NAME}"
 
       # Build-args: the registry ARGs default to public registries (matches the
-      # upstream server build), but OMNIGENT_EXTRAS defaults to EMPTY in the
-      # server-builder stage, which skips the optional managed-sandbox provider
-      # SDKs. Both fork Fly apps (`omnigent-tomkit` AND `local-circuits`) now run
-      # `sandbox.provider: e2b` managed sessions, and the launcher (omnigent/
-      # onboarding/sandboxes/e2b.py) lazily imports the `e2b` SDK — without the
-      # extra the managed launch fails at import ("The E2B SDK is required for
-      # the 'e2b' sandbox provider"). `daytona` is kept alongside it for the
-      # legacy launch path / rollback safety. So pass OMNIGENT_EXTRAS=daytona,e2b
-      # to bake BOTH extras (pyproject: daytona>=0.180,<1 and e2b>=2.26,<3) into
-      # the image. This is the durable replacement for the per-deploy thin layer
-      # that used to `pip install e2b` on top of the canonical image — that layer
-      # vanished on any plain redeploy from the canonical image, silently
-      # breaking e2b launches. Each provider's relay/endpoint (e.g. the daytona
-      # Cloudflare Worker; E2B's api) is reached over the SDK's own bundled HTTP
-      # stack, so no additional omnigent extra is needed for either. Multi-arch
+      # upstream server build). OMNIGENT_EXTRAS stays EMPTY — managed sandbox
+      # hosting was retired from this fork, so neither app launches e2b/daytona
+      # sandboxes and the provider SDKs are dead weight in the image. Multi-arch
       # manifest list (amd64 + arm64); the Fly machine is amd64 and pulls the
       # amd64 variant from the list.
       - name: Build and push
@@ -188,28 +176,19 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            OMNIGENT_EXTRAS=daytona,e2b
-            OMNIGENT_BUILD_SHA=sha-${{ steps.tags.outputs.short_sha }}
-            OMNIGENT_BUILD_TIME=${{ steps.tags.outputs.build_time }}
-            OMNIGENT_BUILD_REF=${{ steps.tags.outputs.build_ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
           sbom: true
 
       # Host image: same Dockerfile, `host` target, also multi-arch (amd64 +
-      # arm64). The `host` stage does NOT consume OMNIGENT_EXTRAS (that arg
-      # lives only in the server-builder stage) — it installs the full omnigent
-      # package via the shared `builder` stage's editable `uv pip install -e .`,
-      # so the fork's patched omnigent/runner/_entry.py (PR #14's runner-side
-      # token-attach) is baked in with no extras needed. The managed-host
-      # runtime deps (git/tmux/harness CLIs/agy) are baked by the Dockerfile's
-      # host stage itself, not via extras. The only build-args it takes are the
-      # provenance trio (sha/time/ref), stamped here so the host half of a
-      # managed session self-reports the SAME build metadata as the server half
-      # (both built from this one commit). Runs after the server build so it
-      # reuses the shared builder-stage layers from the gha cache.
+      # arm64). The `host` stage takes no build-args: it installs the full
+      # omnigent package via the shared `builder` stage's editable
+      # `uv pip install -e .`, and the host runtime deps (git/tmux/harness
+      # CLIs/agy) are baked by the Dockerfile's host stage itself. Runs after
+      # the server build so it reuses the shared builder-stage layers from the
+      # gha cache. Kept published for local `omnigent host` container use even
+      # though managed sandboxes are retired.
       #
       # NOTE (rebase onto upstream v0.3.0): the fork's former workflow-level agy
       # pin — a manifest pre-check plus an ``AGY_EXPECTED_VERSION`` build-arg —
@@ -229,10 +208,6 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.host_tags }}
-          build-args: |
-            OMNIGENT_BUILD_SHA=sha-${{ steps.tags.outputs.short_sha }}
-            OMNIGENT_BUILD_TIME=${{ steps.tags.outputs.build_time }}
-            OMNIGENT_BUILD_REF=${{ steps.tags.outputs.build_ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false

@@ -1,126 +1,88 @@
-# Fork surface atop upstream v0.7.0
+# Fork surface atop upstream v0.11.0
 
 How much we've forked, where the cost sits, and what the next upstream upgrade
-should take. Measured 2026-07-31 at fork `main` = `d54b2f58`.
+should take. Measured 2026-08-25, after retiring managed sandbox hosting.
 
 Regenerate any number here with:
 
 ```bash
-git fetch origin --tags && git diff --numstat v0.7.0..HEAD
+git fetch origin --tags && git diff --numstat v0.11.0..HEAD
 ```
 
 ## The number that matters
 
 A fork only costs you where it **edits files upstream also edits**. Pure
 additions at fork-owned paths are free — upstream never touches them, so they
-never conflict. Split the delta that way:
+never conflict.
 
 | | files | lines | rebase cost |
 |---|---|---|---|
-| **Modified upstream files** | **36** | **+1,712 −289** | **the real cost** |
-| Pure additions to upstream dirs | 20 | +2,912 | low — git applies cleanly |
-| Fork-owned paths (`deploy/`, `tests/deploy/`, fork workflows) | 29 | +3,703 | none |
-| **Total** | **85** | **+8,327 −289** | — |
+| **Modified upstream files** | **12** | **+361 −43** | **the real cost** |
+| Fork-owned paths (`deploy/`, `tests/deploy/`, fork workflows) | 29 | +3,800 | none |
 
-72 fork commits sit atop `v0.7.0`.
-
-So the honest headline is **36 files with real conflict potential**, not 85 —
-and about a fifth of the raw line count.
-
-For comparison, the same measure just before the v0.7.0 upgrade work was
-**78 files / +7,302**. Dropping dead code and moving fork-only content to
-fork-only paths cut the conflict surface roughly in half.
+For comparison, the same measure one release earlier was **56 files / +4,664**,
+and before the v0.7.0 upgrade **78 files / +7,302**.
 
 ## What the fork actually carries
 
 | Feature | files | lines | why upstream doesn't cover it |
 |---|---|---|---|
-| Managed-runner REST auth | 12 | +1,889 −68 | Upstream's `_resolve_managed_runner_owner` covers only the **WS tunnel** handshake. The plain-HTTP callbacks an in-sandbox runner makes (snapshot / labels / agent / events / hooks) have no upstream fallback. Needed by any managed provider, e2b included. |
-| claude-native managed startup | 3 | +748 −34 | `ensure_env_api_key_approved` + SessionStart injection gating — a headless managed launch otherwise hangs on Claude Code's custom-API-key prompt. |
-| pi + Fireworks / model catalog | 8 | +593 −41 | Upstream still defaults OpenAI-family providers to the Responses API (Fireworks 404s on `/responses`); the env-var provider fallback for config-less sandboxes is fork-only. |
-| Build provenance / `/v1/info` typing | 9 | +586 −58 | Fork-only; upstream's `UpdatesSection` is Electron-only. **The most droppable item here** if the fork ever needs to shrink further. |
-| E2B composer resume | 10 | +242 −48 | Threads `sandbox_provider` through the snapshot so an aged-out E2B sandbox reads as relaunchable rather than dead-ending at "host offline". |
-
-Plus ~15 upstream **test** files adapted to fork-changed signatures. Individually
-cheap, collectively the most frequent source of small conflicts.
+| Smart-routing judge output scan | 2 | +75 | Upstream reads the verdict from `output[0]`, which is a reasoning item behind a GLM gateway — the judge then fails open on every call. |
+| Built-in bundle config guard | 1 | +35 | A truncated `tar xzf` onto the Fly volume leaves zero-byte spec files; without this the server registers the bundle and fails per-session at turn setup instead of once, loudly, at boot. |
+| Terminal-first switcher pill (+ its iOS insets) | 4 | +172 | Fork UI for the mobile/desktop shell. |
+| e2e_ui flake-timeout bumps | 5 | +79 | Local timing, not behaviour. |
 
 Fork-owned (free) content: the polly / polly-fw bundles under `deploy/agents/`,
 the fly configs and runbooks under `deploy/fly/`, and the fork publish /
 daily-sync workflows.
 
-## Not fork reasons
+## Retired 2026-08-25 — managed sandbox hosting
 
-Worth restating, because it's counter-intuitive:
+The single biggest cut the fork has taken. Both Fly apps ran
+`sandbox.provider: e2b`, but the newest managed host row on either was ~6 weeks
+old, so the capability was paying rebase tax for nothing. Gone:
 
-- **Multi-user** — entirely upstream. The fork changes zero lines of
-  `server/auth.py` / `routes/accounts_auth.py`. Pure config
-  (`OMNIGENT_AUTH_PROVIDER=accounts` + a cookie secret).
-- **e2b** — `onboarding/sandboxes/e2b.py` is upstream and untouched. Only the
-  `e2b` extra in the image build was fork work.
-- **Session environment tag** — upstream's `HostBadge` already shows it.
+- **Managed-runner REST auth** (~12 files, +1,900) — upstream's
+  `_resolve_managed_runner_owner` covers only the WS tunnel handshake; the
+  plain-HTTP callbacks were fork-only. Dead once no runner runs in a sandbox.
+- **E2B composer resume** (10 files) — `host_managed` / `sandboxProvider`
+  threading so an aged-out sandbox read as relaunchable.
+- **claude-native managed startup** (3 files, +750) — `ensure_env_api_key_approved`
+  pre-approved Claude Code's custom-API-key prompt, which only ever fired where
+  keys were injected as env vars; the SessionStart/splash readiness gate went
+  with it now that upstream maintains its own readiness gate.
+- **pi env-var provider fallback** — existed for config-less sandboxes.
+- **Build provenance** (9 files, +586) — `/health` version, `/v1/info.build` and
+  the Settings "Build & deployment" panel. `fly status` already names the live
+  image tag.
+- The `daytona,e2b` image extras (`OMNIGENT_EXTRAS` build-arg).
 
-## Recent trend
+Deployment-side companions: drop the `sandbox:` block from each app's
+`/data/artifacts/config.yaml` and the now-unused provider secrets.
 
-The fork has been shrinking, and two of the last three changes landed at zero
-rebase cost:
+## Fixed by config instead of by fork
 
-| PR | change | conflict-surface effect |
-|---|---|---|
-| #48 | drop Daytona idle-suspend + git-sync; move polly bundles to `deploy/agents/` | **−22 files** (78 → 56) |
-| #49 | polly hermetic workers, codex-first review | **0** — entirely in `deploy/agents/` |
-| #50 | drop the smart-routing verdict-parser patch | **−2 files** (back to vanilla) |
-| #51 | bump the local-circuits image pin | **0** — fork-owned toml |
+The pi+Fireworks patch (`wire_api` inferred from the base URL, so a
+chat-completions-only gateway isn't sent to `/responses`) was **deleted** in
+favour of one line in `~/.omnigent/config.yaml`:
 
-#49 is the pattern to keep repeating: agent-behaviour changes cost nothing
-because the bundles live at a fork-owned path and ship via the volume
-(`OMNIGENT_BUILTIN_AGENT_DIRS`), not the image.
+```yaml
+providers:
+  fireworks:
+    openai:
+      base_url: https://api.fireworks.ai/inference/v1
+      wire_api: chat        # <- what the fork patch used to infer
+```
+
+This is the rule to keep applying: fix by config, or at a fork-owned path,
+before patching an upstream file.
 
 ## Next upgrade: expected effort
 
-Grounded in the measured v0.5.1 → v0.7.0 upgrade (57 commits, 78 files,
-+7,302 lines — a two-minor jump).
+With 12 modified upstream files and no large single-file patch left, a
+single-minor rebase should be conflict resolution on the order of minutes, not
+hours. The dominant remaining risk is upstream restructuring `ChatPage.tsx`
+(the largest remaining patch, +97) or the smart-routing client.
 
-| Phase | v0.5.1 → v0.7.0 (actual) | v0.7.0 → next (estimate) |
-|---|---|---|
-| Rebase + conflict resolution | ~15 conflicted commits, 2 structural | 1.5–3 h |
-| Re-port work orphaned by upstream file moves | 1 large commit (`sessions.py` split) | 0–2 h — **the swing factor** |
-| Adapt upstream tests to fork signatures | 3 rounds | 0.5–1 h |
-| Validation (lint, `npm run build`, suites) | ~11 min per sweep, several | 0.5–1 h |
-| DB migration + deploy, per app | 950 s migrate + 440 s VACUUM on the 861 MB DB | 0.5–1 h each |
-
-**Realistic total: half a day to a full day** for a comparable jump — versus
-roughly a full day-plus last time. A single-minor jump with no file
-restructuring could be ~2–3 hours.
-
-### What drives the variance
-
-The dominant risk is not line count — it's **upstream restructuring a file the
-fork modifies heavily**. Last time, upstream exploded a 21k-line
-`server/routes/sessions.py` into a package, which orphaned nine fork commits and
-was the single most expensive item. The current equivalents to watch:
-
-- `omnigent/claude_native_bridge.py` (+241 −34) — largest single modified file
-- `omnigent/server/routes/sessions/**` + `_sessions/**` — already split once;
-  a second reorganisation would hurt again
-- `omnigent/runner/native/orchestration.py` — upstream moved this once already
-- `openapi.json` (+177 −23) — conflicts on nearly every upgrade, but is
-  **generated**: resolve by running `scripts/dump_openapi.py`, never by hand
-
-### Known upstream change already scheduled
-
-v0.7.0 deprecates `HARNESS_<NAME>_PATH` in favour of `OMNIGENT_<NAME>_PATH`,
-**slated for removal in v0.8.0**. The fork adds no uses of it (verified: zero
-occurrences in fork-added lines), so that removal should pass through cleanly.
-
-### Cheapest ways to shrink further
-
-1. Drop build provenance (9 files, +586) if the Settings panel isn't worth it.
-2. Upstream the managed-runner REST auth — it's the largest block (12 files,
-   +1,889) and is a genuine gap in upstream, not a local preference.
-3. Keep putting agent-behaviour changes in `deploy/agents/`, per #49.
-
-## Procedure
-
-The upgrade mechanics — landing a rebase by fast-forward, the in-container DB
-migration, the `fly ssh sftp put` throughput ceiling — are in
-[`fly/RUNBOOK.tomkit.md`](fly/RUNBOOK.tomkit.md).
+The cheapest further cut is the terminal-first switcher pill, if the mobile
+shell can live with upstream's chrome.

@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { BUILD_OFF, sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
 import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
@@ -30,7 +30,6 @@ function info(overrides: Partial<ServerInfo>): ServerInfo {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
-    build: BUILD_OFF,
     ...overrides,
   };
 }

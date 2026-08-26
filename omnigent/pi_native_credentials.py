@@ -24,7 +24,7 @@ import os
 import re
 import shlex
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict, TypeGuard
@@ -46,7 +46,6 @@ from omnigent.onboarding.provider_config import (
     KEY_KIND,
     LOCAL_KIND,
     PI_SURFACE,
-    RESPONSES_WIRE_API,
     ProviderEntry,
     default_provider_for_harness,
     load_config,
@@ -192,27 +191,6 @@ def _databricks_workspace_url_for_gateway(
         return resolve_databricks_workspace(profile).host
     except Exception:  # noqa: BLE001 — absent profile disables optional discovery
         return None
-
-
-# Canonical vendor endpoints, used by the env-var fallback when the injected
-# ``*_BASE_URL`` override is unset (mirrors the onboarding family defaults).
-_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
-_ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
-
-
-def _openai_api_for_base_url(base_url: str) -> str:
-    """Pick Pi's OpenAI ``api`` type for an endpoint with no explicit wire.
-
-    The OpenAI Responses API is served only by OpenAI's own endpoint; every
-    other OpenAI-compatible vendor (Fireworks, Groq, OpenRouter, …) speaks
-    Chat Completions only and 404s on ``/responses``. Infer from the base URL
-    so a provider configured without an explicit ``wire_api`` still works.
-
-    :param base_url: The OpenAI-family endpoint base URL.
-    :returns: ``"openai-responses"`` for OpenAI's own endpoint, else
-        ``"openai-completions"``.
-    """
-    return "openai-responses" if "api.openai.com" in base_url else "openai-completions"
 
 
 @dataclass(frozen=True)
@@ -955,9 +933,7 @@ def _inline_family_pi_provider(
     both surfaces serves a GPT id from its OpenAI family rather than whichever
     family happens to be configured first. Falls back to the other family, which
     keeps protocol-translating proxies working: a LiteLLM ``/anthropic``
-    passthrough is the only configured family and still serves any model. The
-    OpenAI family's wire (Responses vs Chat Completions) follows ``wire_api``,
-    inferred from the base URL when unset.
+    passthrough is the only configured family and still serves any model.
 
     :param entry: The resolved default provider entry.
     :param model: Session model override, or ``None`` to use the family default.
@@ -973,14 +949,8 @@ def _inline_family_pi_provider(
             api = "anthropic-messages"
         elif family.wire_api == CHAT_WIRE_API:
             api = "openai-completions"
-        elif family.wire_api == RESPONSES_WIRE_API:
-            api = "openai-responses"
         else:
-            # wire_api unset: infer from the base URL so a third-party provider
-            # configured without an explicit wire_api still works (the
-            # pi+Fireworks bug) rather than defaulting every gateway to
-            # Responses, which only OpenAI's own endpoint serves.
-            api = _openai_api_for_base_url(family.base_url)
+            api = "openai-responses"
         # A static key (or $VAR) — Pi reads a literal/env apiKey directly; an
         # auth_command becomes a "!command" Pi resolves at request time.
         if family.api_key:
@@ -1019,125 +989,29 @@ def _inline_family_pi_provider(
     return None
 
 
-def _looks_like_anthropic_model(model: str) -> bool:
-    """Whether *model* names a Claude model (so the Anthropic surface fits).
-
-    Covers the plain (``claude-opus-4-8``), Databricks
-    (``databricks-claude-sonnet-4-6``), and Bedrock (``us.anthropic.claude-…``)
-    spellings. Used to pick the right family in the env-var fallback when a
-    sandbox injects both Anthropic and OpenAI keys.
-    """
-    return "claude" in model.lower()
-
-
-def _anthropic_env_pi_provider(*, model: str, env: Mapping[str, str]) -> PiProviderConfig | None:
-    """Build an Anthropic-surface Pi provider from env, or None if no key."""
-    # ``ANTHROPIC_AUTH_TOKEN`` is the gateway (bearer) form; ``ANTHROPIC_API_KEY``
-    # is the native key (x-api-key). Either drives the Anthropic surface.
-    anthropic_key = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN")
-    if not anthropic_key:
-        return None
-    return PiProviderConfig(
-        provider_id=_PI_PROVIDER_ID,
-        base_url=env.get("ANTHROPIC_BASE_URL") or _ANTHROPIC_DEFAULT_BASE_URL,
-        api="anthropic-messages",
-        model=model,
-        api_key=anthropic_key,
-        # A native key uses x-api-key; a bare bearer token goes in Authorization
-        # (authHeader), the gateway form.
-        auth_header=not env.get("ANTHROPIC_API_KEY"),
-    )
-
-
-def _openai_env_pi_provider(*, model: str, env: Mapping[str, str]) -> PiProviderConfig | None:
-    """Build an OpenAI-compatible Pi provider from env, or None if no key."""
-    openai_key = env.get("OPENAI_API_KEY")
-    if not openai_key:
-        return None
-    base_url = env.get("OPENAI_BASE_URL") or _OPENAI_DEFAULT_BASE_URL
-    return PiProviderConfig(
-        provider_id=_PI_PROVIDER_ID,
-        base_url=base_url,
-        api=_openai_api_for_base_url(base_url),
-        model=model,
-        api_key=openai_key,
-        auth_header=False,
-    )
-
-
-def _env_var_pi_provider(*, model: str | None, env: Mapping[str, str]) -> PiProviderConfig | None:
-    """Build a Pi provider from credentials injected into the environment.
-
-    Managed sandboxes (Daytona / Modal) ship no ``~/.omnigent/config.yaml`` —
-    they inject credentials as environment variables instead — so config-based
-    resolution finds nothing and Pi would fall back to a ``/login`` that does
-    not exist in a fresh sandbox. This mirrors the documented managed-sandbox
-    contract (see ``deploy/modal/README.md``): ``ANTHROPIC_API_KEY`` (plus an
-    optional ``ANTHROPIC_BASE_URL``) drives Pi's native Anthropic surface;
-    ``OPENAI_API_KEY`` (plus an optional ``OPENAI_BASE_URL``) drives any
-    OpenAI-compatible endpoint — Fireworks, Groq, a gateway, or self-hosted.
-
-    A sandbox commonly injects BOTH families' keys (a deployment-wide set), so
-    the *model* picks the surface: a Claude model id uses the Anthropic surface,
-    anything else uses the OpenAI-compatible endpoint (e.g. a Fireworks model id
-    like ``accounts/fireworks/...`` → the OpenAI surface, NOT Anthropic). When
-    only one family's key is present, that one is used regardless.
-
-    :param model: The model id to pin — the session's ``model_override`` or the
-        agent spec's model. Required: Pi's generated provider carries a single
-        pinned model and the environment names no model, so this returns
-        ``None`` without one (which keeps non-managed callers, who pass no
-        model, on Pi's own login rather than mis-resolving from a stray key).
-    :param env: The environment mapping to read (injection seam for tests).
-    :returns: The resolved provider config, or ``None`` when no usable
-        credential is present in the environment.
-    """
-    if not model:
-        return None
-    # Order the two surfaces by which fits the model, then take the first whose
-    # key is present (so a missing preferred key still falls to the other).
-    if _looks_like_anthropic_model(model):
-        builders = (_anthropic_env_pi_provider, _openai_env_pi_provider)
-    else:
-        builders = (_openai_env_pi_provider, _anthropic_env_pi_provider)
-    for build in builders:
-        provider = build(model=model, env=env)
-        if provider is not None:
-            return provider
-    return None
-
-
 def resolve_pi_native_provider(
     *,
     model: str | None = None,
     config_loader: Callable[[], dict[str, object]] = load_config,
-    env: Mapping[str, str] | None = None,
 ) -> PiProviderConfig | None:
     """Resolve the omnigent-configured provider for a native Pi session.
 
     Reads the default provider for the Pi surface from
     ``~/.omnigent/config.yaml`` and translates it into Pi ``models.json``
-    config. When no usable config provider is found — including a managed
-    sandbox that ships no config file — falls back to credentials injected
-    into the environment (:func:`_env_var_pi_provider`). Returns ``None`` —
-    leaving Pi to use its own ``/login`` — only when neither yields a usable
-    provider (e.g. a subscription / CLI-login default and no injected keys).
+    config. Returns ``None`` — leaving Pi to use its own ``/login`` — when no
+    usable provider is configured, or the default is a subscription / CLI-login
+    provider (a CLI's own login can't be reused outside that CLI).
 
-    :param model: Session model override (``model_override`` or the agent
-        spec's model), or ``None`` to use the config provider's default model.
-        Required for the env-var fallback (see :func:`_env_var_pi_provider`).
+    :param model: Session model override (``model_override``), or ``None`` to
+        use the provider's default model.
     :param config_loader: Injection seam for tests; defaults to
         :func:`load_config`.
-    :param env: Environment mapping for the fallback; defaults to
-        ``os.environ`` (injection seam for tests).
     :returns: The resolved provider config, or ``None`` to fall back to Pi's
         own credentials.
     """
     selection = _split_pi_native_model_selection(model)
     if selection is not None:
         _, model = selection
-    env = os.environ if env is None else env
-    provider: PiProviderConfig | None = None
     try:
         config = config_loader()
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
@@ -1147,56 +1021,43 @@ def resolve_pi_native_provider(
         # default, skipping kinds that can't drive pi. Crucially this now lets a
         # cli-config Databricks AI Gateway through (it is pi-consumable via
         # ``_cli_config_pi_provider``), so an unrelated anthropic-family default
-        # no longer shadows it. When no config entry resolves to a usable Pi
-        # provider we fall through to the env-var fallback below (managed
-        # sandboxes ship no config.yaml and inject credentials as env vars).
+        # no longer shadows it.
         entry = default_provider_for_harness(config, PI_SURFACE)
         if entry is None:
             _LOGGER.info(
                 "pi-native: no omnigent-configured provider for the pi/anthropic/openai "
-                "surface; will try environment-injected credentials."
+                "surface; Pi will use its own login."
             )
-        elif entry.kind == DATABRICKS_KIND:
-            provider = _databricks_pi_provider(entry, model=model)
+            return None
+        if entry.kind == DATABRICKS_KIND:
+            resolved = _databricks_pi_provider(entry, model=model)
         elif entry.kind == CLI_CONFIG_KIND:
             # A Codex cli-config provider whose [model_providers.X] table is the
             # Databricks AI Gateway IS reusable by Pi (the gateway exposes an
             # Anthropic surface Pi speaks). Translate it rather than dropping to
             # Pi's own login — the bug this module fixes.
-            provider = _cli_config_pi_provider(entry, model=model)
+            resolved = _cli_config_pi_provider(entry, model=model)
         elif entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
-            provider = _inline_family_pi_provider(entry, model=model)
+            resolved = _inline_family_pi_provider(entry, model=model)
         else:
             # subscription (a CLI's own login can't be reused outside that CLI):
-            # try the env-var fallback below.
+            # let Pi use its own login.
             _LOGGER.info(
                 "pi-native: configured provider %r (kind %r) cannot drive Pi; "
-                "will try environment-injected credentials.",
+                "Pi will use its own login.",
                 entry.name,
                 entry.kind,
             )
-        if (
-            provider is None
-            and entry is not None
-            and entry.kind
-            in (
-                DATABRICKS_KIND,
-                CLI_CONFIG_KIND,
-                KEY_KIND,
-                GATEWAY_KIND,
-                LOCAL_KIND,
-            )
-        ):
+            return None
+        if resolved is None:
             # The provider matched a translatable kind but its details could not
             # be resolved (e.g. a Databricks gateway whose codex config table is
             # missing). Try the databricks-kind provider as a fallback — a common
             # setup has a cli-config pi default alongside a databricks-kind
-            # provider that carries the actual workspace credentials — then the
-            # env-var fallback below.
+            # provider that carries the actual workspace credentials.
             _LOGGER.warning(
                 "pi-native: configured provider %r (kind %r) could not be translated "
-                "into native Pi config; trying the databricks-kind fallback, then "
-                "environment-injected credentials.",
+                "into native Pi config; trying databricks-kind fallback.",
                 entry.name,
                 entry.kind,
             )
@@ -1214,21 +1075,20 @@ def resolve_pi_native_provider(
                 None,
             )
             if db_entry is not None:
-                provider = _databricks_pi_provider(db_entry, model=model)
+                resolved = _databricks_pi_provider(db_entry, model=model)
+            if resolved is None:
+                _LOGGER.warning("pi-native: no usable provider found; Pi will use its own login.")
+        return resolved
     except Exception:  # noqa: BLE001 — any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
-        # unresolved ``api_key: $VAR``) falls back rather than failing launch.
+        # unresolved ``api_key: $VAR``) falls back to Pi's own login rather than
+        # failing the terminal launch.
         _LOGGER.warning(
-            "pi-native: failed to resolve the omnigent-configured provider; "
-            "will try environment-injected credentials.",
+            "pi-native: failed to resolve the omnigent-configured provider; Pi will "
+            "use its own login.",
             exc_info=True,
         )
-        provider = None
-    if provider is not None:
-        return provider
-    # No usable config provider (commonly: a managed sandbox ships no
-    # config.yaml). Fall back to credentials injected into the environment.
-    return _env_var_pi_provider(model=model, env=env)
+        return None
 
 
 def write_pi_models_config(

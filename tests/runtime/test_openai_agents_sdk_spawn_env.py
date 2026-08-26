@@ -236,62 +236,6 @@ def test_reasoning_item_id_policy_rejects_invalid_values(policy: object) -> None
         _build_openai_agents_sdk_spawn_env(_make_spec(reasoning_item_id_policy=policy))
 
 
-def test_use_responses_false_survives_parser_stringification(tmp_path: Path) -> None:
-    """Regression: ``use_responses: false`` in real YAML must encode ``"false"``.
-
-    ``spec.parser.parse`` stringifies every ``executor.config`` scalar, so
-    ``use_responses: false`` reaches the spawn-env builder as the string
-    ``"False"`` — which is truthy. Before the coercion fix this emitted
-    ``"true"`` and routed a Fireworks (chat-completions-only) agent at the
-    OpenAI ``/responses`` API, 404-ing every turn. Building the spec through
-    ``parse`` (not the in-memory ``_make_spec`` helper, which keeps a real
-    bool) is what reproduces the bug.
-    """
-    from omnigent.spec.parser import parse
-
-    (tmp_path / "config.yaml").write_text(
-        _yaml.safe_dump(
-            {
-                "spec_version": 1,
-                "name": "oa-fw",
-                "executor": {
-                    "type": "omnigent",
-                    "model": "accounts/fireworks/models/glm-5p2",
-                    "config": {"harness": "openai-agents", "use_responses": False},
-                },
-                "prompt": "x",
-                "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
-            }
-        )
-    )
-    spec = parse(tmp_path)
-    assert spec.executor.config["use_responses"] == "False"  # parser stringified it
-    env = _build_openai_agents_sdk_spawn_env(spec)
-    assert env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] == "false"
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (None, None),
-        (True, True),
-        (False, False),
-        ("False", False),
-        ("false", False),
-        ("True", True),
-        ("true", True),
-        ("", False),
-        ("0", False),
-        ("1", True),
-    ],
-)
-def test_coerce_optional_config_bool(value: object, expected: bool | None) -> None:
-    """The coercion treats stringified falsy spellings as ``False`` and keeps ``None``."""
-    from omnigent.runtime.workflow import _coerce_optional_config_bool
-
-    assert _coerce_optional_config_bool(value) is expected
-
-
 def test_no_model_produces_no_model_env_var() -> None:
     """A spec with no model produces no ``HARNESS_OPENAI_AGENTS_MODEL`` env var."""
     env = _build_openai_agents_sdk_spawn_env(_make_spec(model=None))

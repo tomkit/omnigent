@@ -450,107 +450,6 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
 }
 
 
-# ── Managed-runner write authorization: per-event-type classification ──
-#
-# ``POST .../events`` authorizes either as a real user OR — for a
-# credential-less server-managed sandbox runner — via its tunnel binding token
-# (see ``_authorize_session_with_runner_fallback``). A binding token proves only
-# the *in-sandbox runner's* identity; it stands in for the AGENT's work, never
-# for the HUMAN decision-maker. So the token fallback is permitted ONLY for
-# runner-owned event types: the streaming / output / status / turn-control
-# events the in-sandbox runner legitimately emits to report the agent's work.
-#
-# Event types that act as the human decision-maker — resolving an elicitation /
-# approval gate or applying deferred policy-ask writes — MUST require a real
-# user identity and MUST NOT appear here. Today that is exactly ``approval``
-# (``_APPROVAL_TYPE``): its ``post_event`` branch calls ``_resolve_elicitation``
-# (whose only guard is session-scoped — a same-session runner token would pass
-# it) and ``_apply_pending_policy_ask_writes``. The managed runner never posts
-# ``approval`` to the server — server→runner is the only direction a verdict
-# flows (the runner forwards it to its local harness) — so excluding it from the
-# token fallback breaks no legitimate runner flow.
-#
-# Fail-safe by construction: this is an explicit ALLOWLIST, not a denylist. A
-# NEW event type added to ``_ALLOWED_EVENT_TYPES`` but left unclassified here
-# defaults to user-only at runtime (the token fallback is denied) AND trips the
-# partition assertion in ``test_sessions_managed_runner_rest_write_auth.py``,
-# forcing a deliberate runner-owned vs user-control decision before it can ship.
-_RUNNER_OWNED_EVENT_TYPES: frozenset[str] = frozenset(
-    {
-        # Item-typed agent output / lifecycle the runner persists or relays.
-        "message",
-        "function_call",
-        "function_call_output",
-        "error",
-        "reasoning",
-        "compaction",
-        "native_tool",
-        "resource_event",
-        "routing_decision",
-        "slash_command",
-        "terminal_command",
-        # Turn / session control the runner drives over its OWN work.
-        _INTERRUPT_TYPE,
-        # Surfaces an MCP prompt to the user; the human VERDICT arrives
-        # separately via ``approval`` (which is user-control, excluded below).
-        _MCP_ELICITATION_TYPE,
-        _COMPACT_TYPE,
-        # Additionally re-checks LEVEL_OWNER inside its branch, so a token
-        # still cannot stop a session even though the type is listed here.
-        _STOP_SESSION_TYPE,
-        # Terminal / forwarder observations streamed back to report the work.
-        _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
-        _EXTERNAL_CONVERSATION_ITEM_TYPE,
-        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
-        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
-        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
-        _EXTERNAL_SESSION_INTERRUPTED_TYPE,
-        # A pure lifecycle notification (this session was superseded by an
-        # external one); its ``post_event`` branch only publishes the signal —
-        # no approval gate, no policy write — so it is runner-owned reporting,
-        # exactly like the interrupted signal above.
-        _EXTERNAL_SESSION_SUPERSEDED_TYPE,
-        # Reports an in-harness human resolution to clear the pending card;
-        # sets only a "resolved elsewhere" signal — no accept/deny verdict and
-        # no policy write — so it is runner-owned reporting, not a decision.
-        _EXTERNAL_ELICITATION_RESOLVED_TYPE,
-        _EXTERNAL_SESSION_STATUS_TYPE,
-        _EXTERNAL_SESSION_USAGE_TYPE,
-        _EXTERNAL_COMPACTION_STATUS_TYPE,
-        # Harness MCP-server startup progress (codex-native forwarder): its
-        # ``post_event`` branch only validates the server map and republishes it
-        # as a ``session.mcp_startup`` SSE for the UI's startup band — no
-        # approval gate, no policy write, no verdict — so it is runner-owned
-        # reporting, exactly like the compaction/session status edges above.
-        _EXTERNAL_MCP_STARTUP_TYPE,
-        _EXTERNAL_MODEL_CHANGE_TYPE,
-        # The harness's own list of selectable models, mirrored for the picker;
-        # pure reporting, no verdict and no policy write.
-        _EXTERNAL_MODEL_OPTIONS_TYPE,
-        _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
-        _EXTERNAL_SESSION_TODOS_TYPE,
-        _EXTERNAL_SUBAGENT_START_TYPE,
-        _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
-        _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
-        # Mirrors a permission-mode change the human made IN the codex TUI onto
-        # the session's terminal_launch_args so a relaunch preserves it. Pure
-        # forwarder reporting — no approval gate resolved, no policy write —
-        # and the args only affect relaunches on the same runner, which that
-        # runner already fully controls.
-        _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
-    }
-)
-
-# Human-decision-maker event types: a credential-less runner binding token must
-# NEVER satisfy these on ``post_event`` — they resolve approval gates / apply
-# deferred policy-ask writes, i.e. they stand in for the human's verdict. Kept
-# as an explicit, named set (not computed by subtraction) so the
-# security-critical surface is auditable at a glance. Disjoint from
-# ``_RUNNER_OWNED_EVENT_TYPES``; together the two must partition
-# ``_ALLOWED_EVENT_TYPES`` (enforced by test).
-_USER_CONTROL_EVENT_TYPES: frozenset[str] = frozenset({_APPROVAL_TYPE})
-
-
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
 
 
@@ -1021,7 +920,6 @@ __all__ = [
     "_RETRY_SESSION_TYPE",
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
-    "_RUNNER_OWNED_EVENT_TYPES",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
     "_RUNNER_SESSION_INIT_TIMEOUT_S",
     "_SERVER_STREAM_EVENT_ADAPTER",
@@ -1039,7 +937,6 @@ __all__ = [
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
     "_UPLOAD_READ_CHUNK_BYTES",
-    "_USER_CONTROL_EVENT_TYPES",
     "_WATCHER_TASKS",
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",

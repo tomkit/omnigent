@@ -241,26 +241,13 @@ def run_pi_native(
         )
 
 
-def _materialize_pi_agent_spec(tmpdir: Path, *, model: str | None = None) -> Path:
+def _materialize_pi_agent_spec(tmpdir: Path) -> Path:
     """
     Write the terminal-first agent spec used by ``omnigent pi``.
 
     :param tmpdir: Temporary directory for the generated YAML file.
-    :param model: Optional model id to pin as ``executor.model`` — the same
-        field :func:`omnigent.runner.app._pi_native_model_from_spec` reads to
-        route the runner-owned Pi process. A managed sandbox ships no
-        ``~/.omnigent/config.yaml``, so Pi's credential resolution uses the
-        env-var fallback (:func:`resolve_pi_native_provider`), which REQUIRES a
-        model — without one it returns ``None`` and Pi falls back to its own
-        ``/login`` (defaulting to ``api.openai.com``, which rejects a non-OpenAI
-        key). ``None`` leaves the model unset (the pre-existing behaviour for a
-        CLI that resolves its own model or a session ``model_override``). Mirrors
-        ``kiro_native._materialize_kiro_agent_spec``.
     :returns: Path to the generated YAML spec.
     """
-    executor: dict[str, str] = {"harness": "pi-native"}
-    if model:
-        executor["model"] = model
     yaml_path = tmpdir / "pi-native-ui.yaml"
     raw: _JsonObject = {
         "name": _AGENT_NAME,
@@ -268,7 +255,7 @@ def _materialize_pi_agent_spec(tmpdir: Path, *, model: str | None = None) -> Pat
             "Pi is running in the session terminal. Web UI messages are "
             "forwarded into that Pi process through the native extension bridge."
         ),
-        "executor": executor,
+        "executor": {"harness": "pi-native"},
         "spawn": True,
         "os_env": {
             "type": "caller_process",

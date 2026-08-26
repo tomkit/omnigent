@@ -8,7 +8,6 @@ import os
 import queue
 import select
 import shlex
-import stat
 import subprocess
 import sys
 import tempfile
@@ -26,9 +25,7 @@ from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _build_tools,
-    _claude_pane_interactive,
     _claude_prompt_rendered,
-    _claude_welcome_screen_visible,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
@@ -37,7 +34,6 @@ from omnigent.claude_native_bridge import (
     count_hook_events,
     display_cost_approval_popup,
     ensure_claude_workspace_trusted,
-    ensure_env_api_key_approved,
     inject_interrupt,
     inject_user_message,
     kill_session,
@@ -100,43 +96,9 @@ def _composer_pane(draft: str = "") -> str:
 """
 
 
-def _composer_pane_with_banner(banner: str) -> str:
-    """
-    Render a welcome/splash pane: the banner above a framed input box.
-
-    Claude Code's splash paints the same framed box the live composer uses,
-    which is why the readiness gate needs the banner check on top of the
-    prompt scan.
-
-    :param banner: Splash banner line, e.g. ``" ✻ Welcome to Claude Code!"``.
-    :returns: The pane text.
-    """
-    return f"{banner}\n{_composer_pane()}"
-
-
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
-
-
-def _mark_session_started(bridge_dir: Path, session_id: str = "sess-test-123") -> None:
-    """
-    Seed the bridge state as if Claude's ``SessionStart`` hook fired.
-
-    The injection readiness gate (:func:`_wait_for_claude_prompt_ready`)
-    requires a recorded Claude session id — the post-``SessionStart``
-    signal that the TUI is past its welcome/splash screen — before it
-    will type. Tests that drive the gate to its ready state must record
-    one first, matching what a live session does on startup.
-
-    :param bridge_dir: Bridge directory path.
-    :param session_id: Claude session uuid to record.
-    :returns: None.
-    """
-    record_hook_event(
-        bridge_dir,
-        {"hook_event_name": "SessionStart", "session_id": session_id},
-    )
 
 
 @pytest.fixture
@@ -3216,7 +3178,6 @@ def test_inject_user_message_pastes_content_then_submits(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     captured: list[list[str]] = []
     loaded_payloads: list[bytes] = []
@@ -3344,9 +3305,6 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    # This fork gates injection on SessionStart having fired (the managed
-    # claude-native startup race), so the marker must exist before injecting.
-    _mark_session_started(bridge_dir)
 
     loaded_payloads: list[bytes] = []
     tui = {"pane": _composer_pane()}
@@ -3411,7 +3369,6 @@ def test_inject_user_message_raises_on_tmux_failure(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -3461,7 +3418,6 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     send_keys: list[list[str]] = []
     # Prompt is absent for the first two polls (TUI still booting),
@@ -3523,101 +3479,6 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     assert submit[-1] == "Enter"
 
 
-def test_inject_user_message_waits_for_sessionstart_and_splash_clear(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Injection waits for ``SessionStart`` AND the welcome screen to clear.
-
-    On a fresh managed session the welcome/splash renders an ``❯`` box
-    while still mid-``SessionStart``; the bare glyph scan read that as
-    ready and the first message was injected into the repaint and
-    dropped (no transcript, UI hangs forever). The gate must now hold
-    until Claude's session id is recorded (``SessionStart`` fired) AND
-    the splash banner is gone. No keystrokes may be sent before then.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    send_keys: list[list[str]] = []
-    captures = {"n": 0}
-    session_polls = {"n": 0}
-    # Pane shows the welcome/splash (glyph present, but a "Welcome"
-    # banner) until the session is past startup, then the live box.
-    tui = {"pane": _composer_pane_with_banner(" ✻ Welcome to Claude Code!")}
-
-    def _fake_session_id(_bridge_dir: Path) -> str | None:
-        """
-        SessionStart "fires" after a couple of polls.
-
-        Before that the bridge has recorded no Claude session id, which
-        must keep the gate closed regardless of the pane.
-
-        :param _bridge_dir: Bridge directory path (ignored).
-        :returns: A session id once SessionStart fired, else ``None``.
-        """
-        session_polls["n"] += 1
-        return "sess-xyz" if session_polls["n"] >= 2 else None
-
-    monkeypatch.setattr("omnigent.claude_native_bridge.read_claude_session_id", _fake_session_id)
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """
-        Serve the splash first, then a cleared interactive box.
-
-        Even once the session id is recorded, the FIRST capture still
-        shows the splash — the gate must reject it — and only the next
-        capture shows the cleared box. No keystrokes may be issued while
-        the welcome banner is on screen.
-
-        :param cmd: Argv list passed to subprocess.run.
-        :param kwargs: Subprocess kwargs (ignored).
-        :returns: Fake CompletedProcess.
-        """
-        del kwargs
-        if "capture-pane" in cmd:
-            captures["n"] += 1
-            if "Welcome" in tui["pane"]:
-                assert send_keys == [], "typed during the welcome/splash screen"
-                # Splash clears only on the second post-SessionStart
-                # capture; until then the gate must keep rejecting it.
-                # Only the splash is rewritten — later draft/empty panes
-                # (set by paste-buffer / Enter) are left untouched.
-                if captures["n"] >= 2:
-                    tui["pane"] = _composer_pane()
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = _composer_pane("hello")
-        if cmd[-1] == "Enter":
-            tui["pane"] = _composer_pane()
-        send_keys.append(cmd)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content="hello")
-
-    # The gate polled the session id until it was set, and the splash was
-    # rejected for at least one capture before the box cleared.
-    assert session_polls["n"] >= 2, (
-        f"Expected the gate to wait for SessionStart, polled {session_polls['n']} time(s)."
-    )
-    assert captures["n"] >= 2, (
-        f"Expected the splash to be rejected before readiness, got {captures['n']} capture(s)."
-    )
-    # Five delivery calls only after readiness: C-a, C-k, load, paste, Enter.
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux delivery calls after readiness, got {len(send_keys)}."
-    )
-
-
 def test_inject_user_message_raises_when_prompt_never_renders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3636,9 +3497,6 @@ def test_inject_user_message_raises_when_prompt_never_renders(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    # SessionStart fired, so the gate's only blocker is the empty pane —
-    # this exercises the prompt-never-renders path specifically.
-    _mark_session_started(bridge_dir)
     send_keys: list[list[str]] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -3681,9 +3539,6 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    # SessionStart already fired, so the only reason the gate must not
-    # pass is the pane itself (glyph only in scrollback).
-    _mark_session_started(bridge_dir)
     # `❯` only on an early line; the last several non-empty lines (the
     # tail the gate scans) do not contain it.
     scrollback = "\n".join(
@@ -3745,7 +3600,6 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     enters: list[list[str]] = []
     # Input-box state machine: the paste deposits the draft; the FIRST
@@ -3809,7 +3663,6 @@ def test_inject_user_message_raises_when_draft_never_submits(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     tui = {"pane": _composer_pane()}
 
@@ -4293,7 +4146,6 @@ def test_set_permission_mode_cycles_until_target_renders(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
     fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan", "auto"])
     monkeypatch.setattr("subprocess.run", fake.run)
 
@@ -4321,7 +4173,6 @@ def test_set_permission_mode_waits_out_a_stale_mode_footer(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
     # Two stale captures per press — enough that a reader accepting the
     # first non-empty footer always lags a mode behind.
     fake = _FakeModeCycleTmux(
@@ -4354,7 +4205,6 @@ def test_set_permission_mode_is_a_noop_when_already_in_target(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
     fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan", "auto"], start="auto")
     monkeypatch.setattr("subprocess.run", fake.run)
 
@@ -4382,7 +4232,6 @@ def test_set_permission_mode_raises_when_target_not_in_cycle(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
     # No ``auto`` in this session's cycle.
     fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"])
     monkeypatch.setattr("subprocess.run", fake.run)
@@ -4438,7 +4287,6 @@ def test_set_permission_mode_raises_when_footer_never_renders(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     def _fake_run(cmd: list[str], **kwargs: object) -> object:
         """Render a mounted input box that never shows a mode footer."""
@@ -6573,210 +6421,6 @@ def test_ensure_trusted_refuses_malformed_config(
     assert config_path.read_text() == raw
 
 
-# ── ensure_env_api_key_approved ────────────────────────
-
-
-# A representative Anthropic key. The trailing 20 chars are the identifier
-# Claude Code records; the rest must never be written to disk.
-_FAKE_API_KEY = "sk-ant-api03-PREFIXSECRETMIDDLE-LAST20CHARIDENTIFIER!"
-_FAKE_API_KEY_ID = _FAKE_API_KEY[-20:]
-
-
-def test_ensure_env_api_key_seeds_approval_when_missing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A managed env key is pre-approved by its last-20-char identifier.
-
-    This is the core managed-sandbox case: the sandbox injects
-    ``ANTHROPIC_API_KEY`` into the env, and without a seeded approval
-    Claude Code blocks on the "Detected a custom API key" prompt before
-    SessionStart. The approval record must carry exactly the last 20
-    chars under ``approved`` with an empty ``rejected`` list.
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
-
-    ensure_env_api_key_approved()
-
-    data = json.loads(config_path.read_text())
-    responses = data["customApiKeyResponses"]
-    assert responses["approved"] == [_FAKE_API_KEY_ID]
-    assert responses["rejected"] == []
-    # The 20-char identifier is exactly the key's suffix, never longer.
-    assert len(_FAKE_API_KEY_ID) == 20
-
-
-def test_ensure_env_api_key_never_writes_full_secret_and_is_owner_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Only the identifier is persisted, and the file is owner-only 0600.
-
-    Security-critical: the raw key must not leak into ``~/.claude.json``
-    (the secret stays in the runner-owned env), and the config — which
-    also holds the OAuth account block — must be mode 0600 so it is not
-    readable by the agent or other sandbox users.
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
-
-    ensure_env_api_key_approved()
-
-    raw = config_path.read_text()
-    # The secret prefix/middle must be absent; only the suffix id is stored.
-    assert "PREFIXSECRETMIDDLE" not in raw
-    assert _FAKE_API_KEY not in raw
-    # Owner-only permissions (matches the OAuth-bearing config's posture).
-    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
-
-
-def test_ensure_env_api_key_noop_when_env_unset(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Local / non-managed flows (no env key) write nothing.
-
-    Those flows deliver the credential via an ``apiKeyHelper``, so the
-    env prompt never fires and the helper must not create or touch
-    ``~/.claude.json``.
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-    ensure_env_api_key_approved()
-
-    assert not config_path.exists()
-
-
-def test_ensure_env_api_key_preserves_state_and_clears_rejection(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Existing config survives, and a prior rejection of this key is cleared.
-
-    A key the user once answered "No" to sits in ``rejected``; leaving it
-    there would keep Claude suppressing the now-pre-approved key. The
-    helper must move it to ``approved`` while preserving unrelated state
-    and other recorded keys.
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
-    existing = {
-        "oauthAccount": {"emailAddress": "user@example.com"},
-        "customApiKeyResponses": {
-            "approved": ["otherkeyidentifier12"],
-            "rejected": [_FAKE_API_KEY_ID],
-        },
-    }
-    config_path.write_text(json.dumps(existing))
-
-    ensure_env_api_key_approved()
-
-    data = json.loads(config_path.read_text())
-    assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
-    responses = data["customApiKeyResponses"]
-    # Pre-existing approval survives; ours is added; the rejection is cleared.
-    assert set(responses["approved"]) == {"otherkeyidentifier12", _FAKE_API_KEY_ID}
-    assert responses["rejected"] == []
-
-
-def test_ensure_env_api_key_idempotent_does_not_rewrite(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    When the key is already approved, the file is left byte-for-byte alone.
-
-    The seed file is compact; the helper writes indent=2, so any rewrite
-    would change the bytes — this proves the no-op short-circuit holds.
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
-    already = {"customApiKeyResponses": {"approved": [_FAKE_API_KEY_ID], "rejected": []}}
-    config_path.write_text(json.dumps(already, separators=(",", ":")))
-    before = config_path.read_bytes()
-
-    ensure_env_api_key_approved()
-
-    assert config_path.read_bytes() == before
-
-
-def test_ensure_env_api_key_refuses_short_key_without_writing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A sub-20-char key fails loud and the full secret never reaches disk.
-
-    For a key shorter than the 20-char identifier, ``key[-20:]`` is the
-    WHOLE key — persisting it would leak the full secret. Real Anthropic
-    keys are far longer, so a short value is malformed: the helper must
-    raise and write nothing (no ``~/.claude.json`` created at all).
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    short_key = "sk-ant-short"  # < 20 chars
-    monkeypatch.setenv("ANTHROPIC_API_KEY", short_key)
-
-    with pytest.raises(RuntimeError, match="too short"):
-        ensure_env_api_key_approved()
-
-    # No file was created, so the key could not have been written anywhere.
-    assert not config_path.exists()
-
-
-def test_ensure_env_api_key_idempotent_enforces_owner_only_perms(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The already-approved no-write path still tightens loose file perms.
-
-    ``~/.claude.json`` holds the OAuth account block, so a pre-existing
-    world/group-readable config must be pulled back to 0600 even when the
-    approval content needs no change — and the approved list must not be
-    duplicated or grown.
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
-    already = {"customApiKeyResponses": {"approved": [_FAKE_API_KEY_ID], "rejected": []}}
-    config_path.write_text(json.dumps(already))
-    config_path.chmod(0o644)  # loose perms, as a prior tool might have left
-
-    ensure_env_api_key_approved()
-
-    # Perms tightened despite no content change.
-    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
-    # The approved list is unchanged — not duplicated or grown.
-    data = json.loads(config_path.read_text())
-    assert data["customApiKeyResponses"]["approved"] == [_FAKE_API_KEY_ID]
-
-
-def test_ensure_env_api_key_refuses_malformed_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A malformed ``customApiKeyResponses`` raises and never clobbers.
-
-    Fail-loud: a non-object responses block is an unexpected shape Claude
-    never writes, so refuse rather than overwrite the user's real config.
-    """
-    config_path = _redirect_home(monkeypatch, tmp_path / "home")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", _FAKE_API_KEY)
-    raw = json.dumps({"customApiKeyResponses": [1, 2, 3]})
-    config_path.write_text(raw)
-
-    with pytest.raises(ValueError):
-        ensure_env_api_key_approved()
-
-    assert config_path.read_text() == raw
-
-
 def test_display_cost_approval_popup_builds_detached_tmux_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7113,60 +6757,6 @@ def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
         ]
     )
     assert _claude_prompt_rendered(pane) is True
-
-
-def test_claude_pane_interactive_rejects_welcome_screen() -> None:
-    """
-    The welcome/splash screen must NOT count as an interactive prompt.
-
-    Claude Code renders an ``❯`` input box on its WELCOME screen while
-    the session is still mid-``SessionStart`` and not yet accepting
-    keystrokes. The bare glyph scan reads that as ready, so the first
-    injected message lands during the repaint and is dropped — the bug
-    this guards. A welcome pane must therefore fail
-    :func:`_claude_pane_interactive` even though the glyph is present.
-    """
-    welcome_pane = "\n".join(
-        [
-            " ✻ Welcome to Claude Code!",
-            "",
-            "   /help for help, /status for your current setup",
-            "",
-            "   cwd: /home/alice/proj",
-            "────────────────────────────────────────",
-            "❯ ",
-            "────────────────────────────────────────",
-            "  ⏵⏵ accept edits on (shift+tab to cycle)",
-        ]
-    )
-    # The glyph is present (the splash has an input box)...
-    assert _claude_prompt_rendered(welcome_pane) is True
-    # ...but the welcome banner means it is NOT interactive yet.
-    assert _claude_welcome_screen_visible(welcome_pane) is True
-    assert _claude_pane_interactive(welcome_pane) is False
-
-
-def test_claude_pane_interactive_accepts_post_sessionstart_prompt() -> None:
-    """
-    A genuinely-interactive pane (welcome gone) counts as ready.
-
-    Once Claude Code is past ``SessionStart`` the splash banner is gone
-    and only the live input box (plus its footer) remains. That pane
-    must pass :func:`_claude_pane_interactive` so 1st+ messages inject
-    without waiting out the full timeout.
-    """
-    live_pane = "\n".join(
-        [
-            "────────────────────────────────────────",
-            "❯ ",
-            "────────────────────────────────────────",
-            "  alice: /home/alice/proj",
-            "  Opus 4.8 (1M context) | effort:high",
-            "  ⏵⏵ accept edits on (shift+tab to cycle)",
-        ]
-    )
-    assert _claude_welcome_screen_visible(live_pane) is False
-    assert _claude_pane_interactive(live_pane) is True
 
 
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
@@ -7524,7 +7114,6 @@ def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatc
 
 def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """
     On a readiness timeout, the RuntimeError carries Claude Code's own
@@ -7549,7 +7138,6 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
-            tmp_path,
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
@@ -7562,7 +7150,6 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
 
 def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """
     A timeout where every capture came back empty says so in the error.
@@ -7574,8 +7161,6 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     the two failure modes tell themselves apart.
 
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Empty bridge dir (no recorded session id), so the gate
-        times out on the empty captures rather than seeing SessionStart.
     :returns: None.
     """
     monkeypatch.setattr(
@@ -7584,7 +7169,6 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
-            tmp_path,
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
@@ -7599,7 +7183,6 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
 
 def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """
     The attached tail is a capture the loop saw, not a post-timeout one.
@@ -7613,8 +7196,6 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     proves the point: the box-present frame must NOT leak into the error.
 
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Empty bridge dir (no recorded session id), so the gate
-        times out rather than seeing SessionStart.
     :returns: None.
     """
     observed = "  ✱ Working…\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
@@ -7633,7 +7214,6 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     monkeypatch.setattr("omnigent.claude_native_bridge._capture_pane", fake_capture)
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
-            tmp_path,
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
@@ -8586,7 +8166,6 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     captured: list[list[str]] = []
     # The surface covers the pane until Escape dismisses it; afterwards
@@ -8717,7 +8296,6 @@ def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
     )
-    _mark_session_started(bridge_dir)
 
     escapes = {"n": 0}
     tui = {"pane": _REVERSE_SEARCH_PANE}

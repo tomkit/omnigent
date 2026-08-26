@@ -1182,10 +1182,6 @@ export function ChatPage() {
         // resume picker shows at once. Snapshot labels win; sidebar row is the
         // fallback for an off-page session.
         imported: Boolean((activeSession?.labels ?? activeConv.labels)?.[IMPORT_SOURCE_LABEL_KEY]),
-        // Managed sandbox hosts (non-null provider) are relaunchable-on-message
-        // even when not resume-in-place, so they must not dead-end to
-        // host_offline. Sourced from the snapshot like host_resumable.
-        host_managed: activeSession?.sandboxProvider != null,
       }
     : livenessRowFromSession(activeSession);
   // Host-switch launch marker; see the store field. Keeps this surface's

@@ -67,7 +67,6 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.helpers import (
     _allow_all_edits_eligible,
     _allow_remember_eligible,
-    _authorize_session_with_runner_fallback,
     _build_actor,
     _build_evaluation_context,
     _claude_native_remember_host,
@@ -188,13 +187,9 @@ def register_hooks_routes(
         """
         from omnigent.server.routes import sessions as _sf
 
-        await _authorize_session_with_runner_fallback(
-            request,
-            session_id,
-            level=LEVEL_READ,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -578,19 +573,9 @@ def register_hooks_routes(
         """
         from omnigent.server.routes import sessions as _sf
 
-        # READ-level policy evaluation. A server-managed sandbox runner (no
-        # user credential) authorizes via its tunnel binding token; user-auth
-        # callers take the unchanged path. A token grants READ, so the runner's
-        # own hooks evaluate read-only. ``user_id`` (``None`` on the runner
-        # fallback path) is still the policy actor below.
         user_id = _sf._get_user_id(request, auth_provider)
-        access = await _authorize_session_with_runner_fallback(
-            request,
-            session_id,
-            level=LEVEL_READ,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:
@@ -988,13 +973,9 @@ def register_hooks_routes(
         :raises OmnigentError: 404 if the session does not exist,
             400 if the request envelope is malformed or unsupported.
         """
-        await _authorize_session_with_runner_fallback(
-            request,
-            session_id,
-            level=LEVEL_READ,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1083,13 +1064,9 @@ def register_hooks_routes(
         :raises OmnigentError: 404 if the session does not exist, 400 if
             the request body is malformed.
         """
-        await _authorize_session_with_runner_fallback(
-            request,
-            session_id,
-            level=LEVEL_READ,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1186,13 +1163,9 @@ def register_hooks_routes(
         :raises OmnigentError: 404 if the session does not exist, 400 if the
             body is malformed.
         """
-        await _authorize_session_with_runner_fallback(
-            request,
-            session_id,
-            level=LEVEL_READ,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1307,13 +1280,9 @@ def register_hooks_routes(
         :raises OmnigentError: 404 if the session does not exist, 400 if the
             body is malformed.
         """
-        await _authorize_session_with_runner_fallback(
-            request,
-            session_id,
-            level=LEVEL_READ,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
             payload = await request.json()
