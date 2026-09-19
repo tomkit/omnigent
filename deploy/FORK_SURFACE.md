@@ -19,7 +19,7 @@ never conflict.
 | | files | lines | rebase cost |
 |---|---|---|---|
 | **Modified upstream files** | **0** | **0** | **none** |
-| Fork-owned paths (`deploy/agents`, `deploy/fly`, `tests/deploy`, fork workflows) | 23 | +3,200 | none |
+| Fork-owned paths (`deploy/agents`, `deploy/fly`, `tests/deploy`, fork workflow + script) | 17 | +2,200 | none |
 
 For comparison: **12 files / +361** at v0.11.0, **56 / +4,664** at v0.9.0, and
 **78 / +7,302** before the v0.7.0 upgrade.
@@ -32,9 +32,9 @@ Only content at fork-owned paths:
   `OMNIGENT_BUILTIN_AGENT_DIRS`. (`polly-fw`, the Pi-only sandbox variant, was
   deleted here: zero conversations on either app since sandboxes were retired.)
 - **`deploy/fly/`** — the two app configs and `RUNBOOK.tomkit.md`.
-- **`.github/workflows/fork-publish-server.yml`** + `.github/scripts/` — builds
-  the fork's server image to GHCR from upstream's unmodified `Dockerfile`.
-- **`.github/workflows/daily-fork-sync.yml`** — manual-dispatch rebase helper.
+- **`.github/workflows/fork-publish-server.yml`** — builds the fork's server
+  image to GHCR from upstream's unmodified `Dockerfile`.
+- **`.github/scripts/sync-fork.sh`** — the whole upgrade recipe (below).
 - **`tests/deploy/test_fork_agent_bundles.py`** — parses the bundles.
 
 ## Pruned 2026-09-19 (v0.11.0 → v0.14.0)
@@ -64,11 +64,13 @@ before patching an upstream file.
 
 ## Next upgrade: expected effort
 
-Zero conflicts by construction. The recipe is now: check out the new tag,
-`git checkout fork/main -- deploy/agents deploy/fly tests/deploy/test_fork_agent_bundles.py .github/scripts/<fork scripts> .github/workflows/{daily-fork-sync,fork-publish-server}.yml`,
-then re-verify that nothing under those paths shadows a file upstream also
-ships (`deploy/docker`, `deploy/databricks`, `.github/scripts/homebrew` are
-upstream's — never copy them from the fork).
+Zero conflicts by construction. Run `.github/scripts/sync-fork.sh vX.Y.Z`: it
+checks out the tag, copies the fork-owned paths from `fork/main`, and refuses
+if any copied path also exists in the tag (`deploy/docker`, `deploy/databricks`
+and `.github/scripts/homebrew` are upstream's — never carry them). Then update
+this file, run `pre-commit` + `pytest tests/deploy`, commit, and land by
+fast-forwarding main.
 
 The remaining upgrade work is deployment, not code: image build, in-container
-migrate + `ANALYZE`, and the Mac host CLI / harness binaries.
+migrate + `ANALYZE`, and the Mac host CLI / harness binaries — see
+`deploy/fly/RUNBOOK.tomkit.md`.
