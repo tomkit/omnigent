@@ -1,0 +1,56 @@
+# Fly.io config for the FORK's own server image (app: omnigent-tomkit).
+#
+# This is a copy of fly.toml that pins the image to OUR GHCR namespace
+# (ghcr.io/tomkit/omnigent-server, built by .github/workflows/fork-publish-server.yml)
+# instead of the upstream ghcr.io/omnigent-ai/omnigent-server:latest — so our
+# merged fork patches actually run instead of being overwritten by upstream.
+#
+# Everything else (env, internal port, health check, volume mount, machine
+# size, region) MIRRORS the existing live `omnigent-tomkit` machine exactly, so
+# a `fly deploy` with this config only swaps the image and leaves the volume,
+# secrets, and checks untouched. Deploy with:
+#   fly deploy -c deploy/fly/fly.tomkit.toml -a omnigent-tomkit
+# See deploy/fly/RUNBOOK.tomkit.md for the full cutover + rollback flow.
+
+app = "omnigent-tomkit"
+primary_region = "iad"
+
+[build]
+  # Our fork-published server image. :latest tracks the newest fork `main`
+  # build; the auto-deploy workflow / manual cutover can also pin :sha-<short>.
+  image = "ghcr.io/tomkit/omnigent-server:latest"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8000"
+  ARTIFACT_DIR = "/data/artifacts"
+  OMNIGENT_ADMIN_CREDENTIALS_PATH = "/data/admin-credentials"
+  OMNIGENT_AUTH_PROVIDER = "accounts"
+  # SQLite on the persistent volume — no separate Postgres app. Matches the
+  # live machine's env exactly.
+  DATABASE_URL = "sqlite:////data/artifacts/chat.db"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+# Persistent artifact + SQLite store. This is the EXISTING live volume
+# (vol_...; name `artifact_data`, 1GB, iad) — do NOT recreate it; `fly deploy`
+# reattaches it by name.
+[mounts]
+  source = "artifact_data"
+  destination = "/data/artifacts"
+
+# Matches the live machine: shared-cpu-1x, 1 GB (256 MB OOM-loops the server).
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
