@@ -19,7 +19,7 @@ never conflict.
 | | files | lines | rebase cost |
 |---|---|---|---|
 | **Modified upstream files** | **0** | **0** | **none** |
-| Fork-owned paths (`deploy/agents`, `deploy/fly`, `tests/deploy`, fork workflow + script) | 17 | +2,200 | none |
+| Fork-owned paths (`deploy/agents`, `deploy/fly`, `tests/deploy`, fork workflow + script) | 18 | +2,200 | none |
 
 For comparison: **12 files / +361** at v0.11.0, **56 / +4,664** at v0.9.0, and
 **78 / +7,302** before the v0.7.0 upgrade.
