@@ -19,7 +19,7 @@ never conflict.
 | | files | lines | rebase cost |
 |---|---|---|---|
 | **Modified upstream files** | **0** | **0** | **none** |
-| Fork-owned paths (`deploy/agents`, `deploy/fly`, `tests/deploy`, fork workflow + script) | 17 | +2,119 | none |
+| Fork-owned paths (`deploy/agents`, `deploy/fly`, `deploy/patches`, `tests/deploy`, fork workflow + script) | 19 | +2,295 | none |
 
 For comparison: **12 files / +361** at v0.11.0, **56 / +4,664** at v0.9.0, and
 **78 / +7,302** before the v0.7.0 upgrade.
@@ -36,6 +36,14 @@ Only content at fork-owned paths:
   image to GHCR from upstream's unmodified `Dockerfile`.
 - **`.github/scripts/sync-fork.sh`** — the whole upgrade recipe (below).
 - **`tests/deploy/test_fork_agent_bundles.py`** — parses the bundles.
+- **`deploy/patches/`** — temporary host-side patches, kept as `.patch` files
+  and applied to the Mac's uv-installed CLI by `apply-to-host-cli.sh` (never
+  to this tree). Re-run that script after every `uv tool install/upgrade
+  omnigent`. Current: `claude-native-advisor-message-id.patch` — resume
+  rebuilds Claude's transcript without `message.id`, splitting
+  `server_tool_use`/`advisor_tool_result` pairs into a 400. Delete it once
+  upstream groups rebuilt records by response (`sync-fork.sh` warns when it
+  stops applying).
 
 ## Pruned 2026-09-19 (v0.11.0 → v0.14.0)
 
