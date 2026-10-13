@@ -23,6 +23,7 @@ FORK_PATHS=(
   deploy/agents/polly
   deploy/fly
   deploy/FORK_SURFACE.md
+  deploy/patches
   tests/deploy/test_fork_agent_bundles.py
   .github/scripts/sync-fork.sh
   .github/workflows/fork-publish-server.yml
@@ -49,6 +50,14 @@ if [ "${#stale[@]}" -gt 0 ]; then
   printf '  %s\n' "${stale[@]}" >&2
   exit 1
 fi
+
+# Host-side patches stay as files (never applied to this tree); flag any that
+# no longer apply so the upgrade re-checks whether upstream fixed them.
+for p in deploy/patches/*.patch; do
+  [ -e "${p}" ] || continue
+  git apply --check "${p}" 2>/dev/null \
+    || echo "sync-fork: WARNING ${p} no longer applies to ${TAG} — did upstream fix it?" >&2
+done
 
 added=$(git diff --cached --name-only "refs/tags/${TAG}" | wc -l | tr -d ' ')
 echo "sync-fork: upgrade-${TAG} = ${TAG} + ${added} fork-owned files (staged, uncommitted)."
