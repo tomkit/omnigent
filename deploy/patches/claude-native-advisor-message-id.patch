@@ -1,0 +1,132 @@
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index 35f22ee31..79677e967 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -5677,9 +5677,38 @@ def _claude_transcript_records_from_session_items(
+             if isinstance(call_id, str) and call_id:
+                 tool_parent_by_call_id[call_id] = record_uuid
+         parent_uuid = record_uuid
++    _group_assistant_records_by_response(records)
+     return records
+
+
++def _group_assistant_records_by_response(records: list[_JsonObject]) -> None:
++    """
++    Give each run of consecutive assistant records one shared ``message.id``.
++
++    Claude Code writes one API response as several records sharing a
++    ``message.id`` and regroups them by that id on ``--resume``. Without it,
++    server-tool pairs (``server_tool_use`` + ``advisor_tool_result``) are
++    split apart and the API rejects the whole request with a 400.
++
++    :param records: Claude transcript records in order (mutated).
++    :returns: None.
++    """
++    run_id: str | None = None
++    for record in records:
++        message = record.get("message")
++        if record.get("type") != "assistant" or not isinstance(message, dict):
++            run_id = None
++            continue
++        if run_id is None:
++            existing = message.get("id")
++            run_id = (
++                existing
++                if isinstance(existing, str) and existing
++                else f"msg_omnigent_{str(record.get('uuid', '')).replace('-', '')}"
++            )
++        message.setdefault("id", run_id)
++
++
+ def _claude_transcript_record_from_session_item(
+     item: _JsonObject,
+     *,
+diff --git a/tests/harnesses/claude_native/test_claude_native.py b/tests/harnesses/claude_native/test_claude_native.py
+index 73299e48c..dd8cddeed 100644
+--- a/tests/harnesses/claude_native/test_claude_native.py
++++ b/tests/harnesses/claude_native/test_claude_native.py
+@@ -9090,6 +9090,7 @@ def test_claude_transcript_records_handles_native_compaction_messages() -> None:
+     ]
+     assert records[1]["message"] == {"role": "user", "content": "native compact summary"}
+     assert records[2]["message"] == {
++        "id": records[2]["message"]["id"],
+         "role": "assistant",
+         "content": [
+             {"type": "text", "text": "native reply"},
+diff --git a/tests/harnesses/claude_native/test_claude_native_advisor_resume.py b/tests/harnesses/claude_native/test_claude_native_advisor_resume.py
+new file mode 100644
+index 000000000..a0a01b9ee
+--- /dev/null
++++ b/tests/harnesses/claude_native/test_claude_native_advisor_resume.py
+@@ -0,0 +1,71 @@
++"""Rebuilt Claude transcripts keep one API response's blocks grouped by ``message.id``."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from omnigent.harnesses.claude_native import main as claude_native
++
++
++def _rebuild(compacted_messages: list[dict[str, object]]) -> list[dict[str, object]]:
++    items: list[dict[str, object]] = [
++        {
++            "id": "item_1",
++            "type": "compaction",
++            "summary": "summary",
++            "token_count": 10,
++            "compacted_messages": compacted_messages,
++        }
++    ]
++    return claude_native._claude_transcript_records_from_session_items(
++        items,
++        session_id="conv_test",
++        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
++        cwd=Path("/tmp/test"),
++        bridge_dir=Path("/tmp/test-bridge"),
++    )
++
++
++def _assistant(block: dict[str, object]) -> dict[str, object]:
++    return {"type": "message", "role": "assistant", "content": [block]}
++
++
++def test_advisor_pair_shares_message_id_until_next_user_record() -> None:
++    records = _rebuild(
++        [
++            {"type": "message", "role": "user", "content": "hello"},
++            _assistant(
++                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {}}
++            ),
++            _assistant(
++                {
++                    "type": "advisor_tool_result",
++                    "tool_use_id": "srvtoolu_1",
++                    "content": {"type": "advisor_redacted_result", "encrypted_content": "x"},
++                }
++            ),
++            _assistant({"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}),
++            {
++                "type": "message",
++                "role": "user",
++                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}],
++            },
++            _assistant({"type": "text", "text": "done"}),
++        ]
++    )
++    assistant_ids = [r["message"].get("id") for r in records if r.get("type") == "assistant"]
++    assert len(assistant_ids) == 4
++    first_response, second_response = assistant_ids[:3], assistant_ids[3]
++    assert len(set(first_response)) == 1
++    assert first_response[0].startswith("msg_")
++    assert second_response != first_response[0]
++
++
++def test_existing_message_id_is_kept() -> None:
++    message = _assistant({"type": "text", "text": "hi"})
++    records = _rebuild([{"type": "message", "role": "user", "content": "hello"}, message])
++    for record in records:
++        if record.get("type") == "assistant":
++            record["message"]["id"] = "msg_real"
++    claude_native._group_assistant_records_by_response(records)
++    assert [r["message"]["id"] for r in records if r.get("type") == "assistant"] == ["msg_real"]
