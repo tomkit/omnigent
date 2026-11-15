@@ -19,7 +19,7 @@ never conflict.
 | | files | lines | rebase cost |
 |---|---|---|---|
 | **Modified upstream files** | **0** | **0** | **none** |
-| Fork-owned paths (`deploy/agents`, `deploy/fly`, `deploy/patches`, `tests/deploy`, fork workflow + script) | 19 | +2,296 | none |
+| Fork-owned paths (`deploy/agents`, `deploy/fly`, `tests/deploy`, fork workflow + script) | 17 | +2,128 | none |
 
 For comparison: **12 files / +361** at v0.11.0, **56 / +4,664** at v0.9.0, and
 **78 / +7,302** before the v0.7.0 upgrade.
@@ -36,15 +36,15 @@ Only content at fork-owned paths:
   image to GHCR from upstream's unmodified `Dockerfile`.
 - **`.github/scripts/sync-fork.sh`** — the whole upgrade recipe (below).
 - **`tests/deploy/test_fork_agent_bundles.py`** — parses the bundles.
-- **`deploy/patches/`** — temporary host-side patches, kept as `.patch` files
-  and applied to the Mac's uv-installed CLI by `apply-to-host-cli.sh` (never
-  to this tree). Re-run that script after every `uv tool install/upgrade
-  omnigent`. Current: `claude-native-advisor-message-id.patch` — resume
-  rebuilds Claude's transcript without `message.id`, splitting
-  `server_tool_use`/`advisor_tool_result` pairs into a 400. Delete it once
-  upstream groups rebuilt records by response (`sync-fork.sh` warns when it
-  stops applying). v0.22.0 fixed only the compaction replay path; plain items
-  are still rebuilt without `message.id`.
+
+## Pruned 2026-11-14 (v0.19.1 → v0.22.0)
+
+The host-side `deploy/patches/` directory is gone, so the Mac's uv-installed
+CLI is pure PyPI omnigent again; no step follows `uv tool install`.
+
+| Patch | Why it's gone |
+|---|---|
+| `claude-native-advisor-message-id.patch` (+ `apply-to-host-cli.sh`) | Advisor blocks only reach a rebuilt transcript through compaction snapshots (plain items carry text only), and v0.22.0's compaction replay folds a split `advisor_tool_result` back into its `server_tool_use` record and restores stored `message.id`s. The patch still applied cleanly but now broke an upstream test by adding ids that upstream leaves off. |
 
 ## Pruned 2026-09-19 (v0.11.0 → v0.14.0)
 
